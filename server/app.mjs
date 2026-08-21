@@ -2000,6 +2000,7 @@ export function createTaskboardServer(options = {}) {
       const url = new URL(request.url, "http://127.0.0.1");
       const pathname = url.pathname;
       if (pathname.startsWith("/api/local/feishu/workflow/")) {
+        assertLoopbackRequest(request);
         const result = await feishuWorkflowApi.handle({
           method: request.method,
           pathname,
