@@ -34,6 +34,7 @@ import {
   listArchivedTasks,
   listDevelopmentContexts,
   listDeviceWorkspaces,
+  listFeishuWorkflowCatalog,
   listProjects,
   listTasks,
   moveTask as moveTaskRequest,
@@ -43,6 +44,7 @@ import {
   restoreTask as restoreTaskRequest,
   setApiText,
   setCurrentUserActor,
+  startTaskWithCodex,
   uploadAttachment,
   updateTask as updateTaskRequest,
 } from "./api";
@@ -65,6 +67,7 @@ import { ProjectAutomationMenu } from "./components/ProjectAutomationMenu";
 import { TaskboardIcon } from "./components/TaskboardIcon";
 import { TaskContextMenu } from "./components/TaskContextMenu";
 import { TaskDetail } from "./components/TaskDetail";
+import { FeishuWorkflowPanel } from "./components/FeishuWorkflowPanel";
 import { TaskEditor, type NewTaskEditorDraft } from "./components/TaskEditor";
 import { TaskFilterMenu } from "./components/TaskFilterMenu";
 import { taskboardStorage } from "./storage";
@@ -130,7 +133,7 @@ type DetailSourceScroll =
   | { projectId: string; view: "list"; scrollTop: number };
 type GanttZoom = "day" | "week" | "month";
 type ActionError = string | readonly [string, string];
-const SHOW_WORKFLOW_BOARD_ENTRY = false;
+const SHOW_WORKFLOW_BOARD_ENTRY = true;
 const GANTT_ZOOM_OPTIONS: GanttZoom[] = ["day", "week", "month"];
 
 const WorkflowBoard = lazy(() => import("./components/WorkflowBoard").then((module) => ({
@@ -656,6 +659,8 @@ export function App() {
   const [attachmentsRevision, setAttachmentsRevision] = useState(0);
   const [workflowRevision, setWorkflowRevision] = useState(0);
   const [workflowOptions, setWorkflowOptions] = useState<WorkflowOption[]>(DEFAULT_WORKFLOW_OPTIONS);
+  const [feishuCatalog, setFeishuCatalog] = useState<import("./types").FeishuBaseCatalog[]>([]);
+  const [selectedFeishuSubjectKey, setSelectedFeishuSubjectKey] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [draggedTaskId, setDraggedTaskId] = useState<string | null>(null);
   const [draggedTaskHeight, setDraggedTaskHeight] = useState(0);
@@ -664,6 +669,7 @@ export function App() {
   const [settlingTaskId, setSettlingTaskId] = useState<string | null>(null);
   const [openingProjectId, setOpeningProjectId] = useState<string | null>(null);
   const [openingThreadTaskId, setOpeningThreadTaskId] = useState<string | null>(null);
+  const [startingCodexTaskId, setStartingCodexTaskId] = useState<string | null>(null);
   const [projectMenuOpen, setProjectMenuOpen] = useState(
     () => taskboardStorage.getItem(FIRST_USE_COMPLETE_KEY) === null,
   );
@@ -1545,6 +1551,20 @@ export function App() {
   }, [refreshWorkflowOptions, selectedProjectId]);
 
   useEffect(() => {
+    const controller = new AbortController();
+    void listFeishuWorkflowCatalog(controller.signal)
+      .then((catalog) => {
+        if (controller.signal.aborted) return;
+        setFeishuCatalog(catalog);
+        setSelectedFeishuSubjectKey((current) => current && catalog.flatMap((base) => base.subjects).some((subject) => subject.subjectKey === current)
+          ? current
+          : catalog.flatMap((base) => base.subjects).find((subject) => subject.displayEnabled)?.subjectKey ?? null);
+      })
+      .catch(() => { /* Feishu is optional; ordinary projects remain unaffected. */ });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
     if (!selectedProjectId) {
       setDevelopmentScan({ workspacePath: null, contexts: [] });
       return;
@@ -2051,6 +2071,30 @@ export function App() {
         : errorMessage(error));
       if (selectedProjectId) void refreshTasks(selectedProjectId, { quiet: true });
       throw error;
+    }
+  }
+
+  async function startCodexForTask(task: Task) {
+    if (startingCodexTaskId) return;
+    setStartingCodexTaskId(task.id);
+    setActionError(null);
+    try {
+      const response = await startTaskWithCodex(task);
+      setTasks((current) => sortTasks(current.map((candidate) => (
+        candidate.id === response.task.id ? response.task : candidate
+      ))));
+      setAiThreads((current) => [
+        response.thread,
+        ...current.filter((thread) => thread.id !== response.thread.id),
+      ]);
+      setAiOpenThreadRequest((current) => ({
+        threadId: response.thread.id,
+        requestId: (current?.requestId ?? 0) + 1,
+      }));
+    } catch (error) {
+      setActionError(errorMessage(error));
+    } finally {
+      setStartingCodexTaskId(null);
     }
   }
 
@@ -2726,8 +2770,10 @@ export function App() {
             )}
             onOpenThread={openThread}
             onOpenInThread={openTaskInThread}
+            onStartCodex={startCodexForTask}
             onCopy={(text, message) => void copyText(text, message)}
             openingThread={openingThreadTaskId === detailTask.id}
+            startingCodex={startingCodexTaskId === detailTask.id}
             onError={setActionError}
           />
         ) : boardView === "dashboard" ? (
@@ -2768,20 +2814,37 @@ export function App() {
             />
           </Suspense>
         ) : boardView === "workflow" ? (
-          <Suspense fallback={<div className="workflow-board-loading">{text("正在打开节点模式…", "Opening workflow…")}</div>}>
-            <WorkflowBoard
-              key={selectedProject?.id ?? GLOBAL_PROJECT_ID}
-              projectId={selectedProject?.id ?? GLOBAL_PROJECT_ID}
-              projectName={selectedProject?.name ?? text("当前项目", "Current project")}
-              workspacePath={
-                selectedDeviceWorkspacePath
-                ?? developmentScan.workspacePath
-                ?? hostContext?.workspacePath
-              }
-              revision={workflowRevision}
-              onWorkflowsChange={setWorkflowOptions}
+          <div className="workflow-view-stack">
+            <FeishuWorkflowPanel
+              catalog={feishuCatalog}
+              selectedSubjectKey={selectedFeishuSubjectKey}
+              onSelectSubject={(subjectKey) => {
+                setSelectedFeishuSubjectKey(subjectKey);
+                const subject = feishuCatalog.flatMap((base) => base.subjects).find((item) => item.subjectKey === subjectKey);
+                if (subject) changeProject(subject.projectId);
+              }}
+              onCatalogChange={setFeishuCatalog}
+              onSubjectChange={(subject) => setFeishuCatalog((catalog) => catalog.map((base) => ({
+                ...base,
+                subjects: base.subjects.map((item) => item.subjectKey === subject.subjectKey ? subject : item),
+              })))}
+              onError={(message) => setActionError(message)}
             />
-          </Suspense>
+            <Suspense fallback={<div className="workflow-board-loading">{text("正在打开节点模式…", "Opening workflow…")}</div>}>
+              <WorkflowBoard
+                key={selectedProject?.id ?? GLOBAL_PROJECT_ID}
+                projectId={selectedProject?.id ?? GLOBAL_PROJECT_ID}
+                projectName={selectedProject?.name ?? text("当前项目", "Current project")}
+                workspacePath={
+                  selectedDeviceWorkspacePath
+                  ?? developmentScan.workspacePath
+                  ?? hostContext?.workspacePath
+                }
+                revision={workflowRevision}
+                onWorkflowsChange={setWorkflowOptions}
+              />
+            </Suspense>
+          </div>
         ) : (
           <div
             className={`issue-board-layout${otherTasksVisible ? " has-other-tasks" : ""}`}
