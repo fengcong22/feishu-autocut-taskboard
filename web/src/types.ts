@@ -181,6 +181,36 @@ export interface Project {
   updatedAt: string;
 }
 
+export interface FeishuSubjectConfig {
+  subjectKey: string;
+  baseToken: string;
+  baseName: string;
+  tableId: string;
+  tableName: string;
+  projectId: string;
+  displayEnabled: boolean;
+  lifecycle: "draft" | "enabled" | "disabled";
+  configVersion: number;
+  trigger?: { fieldId: string; fieldName: string; startValue: string; optionId: string | null };
+  title?: { fieldId: string | null; fieldName: string | null };
+  execution?: { mode: "manual" | "automatic"; concurrencyGroup: string; maxConcurrent: number; resourceGroups: string[] };
+  packageRoute?: { routeMode: "fixed"; packageAlias: string; subjectCodeFieldId: string | null; branchMap: Record<string, string> | null };
+  upload?: { enqueueMode: "manual" | "automatic"; artifactSourceMode: string; artifactSourcePath: string | null; targetId: string | null; targetPath: string | null; uploadConcurrency: number };
+  metadata?: { fields?: unknown[] };
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface FeishuBaseCatalog {
+  baseToken: string;
+  baseName: string;
+  sourceUrlLabel: string | null;
+  metadataRefreshedAt: number | null;
+  subjects: FeishuSubjectConfig[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ProjectSummary {
   projectId: string;
   summary: string | null;

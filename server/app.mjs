@@ -1,6 +1,6 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import { chmod, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { isIP } from "node:net";
 import os from "node:os";
@@ -21,6 +21,7 @@ import { normalizeWorkflowSnapshot } from "../shared/workflow-control-flow.mjs";
 import { AiChatService } from "./ai-chat.mjs";
 import { resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
 import { createCloudConfigStore } from "./cloud-config.mjs";
+import { createFeishuPackageStore } from "./feishu-package-config.mjs";
 import {
   CloudProxyError,
   createCloudProxy,
@@ -28,6 +29,9 @@ import {
 } from "./cloud-proxy.mjs";
 import { ApiError, TaskboardDatabase } from "./database.mjs";
 import { ProjectSummaryService } from "./project-summary.mjs";
+import { codexInvocation } from "../shared/codex-invocation.mjs";
+import { createFeishuWorkflowStore } from "./feishu-workflow-store.mjs";
+import { createFeishuWorkflowApi } from "./feishu-workflow-api.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const execFileAsync = promisify(execFile);
@@ -937,6 +941,45 @@ function parseAiTurn(body) {
   };
 }
 
+function parseFeishuTaskMetadata(description) {
+  if (typeof description !== "string") return null;
+  const marker = "<!-- feishu-codex-task:";
+  const start = description.indexOf(marker);
+  if (start < 0) return null;
+  const end = description.indexOf("-->", start + marker.length);
+  if (end < 0) return null;
+  try {
+    const encoded = description.slice(start + marker.length, end).trim();
+    let metadata;
+    if (encoded.startsWith("v1:")) {
+      metadata = JSON.parse(Buffer.from(encoded.slice(3), "base64url").toString("utf8"));
+    } else {
+      metadata = JSON.parse(encoded);
+    }
+    if (
+      !metadata
+      || typeof metadata !== "object"
+      || metadata.source !== "feishu-base"
+      || typeof metadata.packageAlias !== "string"
+      || metadata.packageAlias.trim() === ""
+    ) return null;
+    return {
+      packageAlias: metadata.packageAlias.trim(),
+      recordId: typeof metadata.recordId === "string" ? metadata.recordId.trim() : "",
+      eventId: typeof metadata.eventId === "string" ? metadata.eventId.trim() : "",
+      mode: metadata.mode === "automatic" ? "automatic" : "manual",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseStartAiBody(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set());
+  return {};
+}
+
 class EventHub {
   constructor() {
     this.clients = new Set();
@@ -1137,7 +1180,8 @@ async function scanDevelopmentContexts(workspacePath, processEnv = process.env) 
 
 async function discoverSkills(codexExecutable, workspacePath, processEnv) {
   const entries = await new Promise((resolve, reject) => {
-    const child = spawn(codexExecutable, ["app-server", "--stdio"], {
+    const invocation = codexInvocation(codexExecutable, ["app-server", "--stdio"]);
+    const child = spawn(invocation.command, invocation.args, {
       cwd: workspacePath,
       env: processEnv,
       stdio: ["pipe", "pipe", "ignore"],
@@ -1251,7 +1295,8 @@ async function discoverSkills(codexExecutable, workspacePath, processEnv) {
 }
 
 async function discoverMcpServers(codexExecutable, processEnv) {
-  const result = await execFileAsync(codexExecutable, ["mcp", "list", "--json"], {
+  const invocation = codexInvocation(codexExecutable, ["mcp", "list", "--json"]);
+  const result = await execFileAsync(invocation.command, invocation.args, {
     env: processEnv,
     timeout: 8_000,
     maxBuffer: 2 * 1024 * 1024,
@@ -1307,6 +1352,9 @@ export function resolveServerOptions(options = {}) {
     databasePath: options.databasePath ?? path.join(dataDirectory, "taskboard.sqlite"),
     attachmentsDirectory: options.attachmentsDirectory ?? path.join(dataDirectory, "attachments"),
     cloudConfigPath: options.cloudConfigPath ?? path.join(dataDirectory, "cloud-companion.json"),
+    feishuPackagesPath: options.feishuPackagesPath
+      ?? process.env.CODEX_FEISHU_PACKAGES_PATH
+      ?? path.join(dataDirectory, "feishu-packages.json"),
     clientStoragePath: options.clientStoragePath ?? path.join(dataDirectory, "client-storage.json"),
     staticDirectory: options.staticDirectory ?? path.join(PROJECT_ROOT, "dist", "web"),
     skillPath: options.skillPath ?? path.join(PROJECT_ROOT, "skills", "manage-taskboard", "SKILL.md"),
@@ -1346,6 +1394,9 @@ export function createTaskboardServer(options = {}) {
   );
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
+  const feishuWorkflowApi = createFeishuWorkflowApi({
+    store: createFeishuWorkflowStore({ database }),
+  });
   const events = new EventHub();
   let clientStorageWrite = Promise.resolve();
 
@@ -1379,6 +1430,10 @@ export function createTaskboardServer(options = {}) {
   }
   const cloudConfig = options.cloudConfigStore ?? createCloudConfigStore({
     configPath: resolved.cloudConfigPath,
+  });
+  const feishuPackages = options.feishuPackageStore ?? createFeishuPackageStore({
+    filename: resolved.feishuPackagesPath,
+    packages: options.feishuPackages,
   });
   const cloudProxy = createCloudProxy({
     configStore: cloudConfig,
@@ -1431,12 +1486,40 @@ export function createTaskboardServer(options = {}) {
     const config = await cloudConfig.read();
     if (!config.remoteUrl) {
       let resolvedWorkspace;
+      const packageConfig = Object.values(await feishuPackages.read()).find((entry) => (
+        entry.projectId === projectId
+      ));
+      if (packageConfig) {
+        const project = database.getProject(projectId);
+        if (!project) {
+          throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
+        }
+        let workspacePath;
+        try {
+          workspacePath = await realpath(packageConfig.workspacePath);
+          if (!(await stat(workspacePath)).isDirectory()) throw new Error("not a directory");
+        } catch {
+          throw new ApiError(
+            409,
+            "PACKAGE_WORKSPACE_UNAVAILABLE",
+            `Configured workspace for package '${packageConfig.projectName}' is unavailable`,
+          );
+        }
+        resolvedWorkspace = {
+          workspacePath,
+          // Feishu package workspaces are isolated to their configured directory.
+          addDirectories: [],
+          project: { ...project, workspacePath },
+        };
+      }
       try {
-        resolvedWorkspace = await resolveAiWorkspace(
-          projectId,
-          resolved.codexStatePath,
-          database,
-        );
+        if (!resolvedWorkspace) {
+          resolvedWorkspace = await resolveAiWorkspace(
+            projectId,
+            resolved.codexStatePath,
+            database,
+          );
+        }
       } catch (error) {
         if (
           !(error instanceof ApiError)
@@ -1502,6 +1585,241 @@ export function createTaskboardServer(options = {}) {
     processEnv: codexProcessEnvironment,
     resolveContext: resolveAiChatContext,
   });
+  function reconcileFeishuTaskAfterRun(taskId, threadId, run, actor) {
+    const status = run?.status === "completed"
+      ? "in_review"
+      : run?.status === "failed" || run?.status === "interrupted"
+        ? "blocked"
+        : null;
+    if (!status) return;
+    const current = database.getTask(taskId);
+    if (!current || current.threadId !== threadId) return;
+    const claim = database.listTaskAiStarts().find((entry) => (
+      entry.taskId === taskId
+      && entry.threadId === threadId
+      && entry.runId === run.id
+    ));
+    if (!claim) return;
+    const task = database.settleTaskAiStart(
+      taskId,
+      claim.claimToken,
+      run.id,
+      status,
+      actor,
+    );
+    events.emit("task.updated", { task });
+  }
+  function reconcileClaimedFeishuTasks() {
+    for (const claim of database.listTaskAiStarts()) {
+      const task = database.getTask(claim.taskId);
+      const metadata = task ? parseFeishuTaskMetadata(task.description) : null;
+      if (!task || !task.labels.includes("feishu") || !metadata) {
+        if (task) {
+          try {
+            const current = database.getTask(task.id);
+            if (
+              current
+              && current.status === "in_progress"
+              && current.threadId === claim.threadId
+            ) {
+              const ready = database.releaseTaskFromAiStart(task.id, claim.claimToken, CODEX_AGENT_ACTOR);
+              events.emit("task.updated", { task: ready });
+            } else {
+              database.deleteTaskAiStartClaim(task.id, claim.claimToken);
+            }
+          } catch (error) {
+            console.error("Failed to recover edited Feishu task claim", error);
+          }
+        } else {
+          try { database.deleteTaskAiStartClaim(claim.taskId, claim.claimToken); } catch {}
+        }
+        continue;
+      }
+      if (task.status !== "in_progress") {
+        try { database.releaseTaskFromAiStart(task.id, claim.claimToken, CODEX_AGENT_ACTOR); } catch {}
+        continue;
+      }
+      if (!claim.threadId) {
+        try {
+          const ready = database.releaseTaskFromAiStart(task.id, claim.claimToken, CODEX_AGENT_ACTOR);
+          events.emit("task.updated", { task: ready });
+        } catch (error) {
+          console.error("Failed to recover unbound Feishu task start", error);
+        }
+        continue;
+      }
+      const thread = database.getAiChatThread(claim.threadId);
+      if (!thread) {
+        try {
+          const ready = database.releaseTaskFromAiStart(task.id, claim.claimToken, CODEX_AGENT_ACTOR);
+          events.emit("task.updated", { task: ready });
+        } catch (error) {
+          console.error("Failed to recover invalid Feishu task thread", error);
+        }
+        continue;
+      }
+      if (thread.origin.issueId !== task.id) {
+        console.error(`Refusing to recover Feishu task '${task.id}' from mismatched thread '${claim.threadId}'`);
+        try {
+          const current = database.getTask(task.id);
+          if (current.status === "in_progress" && current.threadId === claim.threadId) {
+            const ready = database.releaseTaskFromAiStart(task.id, claim.claimToken, CODEX_AGENT_ACTOR);
+            events.emit("task.updated", { task: ready });
+          } else {
+            database.deleteTaskAiStartClaim(task.id, claim.claimToken);
+          }
+        } catch (error) {
+          console.error("Failed to recover mismatched Feishu task claim", error);
+        }
+        continue;
+      }
+      const latest = claim.runId ? database.getAiChatRun(claim.runId) : null;
+      if (!latest) {
+        try {
+          const ready = database.releaseTaskFromAiStart(task.id, claim.claimToken, CODEX_AGENT_ACTOR);
+          events.emit("task.updated", { task: ready });
+          if (database.listAiChatRuns(claim.threadId).length === 0) {
+            try { aiChat.deleteThread(claim.threadId); } catch {}
+          }
+        } catch (error) {
+          console.error("Failed to recover Feishu task before run", error);
+        }
+        continue;
+      }
+      const status = latest.status === "completed"
+        ? "in_review"
+        : ["failed", "interrupted"].includes(latest.status)
+          ? "blocked"
+          : null;
+      if (!status) continue;
+      try {
+        const updated = database.settleTaskAiStart(
+          task.id,
+          claim.claimToken,
+          latest.id,
+          status,
+          CODEX_AGENT_ACTOR,
+        );
+        events.emit("task.updated", { task: updated });
+      } catch (error) {
+        console.error("Failed to recover terminal Feishu task", error);
+      }
+    }
+  }
+  reconcileClaimedFeishuTasks();
+
+  async function startTaskWithAi(task, actor, metadata) {
+    const packages = await feishuPackages.read();
+    const packageConfig = packages[metadata.packageAlias];
+    if (!packageConfig) {
+      throw new ApiError(
+        409,
+        "UNKNOWN_PACKAGE_ALIAS",
+        `Package '${metadata.packageAlias}' is not configured on this Taskboard`,
+      );
+    }
+    if (packageConfig.projectId !== task.projectId) {
+      throw new ApiError(
+        409,
+        "TASK_PACKAGE_MISMATCH",
+        `Task project '${task.projectId}' does not match package '${metadata.packageAlias}'`,
+      );
+    }
+    try {
+      const workspacePath = await realpath(packageConfig.workspacePath);
+      if (!(await stat(workspacePath)).isDirectory()) throw new Error("not a directory");
+    } catch {
+      throw new ApiError(
+        409,
+        "PACKAGE_WORKSPACE_UNAVAILABLE",
+        `Configured workspace for package '${packageConfig.projectName}' is unavailable`,
+      );
+    }
+    const claimedTask = database.claimTaskForAiStart(task.id, task.version, actor);
+    events.emit("task.updated", { task: claimedTask });
+    const threadId = randomUUID();
+    let thread;
+    let unsubscribeRun = null;
+    try {
+      const updatedTask = database.bindTaskAiStart(
+        claimedTask.id,
+        claimedTask.claimToken,
+        claimedTask.version,
+        threadId,
+        actor,
+      );
+      events.emit("task.updated", { task: updatedTask });
+      claimedTask.version = updatedTask.version;
+      thread = await aiChat.createThread({
+        id: threadId,
+        projectId: claimedTask.projectId,
+        issueId: claimedTask.id,
+        title: `${claimedTask.identifier} · ${metadata.packageAlias}`,
+        sandbox: "workspace-write",
+      });
+      database.verifyTaskAiStart(
+        claimedTask.id,
+        claimedTask.claimToken,
+        claimedTask.version,
+        thread.id,
+      );
+      unsubscribeRun = aiChat.subscribe(thread.id, (event) => {
+        if (event?.type !== "ai.run" || !event.run || event.run.status === "running") return;
+        unsubscribeRun?.();
+        unsubscribeRun = null;
+        try {
+          reconcileFeishuTaskAfterRun(claimedTask.id, thread.id, event.run, actor);
+        } catch (error) {
+          console.error("Failed to reconcile Feishu task after Codex run", error);
+        }
+      });
+    } catch (error) {
+      unsubscribeRun?.();
+      unsubscribeRun = null;
+      try {
+        const rollback = database.releaseTaskFromAiStart(
+          claimedTask.id,
+          claimedTask.claimToken,
+          actor,
+        );
+        events.emit("task.updated", { task: rollback });
+      } catch {}
+      if (thread) {
+        try { aiChat.deleteThread(thread.id); } catch {}
+      }
+      throw error;
+    }
+    let run;
+    try {
+      run = await aiChat.startTurn(thread.id, {
+        message: packageConfig.prompt,
+      }, {
+        onRunCreated: (createdRun) => database.bindTaskAiStartRun(
+          claimedTask.id,
+          claimedTask.claimToken,
+          thread.id,
+          createdRun.id,
+        ),
+      });
+    } catch (error) {
+      unsubscribeRun?.();
+      unsubscribeRun = null;
+      try {
+        const rollback = database.getTask(claimedTask.id)
+          ? database.releaseTaskFromAiStart(
+            claimedTask.id,
+            claimedTask.claimToken,
+            actor,
+          )
+          : null;
+        if (!rollback) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${claimedTask.id}' does not exist`);
+        events.emit("task.updated", { task: rollback });
+      } catch {}
+      try { aiChat.deleteThread(thread.id); } catch {}
+      throw error;
+    }
+    return { task: database.getTask(claimedTask.id), thread, run };
+  }
   const projectSummary = new ProjectSummaryService({
     database,
     codexExecutable: resolved.codexExecutable,
@@ -1681,6 +1999,14 @@ export function createTaskboardServer(options = {}) {
       }
       const url = new URL(request.url, "http://127.0.0.1");
       const pathname = url.pathname;
+      if (pathname.startsWith("/api/local/feishu/workflow/")) {
+        const result = await feishuWorkflowApi.handle({
+          method: request.method,
+          pathname,
+          body: request.method === "GET" ? null : await readJson(request),
+        });
+        if (result) return sendJson(response, result.status, result.body);
+      }
       const isLocalAiRoute = pathname === "/api/local/ai" || pathname.startsWith("/api/local/ai/");
       if (isLocalAiRoute) {
         assertAiLoopbackRequest(request);
@@ -2455,7 +2781,7 @@ export function createTaskboardServer(options = {}) {
         return sendEmpty(response, 204);
       }
 
-      const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move))?$/);
+      const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move|start-ai))?$/);
       if (taskRoute) {
         let id;
         try {
@@ -2497,6 +2823,32 @@ export function createTaskboardServer(options = {}) {
           }
           events.emit("task.deleted", { task: deleted.task });
           return sendEmpty(response, 204);
+        }
+        if (action === "start-ai" && request.method === "POST") {
+          assertAiLoopbackRequest(request);
+          await parseStartAiBody(await readJson(request));
+          const task = database.getTask(id);
+          if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          if (task.status !== "todo") {
+            throw new ApiError(
+              409,
+              "TASK_NOT_STARTABLE",
+              "Only ready tasks can be started with Codex",
+            );
+          }
+          const metadata = parseFeishuTaskMetadata(task.description);
+          if (!metadata) {
+            throw new ApiError(
+              409,
+              "TASK_NOT_STARTABLE",
+              "This task does not contain server-owned Feishu workflow metadata",
+            );
+          }
+          return sendJson(response, 202, await startTaskWithAi(
+            task,
+            actorFromRequest(request),
+            metadata,
+          ));
         }
         if (action === "move" && request.method === "POST") {
           const move = parseMove(await readJson(request));

@@ -127,6 +127,16 @@ function taskFieldChanges(task, changes) {
   });
 }
 
+function attachAiStartClaim(task, claimToken) {
+  Object.defineProperty(task, "claimToken", {
+    value: claimToken,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  return task;
+}
+
 function relationActivityValue(type, task) {
   return {
     type,
@@ -498,6 +508,39 @@ export class TaskboardDatabase {
       CREATE INDEX IF NOT EXISTS ai_chat_events_thread_created
         ON ai_chat_events(thread_id, created_at, id);
 
+      CREATE TABLE IF NOT EXISTS feishu_bases (
+        base_token TEXT PRIMARY KEY,
+        base_name TEXT NOT NULL,
+        source_url_label TEXT,
+        metadata_refreshed_at INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS feishu_subjects (
+        subject_key TEXT PRIMARY KEY,
+        base_token TEXT NOT NULL REFERENCES feishu_bases(base_token) ON DELETE CASCADE,
+        table_id TEXT NOT NULL,
+        table_name TEXT NOT NULL,
+        project_id TEXT NOT NULL UNIQUE,
+        display_enabled INTEGER NOT NULL DEFAULT 1 CHECK (display_enabled IN (0, 1)),
+        lifecycle TEXT NOT NULL CHECK (lifecycle IN ('draft', 'enabled', 'disabled')),
+        config_version INTEGER NOT NULL CHECK (config_version > 0),
+        config_json TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(base_token, table_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS feishu_subject_versions (
+        subject_key TEXT NOT NULL REFERENCES feishu_subjects(subject_key) ON DELETE CASCADE,
+        version INTEGER NOT NULL CHECK (version > 0),
+        snapshot_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(subject_key, version)
+      );
+
     `);
 
     const projectColumns = this.database.prepare("PRAGMA table_info(projects)").all();
@@ -585,6 +628,96 @@ export class TaskboardDatabase {
       CREATE INDEX IF NOT EXISTS tasks_project_status_sort
         ON tasks(project_id, archived_at, status, sort_order, created_at)
     `);
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS task_ai_starts (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        claim_token TEXT NOT NULL UNIQUE,
+        thread_id TEXT UNIQUE,
+        run_id TEXT UNIQUE REFERENCES ai_chat_runs(id) ON DELETE SET NULL,
+        claimed_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        claimed_activity_rowid INTEGER
+      )
+    `);
+    const taskAiStartColumns = this.database.prepare("PRAGMA table_info(task_ai_starts)").all();
+    const hadTaskAiStartRunId = taskAiStartColumns.some((column) => column.name === "run_id");
+    const hadTaskAiStartActivityRowid = taskAiStartColumns.some(
+      (column) => column.name === "claimed_activity_rowid",
+    );
+    if (!hadTaskAiStartRunId) {
+      this.database.exec("ALTER TABLE task_ai_starts ADD COLUMN run_id TEXT REFERENCES ai_chat_runs(id) ON DELETE SET NULL");
+    }
+    if (!hadTaskAiStartActivityRowid) {
+      this.database.exec("ALTER TABLE task_ai_starts ADD COLUMN claimed_activity_rowid INTEGER");
+    }
+    if (!hadTaskAiStartRunId || !hadTaskAiStartActivityRowid) {
+      const legacyClaims = this.database.prepare(`
+        SELECT task_id, claim_token, thread_id, run_id, claimed_at, claimed_activity_rowid
+        FROM task_ai_starts
+      `).all();
+      const activitiesForClaim = this.database.prepare(`
+        SELECT rowid, changes
+        FROM task_activities
+        WHERE task_id = ? AND created_at <= ?
+        ORDER BY created_at DESC, rowid DESC
+      `);
+      const runsForClaim = this.database.prepare(`
+        SELECT ai_chat_runs.id
+        FROM ai_chat_runs
+        JOIN ai_chat_threads ON ai_chat_threads.id = ai_chat_runs.thread_id
+        JOIN tasks ON tasks.id = ai_chat_threads.origin_issue_id
+        WHERE ai_chat_runs.thread_id = ?
+          AND ai_chat_threads.origin_issue_id = ?
+          AND tasks.thread_id = ai_chat_runs.thread_id
+          AND ai_chat_runs.started_at >= ?
+        ORDER BY ai_chat_runs.started_at, ai_chat_runs.id
+        LIMIT 2
+      `);
+      const updateLegacyClaim = this.database.prepare(`
+        UPDATE task_ai_starts
+        SET claimed_activity_rowid = COALESCE(claimed_activity_rowid, ?),
+            run_id = COALESCE(run_id, ?)
+        WHERE task_id = ? AND claim_token = ?
+      `);
+      this.database.exec("BEGIN IMMEDIATE");
+      try {
+        for (const claim of legacyClaims) {
+          let claimedActivityRowid = claim.claimed_activity_rowid;
+          if (claimedActivityRowid === null) {
+            const activity = activitiesForClaim.all(claim.task_id, claim.claimed_at).find((entry) => {
+              try {
+                return JSON.parse(entry.changes).some((change) => (
+                  change?.field === "status" && change.after === "in_progress"
+                ));
+              } catch {
+                return false;
+              }
+            });
+            claimedActivityRowid = activity?.rowid ?? null;
+          }
+          let runId = claim.run_id;
+          if (runId === null && claim.thread_id && claimedActivityRowid !== null) {
+            const candidates = runsForClaim.all(
+              claim.thread_id,
+              claim.task_id,
+              claim.claimed_at,
+            );
+            if (candidates.length === 1) runId = candidates[0].id;
+          }
+          updateLegacyClaim.run(
+            claimedActivityRowid,
+            runId,
+            claim.task_id,
+            claim.claim_token,
+          );
+        }
+        this.database.exec("COMMIT");
+      } catch (error) {
+        this.database.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    this.database.exec("CREATE UNIQUE INDEX IF NOT EXISTS task_ai_starts_run ON task_ai_starts(run_id) WHERE run_id IS NOT NULL");
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS task_relations (
         relation_type TEXT NOT NULL CHECK (relation_type IN ('parent', 'blocks', 'related')),
@@ -1474,6 +1607,300 @@ export class TaskboardDatabase {
     return this.getTask(current.id);
   }
 
+  deleteAiChatRun(id) {
+    const run = this.getAiChatRun(id);
+    if (!run) return;
+    const timestamp = now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare("DELETE FROM ai_chat_runs WHERE id = ?").run(id);
+      this.database.prepare(`
+        UPDATE ai_chat_threads
+        SET status = 'idle', updated_at = ?
+        WHERE id = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM ai_chat_runs
+            WHERE thread_id = ? AND status = 'running'
+          )
+      `).run(timestamp, run.threadId, run.threadId);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  claimTaskForAiStart(id, expectedVersion, actor) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.getTask(id);
+      if (!current) {
+        throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+      }
+      this.#requireVersion(current, expectedVersion);
+      if (current.status !== "todo" || current.archivedAt !== null || current.threadId !== null) {
+        throw new ApiError(409, "TASK_NOT_STARTABLE", "Only ready tasks can be started with Codex");
+      }
+      const row = this.database.prepare(`
+        SELECT MIN(sort_order) AS minimum
+        FROM tasks
+        WHERE project_id = ? AND status = 'in_progress' AND archived_at IS NULL AND id != ?
+      `).get(current.projectId, current.id);
+      const sortOrder = row.minimum === null ? 1000 : row.minimum - 1000;
+      const timestamp = now();
+      const result = this.database.prepare(`
+        UPDATE tasks
+        SET status = 'in_progress', sort_order = ?, version = version + 1, updated_at = ?
+        WHERE id = ? AND version = ? AND status = 'todo' AND archived_at IS NULL
+      `).run(sortOrder, timestamp, current.id, expectedVersion);
+      if (result.changes !== 1) {
+        throw new ApiError(409, "TASK_NOT_STARTABLE", "Only ready tasks can be started with Codex");
+      }
+      const claimToken = randomUUID();
+      const activity = this.database.prepare(`
+        INSERT INTO task_activities (
+          id, task_id, actor_type, actor_id, actor_name, actor_avatar_url, changes, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        randomUUID(),
+        current.id,
+        actor.type,
+        actor.id,
+        actor.name,
+        actor.avatarUrl,
+        JSON.stringify(taskFieldChanges(current, { status: "in_progress" })),
+        timestamp,
+      );
+      this.database.prepare(`
+        INSERT INTO task_ai_starts (task_id, claim_token, thread_id, claimed_at, updated_at)
+        VALUES (?, ?, NULL, ?, ?)
+      `).run(current.id, claimToken, timestamp, timestamp);
+      this.database.prepare("UPDATE task_ai_starts SET claimed_activity_rowid = ? WHERE task_id = ? AND claim_token = ?")
+        .run(Number(activity.lastInsertRowid), current.id, claimToken);
+      this.database.exec("COMMIT");
+      return attachAiStartClaim(this.getTask(current.id), claimToken);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  releaseTaskFromAiStart(id, claimToken, actor) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.getTask(id);
+      if (!current) {
+        throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+      }
+      const claim = this.database.prepare(`
+        SELECT thread_id FROM task_ai_starts
+        WHERE task_id = ? AND claim_token = ?
+      `).get(id, claimToken);
+      if (!claim) {
+        throw new ApiError(409, "TASK_START_STATE_CHANGED", "Task start state changed before Codex finished starting");
+      }
+      if (current.status !== "in_progress" || current.threadId !== claim.thread_id) {
+        this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
+          .run(id, claimToken);
+        this.database.exec("COMMIT");
+        return current;
+      }
+      const timestamp = now();
+      const result = this.database.prepare(`
+        UPDATE tasks
+        SET status = 'todo', thread_id = NULL, version = version + 1, updated_at = ?
+        WHERE id = ? AND status = 'in_progress' AND thread_id IS ?
+      `).run(timestamp, current.id, claim.thread_id);
+      if (result.changes !== 1) {
+        throw new ApiError(
+          409,
+          "TASK_START_STATE_CHANGED",
+          "Task start state changed before Codex finished starting",
+        );
+      }
+      this.#recordTaskActivity(current.id, actor, taskFieldChanges(current, {
+        status: "todo",
+        threadId: null,
+      }), timestamp);
+      this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
+        .run(id, claimToken);
+      this.database.exec("COMMIT");
+      return this.getTask(current.id);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listTaskAiStarts() {
+    return this.database.prepare(`
+      SELECT task_id, claim_token, thread_id, run_id, claimed_at, updated_at, claimed_activity_rowid
+      FROM task_ai_starts
+      ORDER BY claimed_at, task_id
+    `).all().map((row) => ({
+      taskId: row.task_id,
+      claimToken: row.claim_token,
+      threadId: row.thread_id,
+      runId: row.run_id,
+      claimedAt: row.claimed_at,
+      updatedAt: row.updated_at,
+      claimedActivityRowid: row.claimed_activity_rowid,
+    }));
+  }
+
+  deleteTaskAiStartClaim(id, claimToken) {
+    this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
+      .run(id, claimToken);
+  }
+
+  bindTaskAiStart(id, claimToken, expectedVersion, threadId, actor) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.getTask(id);
+      if (!current) {
+        throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+      }
+      this.#requireVersion(current, expectedVersion);
+      const claim = this.database.prepare(`
+        SELECT thread_id FROM task_ai_starts
+        WHERE task_id = ? AND claim_token = ?
+      `).get(id, claimToken);
+      if (!claim || claim.thread_id !== null || current.status !== "in_progress" || current.threadId !== null) {
+        throw new ApiError(409, "TASK_START_STATE_CHANGED", "Task start state changed before Codex finished starting");
+      }
+      const timestamp = now();
+      const result = this.database.prepare(`
+        UPDATE tasks
+        SET thread_id = ?, version = version + 1, updated_at = ?
+        WHERE id = ? AND version = ? AND status = 'in_progress' AND thread_id IS NULL
+      `).run(threadId, timestamp, id, expectedVersion);
+      if (result.changes !== 1) {
+        throw new ApiError(409, "TASK_START_STATE_CHANGED", "Task start state changed before Codex finished starting");
+      }
+      const claimResult = this.database.prepare(`
+        UPDATE task_ai_starts SET thread_id = ?, updated_at = ?
+        WHERE task_id = ? AND claim_token = ? AND thread_id IS NULL
+      `).run(threadId, timestamp, id, claimToken);
+      if (claimResult.changes !== 1) {
+        throw new ApiError(409, "TASK_START_STATE_CHANGED", "Task start state changed before Codex finished starting");
+      }
+      this.#recordTaskActivity(current.id, actor, taskFieldChanges(current, { threadId }), timestamp);
+      this.database.exec("COMMIT");
+      return attachAiStartClaim(this.getTask(id), claimToken);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  bindTaskAiStartRun(id, claimToken, threadId, runId) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const claim = this.database.prepare(`
+        SELECT thread_id, run_id FROM task_ai_starts
+        WHERE task_id = ? AND claim_token = ?
+      `).get(id, claimToken);
+      const run = this.database.prepare(`
+        SELECT id, thread_id FROM ai_chat_runs WHERE id = ?
+      `).get(runId);
+      if (!claim || claim.thread_id !== threadId || claim.run_id !== null || !run || run.thread_id !== threadId) {
+        throw new ApiError(409, "TASK_START_STATE_CHANGED", "Task start state changed before Codex run was bound");
+      }
+      this.database.prepare(`
+        UPDATE task_ai_starts SET run_id = ?, updated_at = ?
+        WHERE task_id = ? AND claim_token = ? AND thread_id = ? AND run_id IS NULL
+      `).run(runId, now(), id, claimToken, threadId);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  verifyTaskAiStart(id, claimToken, expectedVersion, threadId) {
+    const current = this.getTask(id);
+    const claim = this.database.prepare(`
+      SELECT thread_id FROM task_ai_starts
+      WHERE task_id = ? AND claim_token = ?
+    `).get(id, claimToken);
+    if (
+      !current
+      || current.version !== expectedVersion
+      || current.status !== "in_progress"
+      || current.threadId !== threadId
+      || claim?.thread_id !== threadId
+    ) {
+      throw new ApiError(409, "TASK_START_STATE_CHANGED", "Task start state changed before Codex finished starting");
+    }
+    return current;
+  }
+
+  settleTaskAiStart(id, claimToken, runId, status, actor) {
+    if (!["in_review", "blocked"].includes(status)) {
+      throw new ApiError(400, "INVALID_FIELD", "Invalid AI start terminal status");
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.getTask(id);
+      if (!current) {
+        throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+      }
+      const claim = this.database.prepare(`
+        SELECT thread_id, run_id, claimed_at, claimed_activity_rowid FROM task_ai_starts
+        WHERE task_id = ? AND claim_token = ?
+      `).get(id, claimToken);
+      if (!claim) {
+        throw new ApiError(409, "TASK_START_STATE_CHANGED", "Task start state changed before Codex finished");
+      }
+      if (!claim.run_id || claim.run_id !== runId) {
+        throw new ApiError(409, "TASK_START_STATE_CHANGED", "Codex run does not own this task start claim");
+      }
+      if (current.status !== "in_progress" || current.threadId !== claim.thread_id) {
+        this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
+          .run(id, claimToken);
+        this.database.exec("COMMIT");
+        return current;
+      }
+      const latestStatusChange = this.latestTaskStatusChange(id, claim.claimed_activity_rowid);
+      if (latestStatusChange) {
+        this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
+          .run(id, claimToken);
+        this.database.exec("COMMIT");
+        return current;
+      }
+      const timestamp = now();
+      const result = this.database.prepare(`
+        UPDATE tasks SET status = ?, version = version + 1, updated_at = ?
+        WHERE id = ? AND status = 'in_progress' AND thread_id IS ?
+      `).run(status, timestamp, id, claim.thread_id);
+      if (result.changes !== 1) {
+        throw new ApiError(409, "TASK_START_STATE_CHANGED", "Task start state changed before Codex finished");
+      }
+      this.#recordTaskActivity(current.id, actor, taskFieldChanges(current, { status }), timestamp);
+      this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
+        .run(id, claimToken);
+      this.database.exec("COMMIT");
+      return this.getTask(id);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  latestTaskStatusChange(taskId, afterRowid = 0) {
+    const task = this.#requireTask(taskId);
+    const activities = this.database.prepare(`
+      SELECT changes, created_at FROM task_activities
+      WHERE task_id = ? AND rowid > ?
+      ORDER BY rowid DESC
+    `).all(task.id, afterRowid ?? 0);
+    for (const activity of activities) {
+      const change = JSON.parse(activity.changes).find((entry) => entry?.field === "status");
+      if (change) return { createdAt: activity.created_at, ...change };
+    }
+    return null;
+  }
+
   moveTask(id, version, status, sortOrder, threadId, actor) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
@@ -1711,7 +2138,7 @@ export class TaskboardDatabase {
     return this.database.prepare(`
       SELECT * FROM task_activities
       WHERE task_id = ?
-      ORDER BY created_at, id
+      ORDER BY rowid
     `).all(task.id).map(taskActivityFromRow);
   }
 

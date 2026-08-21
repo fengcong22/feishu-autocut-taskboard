@@ -20,6 +20,8 @@ import type {
   TaskStatus,
   WorkflowCapabilities,
   WorkflowWorkspaceRecord,
+  FeishuBaseCatalog,
+  FeishuSubjectConfig,
 } from "./types";
 
 const DEFAULT_USER_ACTOR: ActorIdentity = {
@@ -390,6 +392,54 @@ export async function updateTask(task: Task, draft: TaskDraft, threadId?: string
     body: JSON.stringify({ version: task.version, ...draft, ...(threadId ? { threadId } : {}) }),
   });
   return data.task;
+}
+
+export async function listFeishuWorkflowCatalog(signal?: AbortSignal): Promise<FeishuBaseCatalog[]> {
+  const data = await request<{ catalog: FeishuBaseCatalog[] }>("/api/local/feishu/workflow/catalog", { signal });
+  return data.catalog;
+}
+
+export async function upsertFeishuBasePreview(preview: unknown): Promise<FeishuBaseCatalog> {
+  const data = await request<{ catalog: FeishuBaseCatalog[] }>("/api/local/feishu/workflow/catalog", {
+    method: "POST", body: JSON.stringify(preview),
+  });
+  return data.catalog[0];
+}
+
+export async function saveFeishuSubjectDraft(subjectKey: string, patch: unknown): Promise<FeishuSubjectConfig> {
+  const data = await request<{ subject: FeishuSubjectConfig }>(`/api/local/feishu/workflow/subjects/${encodeURIComponent(subjectKey)}`, {
+    method: "PATCH", body: JSON.stringify(patch),
+  });
+  return data.subject;
+}
+
+export async function enableFeishuSubject(subjectKey: string, expectedVersion: number): Promise<FeishuSubjectConfig> {
+  const data = await request<{ subject: FeishuSubjectConfig }>(`/api/local/feishu/workflow/subjects/${encodeURIComponent(subjectKey)}/enable`, {
+    method: "POST", body: JSON.stringify({ expectedVersion }),
+  });
+  return data.subject;
+}
+
+export async function disableFeishuSubject(subjectKey: string, expectedVersion: number): Promise<FeishuSubjectConfig> {
+  const data = await request<{ subject: FeishuSubjectConfig }>(`/api/local/feishu/workflow/subjects/${encodeURIComponent(subjectKey)}/disable`, {
+    method: "POST", body: JSON.stringify({ expectedVersion }),
+  });
+  return data.subject;
+}
+
+export async function startTaskWithCodex(task: Task): Promise<{
+  task: Task;
+  thread: AiChatThread;
+  run: AiChatRun;
+}> {
+  return request<{
+    task: Task;
+    thread: AiChatThread;
+    run: AiChatRun;
+  }>(`/api/tasks/${encodeURIComponent(task.id)}/start-ai`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
 }
 
 export async function moveTask(
