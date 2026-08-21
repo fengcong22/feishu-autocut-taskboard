@@ -3,6 +3,10 @@ import { ApiError } from "./database.mjs";
 export function createFeishuWorkflowApi({ store }) {
   return {
     async handle({ method, pathname, body }) {
+      if (pathname === "/api/local/feishu/workflow/subjects") {
+        if (method !== "GET") throw new ApiError(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+        return { status: 200, body: { subjects: (await store.listCatalog()).flatMap((base) => base.subjects) } };
+      }
       if (pathname === "/api/local/feishu/workflow/catalog") {
         if (method === "GET") return { status: 200, body: { catalog: await store.listCatalog() } };
         if (method === "POST") return { status: 201, body: { catalog: [await store.upsertBasePreview(body)] } };
@@ -20,9 +24,11 @@ export function createFeishuWorkflowApi({ store }) {
           : await store.disableSubject(subjectKey, body.expectedVersion);
         return { status: 200, body: { subject } };
       }
+      if (method === "GET") {
+        return { status: 200, body: { subject: await store.getSubject(subjectKey) } };
+      }
       if (method !== "PATCH") throw new ApiError(405, "METHOD_NOT_ALLOWED", "Method not allowed");
       return { status: 200, body: { subject: await store.saveSubjectDraft(subjectKey, body) } };
     },
   };
 }
-

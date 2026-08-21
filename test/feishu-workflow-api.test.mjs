@@ -32,6 +32,12 @@ test("local Feishu workflow API persists preview and subject lifecycle", async (
     assert.equal(preview.response.status, 201);
     assert.equal(preview.body.catalog[0].subjects[0].lifecycle, "draft");
     const key = encodeURIComponent("bas_api:tbl_a");
+    const subjects = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/subjects");
+    assert.equal(subjects.response.status, 200);
+    assert.equal(subjects.body.subjects[0].subjectKey, "bas_api:tbl_a");
+    const single = await request(fixtureData.baseUrl, `/api/local/feishu/workflow/subjects/${key}`);
+    assert.equal(single.response.status, 200);
+    assert.equal(single.body.subject.subjectKey, "bas_api:tbl_a");
     const draft = await request(fixtureData.baseUrl, `/api/local/feishu/workflow/subjects/${key}`, {
       method: "PATCH",
       body: { trigger: { fieldId: "fld_status", fieldName: "状态", startValue: "待剪辑", optionId: null }, title: { fieldId: null, fieldName: null }, execution: { mode: "manual", concurrencyGroup: "g", maxConcurrent: 1, resourceGroups: [] }, packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-A", subjectCodeFieldId: null, branchMap: null }, upload: { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 } },
@@ -47,4 +53,3 @@ test("local Feishu workflow API persists preview and subject lifecycle", async (
     await rm(fixtureData.directory, { recursive: true, force: true });
   }
 });
-
