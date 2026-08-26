@@ -61,6 +61,14 @@ function plainObject(value, name) {
   return value;
 }
 
+function assertDraftFields(value) {
+  for (const field of ["state", "updatedAt", "revision", "expectedRevision"]) {
+    if (Object.hasOwn(value, field)) {
+      throw new PackageConfigError("PACKAGE_INVALID", `${field} is managed by the package store`, undefined, 400);
+    }
+  }
+}
+
 function normalizeRecord(aliasKey, raw, { now = nowIso, legacy = false } = {}) {
   const entry = plainObject(raw, `packages.${aliasKey}`);
   const alias = packageAlias(entry.alias ?? aliasKey);
@@ -136,7 +144,14 @@ function validateModel(record, catalog) {
       "Auto-Cut package requires a model and reasoning effort before enabling",
     );
   }
-  if (!catalog) return;
+  if (!catalog) {
+    throw new PackageConfigError(
+      "PACKAGE_MODEL_CATALOG_UNAVAILABLE",
+      "Codex model catalog is unavailable",
+      undefined,
+      503,
+    );
+  }
   const model = catalogModels(catalog).find((candidate) => (
     candidate?.slug === record.model || candidate?.id === record.model
   ));
@@ -266,6 +281,7 @@ export function createFeishuPackageStore({
     const aliasFromChanges = changes.alias === undefined ? originalAlias : packageAlias(changes.alias);
     if (!aliasFromChanges) throw new PackageConfigError("PACKAGE_INVALID", "package alias is required", undefined, 400);
     return enqueueMutation(async () => {
+      assertDraftFields(changes);
       const catalog = await readCatalog();
     const existing = catalog[originalAlias ?? aliasFromChanges] ?? null;
     if (existing && !originalAlias && expectedRevision === undefined && changes.expectedRevision === undefined) {

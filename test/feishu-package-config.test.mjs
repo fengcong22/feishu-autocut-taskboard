@@ -37,7 +37,9 @@ test("managed Auto-Cut package store supports draft, enable, snapshot and CAS", 
     );
 
     const edited = await store.saveDraft({
-      ...draft,
+      alias: draft.alias,
+      name: draft.name,
+      projectId: draft.projectId,
       workspacePath: workspace,
       model: "gpt-test",
       reasoningEffort: "high",
@@ -54,7 +56,7 @@ test("managed Auto-Cut package store supports draft, enable, snapshot and CAS", 
     snapshot.prompt = "mutated";
     assert.equal((await store.get(enabled.alias)).prompt, "run the fixture workflow");
     await assert.rejects(
-      () => store.saveDraft({ ...enabled, name: "stale" }, edited.revision),
+      () => store.saveDraft({ alias: enabled.alias, name: "stale", projectId: enabled.projectId }, edited.revision),
       (error) => error instanceof PackageConfigError && error.code === "PACKAGE_REVISION_CONFLICT",
     );
 
@@ -120,6 +122,30 @@ test("enable rejects an unsupported model and reasoning effort", async () => {
   }
 });
 
+test("enable rejects a missing model catalog", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-no-catalog-"));
+  const workspace = path.join(directory, "workspace");
+  await mkdir(workspace);
+  try {
+    const store = createFeishuPackageStore({ packages: {} });
+    const draft = await store.saveDraft({
+      alias: "Auto-cut-no-catalog",
+      name: "No catalog",
+      projectId: "auto-cut-no-catalog",
+      workspacePath: workspace,
+      model: "gpt-test",
+      reasoningEffort: "high",
+      prompt: "fixture",
+    });
+    await assert.rejects(
+      () => store.enable(draft.alias, draft.revision),
+      (error) => error instanceof PackageConfigError && error.code === "PACKAGE_MODEL_CATALOG_UNAVAILABLE",
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("concurrent mutations serialize compare-and-swap against the latest revision", async () => {
   const store = createFeishuPackageStore({ packages: {} });
   const draft = await store.saveDraft({ alias: "Auto-cut-race", name: "Race", projectId: "auto-cut-race" });
@@ -142,4 +168,16 @@ test("malformed registry fails closed instead of becoming an empty catalog", asy
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("store saveDraft rejects server-managed fields", async () => {
+  const store = createFeishuPackageStore({ packages: {} });
+  await assert.rejects(
+    () => store.saveDraft({ alias: "Auto-cut-managed", name: "Managed", projectId: "managed", state: "enabled" }),
+    (error) => error instanceof PackageConfigError && error.code === "PACKAGE_INVALID",
+  );
+  await assert.rejects(
+    () => store.saveDraft({ alias: "Auto-cut-managed", name: "Managed", projectId: "managed", updatedAt: "2099-01-01T00:00:00.000Z" }),
+    (error) => error instanceof PackageConfigError && error.code === "PACKAGE_INVALID",
+  );
 });

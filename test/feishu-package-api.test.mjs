@@ -81,3 +81,16 @@ test("package mutations reject server-managed fields and catalog validates works
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("catalog maps discovery failures to a stable controlled error", async () => {
+  const store = createFeishuPackageStore({ packages: {} });
+  const api = createFeishuPackageApi({ store, getModelCatalog: async () => { throw new Error("sensitive internal output"); } });
+  await assert.rejects(
+    () => api.handle({
+      method: "POST",
+      pathname: "/api/local/autocut/packages/catalog",
+      body: { workspacePath: process.cwd() },
+    }),
+    (error) => error.code === "PACKAGE_MODEL_CATALOG_UNAVAILABLE",
+  );
+});
