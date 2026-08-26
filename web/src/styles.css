@@ -382,6 +382,54 @@ kbd {
   white-space: nowrap;
 }
 
+.feishu-package-manager {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.34fr) minmax(0, 1fr);
+  gap: 1px;
+  min-height: 520px;
+  height: calc(100vh - 110px);
+  overflow: hidden;
+  background: var(--border);
+}
+.feishu-package-list,
+.feishu-package-editor { background: var(--surface); padding: 18px; overflow: auto; }
+.feishu-package-list-header,
+.feishu-package-editor-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+.feishu-package-list h2,
+.feishu-package-editor h2 { margin: 0; font-size: 15px; color: var(--text-primary); }
+.feishu-package-list-header button,
+.feishu-package-actions button { border: 1px solid var(--border-strong); border-radius: 5px; background: var(--surface); color: var(--text-primary); padding: 6px 10px; cursor: pointer; }
+.feishu-package-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.feishu-package-actions .danger { color: var(--danger); }
+.feishu-package-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px; width: 100%; margin: 2px 0; padding: 9px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--text-secondary); text-align: left; cursor: pointer; }
+.feishu-package-row:hover,
+.feishu-package-row.active { background: var(--surface-active); color: var(--text-primary); }
+.feishu-package-row strong,
+.feishu-package-row small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.feishu-package-row small { margin-top: 2px; color: var(--text-tertiary); font-size: 11px; }
+.feishu-package-state { font-size: 11px; }
+.state-enabled { color: var(--success); }
+.state-disabled { color: var(--warning); }
+.state-draft { color: var(--text-tertiary); }
+.feishu-package-refs { color: var(--text-tertiary); font-size: 11px; white-space: nowrap; }
+.feishu-package-reference-warning { margin: 0 0 16px; padding: 10px 12px; border: 1px solid var(--warning); border-radius: 6px; background: var(--danger-soft); color: var(--text-secondary); font-size: 12px; }
+.feishu-package-reference-warning ul { margin: 6px 0 0; padding-left: 18px; }
+.feishu-package-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; max-width: 820px; }
+.feishu-package-form label { display: flex; flex-direction: column; gap: 5px; color: var(--text-secondary); font-size: 12px; }
+.feishu-package-form input,
+.feishu-package-form select,
+.feishu-package-form textarea { width: 100%; box-sizing: border-box; border: 1px solid var(--border-strong); border-radius: 5px; background: var(--surface); color: var(--text-primary); padding: 8px; font: inherit; }
+.feishu-package-form textarea { resize: vertical; }
+.feishu-package-form .wide { grid-column: 1 / -1; }
+.feishu-package-form + .secondary,
+.feishu-package-editor .secondary { margin: -4px 0 0; width: fit-content; border: 1px solid var(--border-strong); border-radius: 5px; background: var(--surface); color: var(--text-primary); padding: 6px 10px; cursor: pointer; }
+@media (max-width: 720px) {
+  .feishu-package-manager { grid-template-columns: 1fr; height: auto; overflow: visible; }
+  .feishu-package-list { max-height: 260px; }
+  .feishu-package-form { grid-template-columns: 1fr; }
+  .feishu-package-form .wide { grid-column: auto; }
+}
+
 .nav-spacer {
   flex: 1;
   min-height: 20px;

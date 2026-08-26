@@ -68,6 +68,7 @@ import { TaskboardIcon } from "./components/TaskboardIcon";
 import { TaskContextMenu } from "./components/TaskContextMenu";
 import { TaskDetail } from "./components/TaskDetail";
 import { FeishuWorkflowPanel } from "./components/FeishuWorkflowPanel";
+import { FeishuPackageManager } from "./components/FeishuPackageManager";
 import { TaskEditor, type NewTaskEditorDraft } from "./components/TaskEditor";
 import { TaskFilterMenu } from "./components/TaskFilterMenu";
 import { taskboardStorage } from "./storage";
@@ -127,7 +128,7 @@ import { createRevisionPoller, getRevisionPollingInterval } from "./revisionPoll
 
 type ConnectionState = "connecting" | "live" | "reconnecting";
 type Theme = "light" | "dark";
-type BoardView = "dashboard" | "issues" | "list" | "gantt" | "workflow";
+type BoardView = "dashboard" | "issues" | "list" | "gantt" | "workflow" | "autocut_packages";
 type DetailSourceScroll =
   | { projectId: string; view: "issues"; status: TaskStatus; scrollTop: number }
   | { projectId: string; view: "list"; scrollTop: number };
@@ -291,6 +292,7 @@ function readIssueActivityKeys(storageKey: string): Record<string, string> {
 function readProjectBoardView(projectId: string): BoardView {
   const view = taskboardStorage.getItem(`${PROJECT_VIEW_KEY_PREFIX}${projectId}`);
   return view === "dashboard" || view === "list" || view === "gantt" || view === "issues"
+    || view === "autocut_packages"
     ? view
     : "issues";
 }
@@ -2471,6 +2473,10 @@ export function App() {
               {text("议题", "Issues")}
               <span className="nav-count">{tasks.length}</span>
             </button>
+            <button className={`nav-item${boardView === "autocut_packages" ? " active" : ""}`} type="button" aria-current={boardView === "autocut_packages" ? "page" : undefined} onClick={() => selectBoardView("autocut_packages")}>
+              <span className="nav-glyph" aria-hidden="true"><LinearIcon name="project" /></span>
+              {text("Auto-Cut 包", "Auto-Cut packages")}
+            </button>
           </nav>
 
           <div className="nav-spacer" />
@@ -2609,7 +2615,7 @@ export function App() {
           </div>
         </header>
 
-        {selectedProjectId && !detailTask && <div className="board-toolbar">
+        {selectedProjectId && !detailTask && boardView !== "autocut_packages" && <div className="board-toolbar">
           <div className="view-tabs" aria-label={text("看板视图", "Board views")}>
             <button
               className={`view-tab${boardView === "dashboard" ? " active" : ""}`}
@@ -2776,6 +2782,8 @@ export function App() {
             startingCodex={startingCodexTaskId === detailTask.id}
             onError={setActionError}
           />
+        ) : boardView === "autocut_packages" ? (
+          <FeishuPackageManager onError={(message) => setActionError(message)} />
         ) : boardView === "dashboard" ? (
           <DashboardView
             key={selectedProjectId}
