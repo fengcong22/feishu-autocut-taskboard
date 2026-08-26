@@ -19,9 +19,10 @@ import { resolveCodexExecutable } from "../shared/codex-executable.mjs";
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
 import { normalizeWorkflowSnapshot } from "../shared/workflow-control-flow.mjs";
 import { AiChatService } from "./ai-chat.mjs";
-import { resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
+import { discoverAiCatalog, resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
 import { createCloudConfigStore } from "./cloud-config.mjs";
 import { createFeishuPackageStore } from "./feishu-package-config.mjs";
+import { createFeishuPackageApi } from "./feishu-package-api.mjs";
 import {
   CloudProxyError,
   createCloudProxy,
@@ -1394,6 +1395,18 @@ export function createTaskboardServer(options = {}) {
   );
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
+  const feishuPackages = options.feishuPackageStore ?? createFeishuPackageStore({
+    filename: resolved.feishuPackagesPath,
+    packages: options.feishuPackages,
+  });
+  const feishuPackageApi = createFeishuPackageApi({
+    store: feishuPackages,
+    getModelCatalog: async (workspacePath) => discoverAiCatalog({
+      codexExecutable: resolved.codexExecutable,
+      workspacePath,
+      processEnv: codexProcessEnvironment,
+    }),
+  });
   const feishuWorkflowApi = createFeishuWorkflowApi({
     store: createFeishuWorkflowStore({ database }),
   });
@@ -2013,6 +2026,19 @@ export function createTaskboardServer(options = {}) {
         assertAiLoopbackRequest(request);
       } else if (pathname.startsWith("/api/local/")) {
         assertLoopbackRequest(request);
+      }
+      if (pathname === "/api/local/autocut/packages"
+        || pathname.startsWith("/api/local/autocut/packages/")) {
+        const result = await feishuPackageApi.handle({
+          method: request.method,
+          pathname,
+          body: request.method === "GET" ? null : (
+            request.method === "DELETE" && !request.headers["content-length"]
+              ? null
+              : await readJson(request)
+          ),
+        });
+        if (result) return sendJson(response, result.status, result.body);
       }
       const isMachineCapabilityRoute = pathname === "/api/meta"
         || pathname === "/api/device-workspaces"
