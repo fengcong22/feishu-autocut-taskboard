@@ -112,3 +112,30 @@ test("catalog maps discovery failures to a stable controlled error", async () =>
     (error) => error.code === "PACKAGE_MODEL_CATALOG_UNAVAILABLE",
   );
 });
+
+test("package listing includes real reference summaries from the store", async () => {
+  const base = {
+    alias: "Auto-cut-references",
+    name: "References",
+    projectId: "references",
+    workspacePath: null,
+    model: null,
+    reasoningEffort: null,
+    prompt: null,
+    zipSourceDirectory: null,
+    maxConcurrent: 1,
+  };
+  const store = createFeishuPackageStore({ packages: { [base.alias]: base } });
+  const original = store.references;
+  let calledWith = null;
+  store.references = async (alias) => {
+    calledWith = alias;
+    return [{ subjectKey: "base/table", subjectName: "语文" }];
+  };
+  const api = createFeishuPackageApi({ store });
+  const result = await api.handle({ method: "GET", pathname: "/api/local/autocut/packages", body: null });
+  assert.equal(calledWith, base.alias);
+  assert.deepEqual(result.body.packages[0].references, [{ subjectKey: "base/table", subjectName: "语文" }]);
+  assert.equal(result.body.packages[0].referenceCount, 1);
+  store.references = original;
+});

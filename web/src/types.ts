@@ -181,6 +181,40 @@ export interface Project {
   updatedAt: string;
 }
 
+export type FeishuPackageState = "draft" | "enabled" | "disabled";
+
+export interface FeishuPackage {
+  alias: string;
+  name: string;
+  projectName?: string;
+  projectId: string;
+  workspacePath: string | null;
+  model: string | null;
+  reasoningEffort: string | null;
+  prompt: string | null;
+  zipSourceDirectory: string | null;
+  maxConcurrent: number;
+  state: FeishuPackageState;
+  revision: number;
+  updatedAt: string;
+  referenceCount?: number;
+  references?: unknown[];
+}
+
+export interface FeishuFieldOption {
+  id: string;
+  name: string;
+  color?: number;
+}
+
+export interface FeishuFieldMetadata {
+  fieldId: string;
+  fieldName: string;
+  type: number | string | null;
+  uiType: string | null;
+  options: FeishuFieldOption[];
+}
+
 export interface FeishuSubjectConfig {
   subjectKey: string;
   baseToken: string;
@@ -196,7 +230,7 @@ export interface FeishuSubjectConfig {
   execution?: { mode: "manual" | "automatic"; concurrencyGroup: string; maxConcurrent: number; resourceGroups: string[] };
   packageRoute?: { routeMode: "fixed"; packageAlias: string; subjectCodeFieldId: string | null; branchMap: Record<string, string> | null };
   upload?: { enqueueMode: "manual" | "automatic"; artifactSourceMode: string; artifactSourcePath: string | null; targetId: string | null; targetPath: string | null; uploadConcurrency: number };
-  metadata?: { fields?: unknown[] };
+  metadata?: { fields?: FeishuFieldMetadata[] };
   createdAt: string;
   updatedAt: string;
 }
@@ -209,6 +243,30 @@ export interface FeishuBaseCatalog {
   subjects: FeishuSubjectConfig[];
   createdAt: string;
   updatedAt: string;
+}
+
+export interface FeishuWorkflowShareConfiguration {
+  schemaVersion: number;
+  configVersion?: number;
+  createdAt?: string | number | null;
+  updatedAt?: string | number | null;
+  bases: FeishuBaseCatalog[];
+}
+
+export interface FeishuWorkflowShareDiagnostic {
+  code: string;
+  severity: "info" | "warning" | "error";
+  path?: string;
+  alias?: string;
+  message: string;
+}
+
+export interface FeishuWorkflowShareResult {
+  configuration: FeishuWorkflowShareConfiguration;
+  catalog?: FeishuBaseCatalog[];
+  diagnostics: FeishuWorkflowShareDiagnostic[];
+  diagnosticsOk?: boolean;
+  dryRun: boolean;
 }
 
 export interface ProjectSummary {
@@ -277,6 +335,7 @@ export interface Task {
   version: number;
   createdAt: string;
   updatedAt: string;
+  feishuOrigin?: FeishuTaskOrigin;
 }
 
 export interface Comment {
@@ -319,6 +378,66 @@ export interface Attachment {
   contentType: string;
   size: number;
   createdAt: string;
+}
+
+export interface TaskArtifact {
+  id: string;
+  taskId: string;
+  filename: string;
+  contentType: string;
+  size: number;
+  sha256: string;
+  sourceMode: string;
+  validationStatus: string;
+  entryCount: number;
+  draftRoot: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface FeishuTaskOrigin {
+  taskId?: string;
+  version: number;
+  source: "feishu-base";
+  eventId: string;
+  baseToken: string;
+  tableId: string;
+  recordId: string;
+  triggerField?: string;
+  triggerFieldId?: string;
+  triggerValue?: string;
+  subjectKey?: string;
+  configVersion?: number;
+  mode?: "manual" | "automatic";
+  executionMode?: "manual" | "automatic";
+  uploadMode?: "manual" | "automatic";
+  packageAlias?: string;
+  packageSource?: string;
+  concurrencyGroup?: string;
+  maxConcurrent?: number;
+  resourceGroups?: string[];
+}
+
+export interface ArtifactUpload {
+  id: string;
+  taskId: string;
+  artifactId: string;
+  subjectKey: string;
+  filename: string;
+  sha256: string;
+  status: "queued" | "uploading" | "uploaded" | "failed";
+  attemptCount: number;
+  errorCode: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  updatedAt: string;
+}
+
+export interface ArtifactUploadListItem {
+  upload: ArtifactUpload;
+  task: Task;
 }
 
 export interface HostContext {

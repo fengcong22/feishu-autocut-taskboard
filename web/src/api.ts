@@ -7,6 +7,8 @@ import type {
   AiChatThread,
   AiChatThreadSnapshot,
   Attachment,
+  ArtifactUpload,
+  ArtifactUploadListItem,
   Comment,
   DevelopmentScan,
   HostContext,
@@ -14,6 +16,7 @@ import type {
   Project,
   ProjectSummary,
   Task,
+  TaskArtifact,
   TaskChangeActivity,
   TaskboardMetadata,
   TaskDraft,
@@ -22,6 +25,9 @@ import type {
   WorkflowWorkspaceRecord,
   FeishuBaseCatalog,
   FeishuSubjectConfig,
+  FeishuWorkflowShareConfiguration,
+  FeishuWorkflowShareResult,
+  FeishuPackage,
 } from "./types";
 
 const DEFAULT_USER_ACTOR: ActorIdentity = {
@@ -399,6 +405,44 @@ export async function listFeishuWorkflowCatalog(signal?: AbortSignal): Promise<F
   return data.catalog;
 }
 
+export async function listFeishuPackages(signal?: AbortSignal): Promise<FeishuPackage[]> {
+  const data = await request<{ packages: FeishuPackage[] }>("/api/local/autocut/packages", { signal });
+  return data.packages;
+}
+
+export async function getFeishuPackage(alias: string): Promise<FeishuPackage> {
+  const data = await request<{ package: FeishuPackage }>(`/api/local/autocut/packages/${encodeURIComponent(alias)}`);
+  return data.package;
+}
+
+export async function saveFeishuPackageDraft(alias: string | null, patch: Partial<FeishuPackage> & { expectedRevision?: number }): Promise<FeishuPackage> {
+  const data = await request<{ package: FeishuPackage }>(alias
+    ? `/api/local/autocut/packages/${encodeURIComponent(alias)}`
+    : "/api/local/autocut/packages", {
+    method: alias ? "PATCH" : "POST", body: JSON.stringify(patch),
+  });
+  return data.package;
+}
+
+export async function enableFeishuPackage(alias: string, revision: number): Promise<FeishuPackage> {
+  const data = await request<{ package: FeishuPackage }>(`/api/local/autocut/packages/${encodeURIComponent(alias)}/enable`, { method: "POST", body: JSON.stringify({ revision }) });
+  return data.package;
+}
+
+export async function disableFeishuPackage(alias: string, revision: number): Promise<FeishuPackage> {
+  const data = await request<{ package: FeishuPackage }>(`/api/local/autocut/packages/${encodeURIComponent(alias)}/disable`, { method: "POST", body: JSON.stringify({ revision }) });
+  return data.package;
+}
+
+export async function removeFeishuPackage(alias: string, revision: number): Promise<FeishuPackage> {
+  const data = await request<{ package: FeishuPackage }>(`/api/local/autocut/packages/${encodeURIComponent(alias)}`, { method: "DELETE", body: JSON.stringify({ revision }) });
+  return data.package;
+}
+
+export async function discoverFeishuPackageModels(workspacePath: string): Promise<AiChatCatalog | { models?: AiChatModel[] }> {
+  return request(`/api/local/autocut/packages/catalog`, { method: "POST", body: JSON.stringify({ workspacePath }) });
+}
+
 export async function upsertFeishuBasePreview(preview: unknown): Promise<FeishuBaseCatalog> {
   const data = await request<{ catalog: FeishuBaseCatalog[] }>("/api/local/feishu/workflow/catalog", {
     method: "POST", body: JSON.stringify(preview),
@@ -427,6 +471,46 @@ export async function disableFeishuSubject(subjectKey: string, expectedVersion: 
   return data.subject;
 }
 
+export async function setFeishuSubjectDisplayEnabled(subjectKey: string, displayEnabled: boolean): Promise<FeishuSubjectConfig> {
+  const data = await request<{ subject: FeishuSubjectConfig }>(`/api/local/feishu/workflow/subjects/${encodeURIComponent(subjectKey)}/display`, {
+    method: "PATCH", body: JSON.stringify({ displayEnabled }),
+  });
+  return data.subject;
+}
+
+export async function removeFeishuBase(baseToken: string): Promise<FeishuBaseCatalog[]> {
+  const data = await request<{ catalog: FeishuBaseCatalog[] }>(`/api/local/feishu/workflow/bases/${encodeURIComponent(baseToken)}`, {
+    method: "DELETE",
+    body: JSON.stringify({}),
+  });
+  return data.catalog;
+}
+
+export async function removeFeishuSubject(subjectKey: string): Promise<FeishuBaseCatalog[]> {
+  const data = await request<{ catalog: FeishuBaseCatalog[] }>(`/api/local/feishu/workflow/subjects/${encodeURIComponent(subjectKey)}`, {
+    method: "DELETE",
+    body: JSON.stringify({}),
+  });
+  return data.catalog;
+}
+
+export async function exportFeishuWorkflowShare(): Promise<FeishuWorkflowShareConfiguration> {
+  const data = await request<{ configuration: FeishuWorkflowShareConfiguration }>(
+    "/api/local/feishu/workflow/share/export",
+  );
+  return data.configuration;
+}
+
+export async function importFeishuWorkflowShare(
+  configuration: FeishuWorkflowShareConfiguration,
+  dryRun = false,
+): Promise<FeishuWorkflowShareResult> {
+  return request<FeishuWorkflowShareResult>("/api/local/feishu/workflow/share/import", {
+    method: "POST",
+    body: JSON.stringify({ configuration, dryRun }),
+  });
+}
+
 export async function startTaskWithCodex(task: Task): Promise<{
   task: Task;
   thread: AiChatThread;
@@ -439,6 +523,42 @@ export async function startTaskWithCodex(task: Task): Promise<{
   }>(`/api/tasks/${encodeURIComponent(task.id)}/start-ai`, {
     method: "POST",
     body: JSON.stringify({}),
+  });
+}
+
+export async function executeTaskWithCodex(
+  task: Task,
+  trigger: "manual" | "move" | "automatic" = "manual",
+): Promise<{
+  task: Task;
+  thread: AiChatThread;
+  run: AiChatRun;
+  execution?: {
+    executionId: string;
+    leaseId: string;
+    state: string;
+    trigger: string;
+    mode: string;
+    concurrencyGroup: string;
+    resourceGroups: string[];
+  };
+}> {
+  return request<{
+    task: Task;
+    thread: AiChatThread;
+    run: AiChatRun;
+    execution?: {
+      executionId: string;
+      leaseId: string;
+      state: string;
+      trigger: string;
+      mode: string;
+      concurrencyGroup: string;
+      resourceGroups: string[];
+    };
+  }>(`/api/local/tasks/${encodeURIComponent(task.id)}/execute`, {
+    method: "POST",
+    body: JSON.stringify({ trigger }),
   });
 }
 
@@ -571,6 +691,96 @@ export async function listAttachments(taskId: string, signal?: AbortSignal): Pro
     { signal },
   );
   return data.attachments;
+}
+
+export async function listTaskArtifacts(taskId: string, signal?: AbortSignal): Promise<TaskArtifact[]> {
+  const data = await request<{ artifacts: TaskArtifact[] }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/artifacts`,
+    { signal },
+  );
+  return data.artifacts;
+}
+
+export async function uploadTaskArtifact(
+  taskId: string,
+  file: File,
+): Promise<{
+  artifact: TaskArtifact;
+  task: Task;
+  upload?: ArtifactUpload;
+  uploadEnqueueError?: { code: string; message: string };
+}> {
+  return request<{
+    artifact: TaskArtifact;
+    task: Task;
+    upload?: ArtifactUpload;
+    uploadEnqueueError?: { code: string; message: string };
+  }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/artifacts`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": file.type || "application/zip",
+        "X-Taskboard-Filename": encodeURIComponent(file.name),
+      },
+      body: file,
+    },
+  );
+}
+
+export async function deleteTaskArtifact(artifactId: string): Promise<void> {
+  await request(`/api/local/artifacts/${encodeURIComponent(artifactId)}`, {
+    method: "DELETE",
+  });
+}
+
+export function artifactDownloadUrl(artifactId: string): string {
+  return `api/local/artifacts/${encodeURIComponent(artifactId)}/download`;
+}
+
+export async function listTaskArtifactUploads(
+  taskId: string,
+  signal?: AbortSignal,
+): Promise<ArtifactUpload[]> {
+  const data = await request<{ uploads: ArtifactUpload[] }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/upload`,
+    { signal },
+  );
+  return data.uploads;
+}
+
+export async function listArtifactUploads(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ArtifactUploadListItem[]> {
+  const params = new URLSearchParams({ projectId });
+  const data = await request<{ items: ArtifactUploadListItem[] }>(
+    `/api/local/artifact-uploads?${params}`,
+    { signal },
+  );
+  return data.items;
+}
+
+export async function enqueueTaskArtifactUpload(
+  taskId: string,
+  artifactId: string,
+): Promise<ArtifactUpload> {
+  const data = await request<{ upload: ArtifactUpload }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/upload-queue`,
+    { method: "POST", body: JSON.stringify({ artifactId }) },
+  );
+  return data.upload;
+}
+
+export async function retryTaskArtifactUpload(
+  taskId: string,
+  uploadId: string,
+): Promise<ArtifactUpload> {
+  const data = await request<{ upload: ArtifactUpload }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/upload/retry`,
+    { method: "POST", body: JSON.stringify({ uploadId }) },
+  );
+  return data.upload;
 }
 
 export async function uploadAttachment(taskId: string, file: File): Promise<Attachment> {

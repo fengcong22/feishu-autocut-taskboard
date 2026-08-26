@@ -82,7 +82,14 @@ export function createFeishuPackageApi({ store, getModelCatalog = null } = {}) {
     async handle({ method, pathname, body }) {
       try {
         if (pathname === PACKAGE_ROOT) {
-          if (method === "GET") return { status: 200, body: { packages: await store.list() } };
+          if (method === "GET") {
+            const packages = await store.list();
+            const enriched = await Promise.all(packages.map(async (record) => {
+              const references = await store.references(record.alias);
+              return { ...record, references, referenceCount: references.length };
+            }));
+            return { status: 200, body: { packages: enriched } };
+          }
           if (method === "POST") {
             const input = packagePatch(body);
             const record = await store.saveDraft(input);
