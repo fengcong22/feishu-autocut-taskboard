@@ -4,6 +4,7 @@ import path from "node:path";
 const REGISTRY_VERSION = 1;
 const STATES = new Set(["draft", "enabled", "disabled"]);
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
+const registryMutationQueues = new Map();
 
 export class PackageConfigError extends Error {
   constructor(code, message, details = undefined, status = 409) {
@@ -17,6 +18,22 @@ export class PackageConfigError extends Error {
 
 function nowIso() { return new Date().toISOString(); }
 function clone(value) { return value === undefined ? undefined : structuredClone(value); }
+
+function mutationQueueFor(filename) {
+  if (!filename) return Promise.resolve();
+  const key = path.resolve(filename);
+  if (!registryMutationQueues.has(key)) registryMutationQueues.set(key, Promise.resolve());
+  return registryMutationQueues.get(key);
+}
+
+function enqueueRegistryMutation(filename, operation) {
+  if (!filename) return operation();
+  const key = path.resolve(filename);
+  const previous = mutationQueueFor(filename);
+  const result = previous.catch(() => {}).then(operation);
+  registryMutationQueues.set(key, result.catch(() => {}));
+  return result;
+}
 
 function requireText(value, name, { optional = false } = {}) {
   if (value === undefined || value === null) {
@@ -205,7 +222,7 @@ export function createFeishuPackageStore({
   getModelCatalog = null,
 } = {}) {
   let inline = packages === undefined ? null : normalizeFeishuPackages(packages, { now });
-  let mutationQueue = Promise.resolve();
+  let mutationQueue = mutationQueueFor(filename);
 
   async function readCatalog() {
     if (inline !== null) return clone(inline);
@@ -240,6 +257,7 @@ export function createFeishuPackageStore({
   }
 
   function enqueueMutation(operation) {
+    if (filename) return enqueueRegistryMutation(filename, operation);
     const result = mutationQueue.catch(() => {}).then(operation);
     mutationQueue = result.catch(() => {});
     return result;

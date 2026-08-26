@@ -7,7 +7,10 @@ import { PackageConfigError } from "./feishu-package-config.mjs";
 const PACKAGE_ROOT = "/api/local/autocut/packages";
 const PACKAGE_FIELDS = new Set([
   "alias", "name", "projectName", "projectId", "workspacePath", "model", "reasoningEffort",
-  "prompt", "zipSourceDirectory", "maxConcurrent", "revision", "expectedRevision",
+  "prompt", "zipSourceDirectory", "maxConcurrent",
+]);
+const PACKAGE_MUTATION_FIELDS = new Set([
+  ...PACKAGE_FIELDS, "revision", "expectedRevision",
 ]);
 
 function plainObject(value, name) {
@@ -60,9 +63,9 @@ async function discoverCatalog(getModelCatalog, workspacePath) {
   }
 }
 
-function packagePatch(body) {
+function packagePatch(body, { allowRevision = false } = {}) {
   plainObject(body, "package");
-  assertAllowed(body, PACKAGE_FIELDS, "package");
+  assertAllowed(body, allowRevision ? PACKAGE_MUTATION_FIELDS : PACKAGE_FIELDS, "package");
   const patch = { ...body };
   if (patch.name === undefined && patch.projectName !== undefined) patch.name = patch.projectName;
   delete patch.projectName;
@@ -135,7 +138,7 @@ export function createFeishuPackageApi({ store, getModelCatalog = null } = {}) {
         if (method === "PATCH") {
           const input = plainObject(body, "package");
           const expectedRevision = revision(input);
-          const record = await store.saveDraft(alias, packagePatch(input), expectedRevision);
+          const record = await store.saveDraft(alias, packagePatch(input, { allowRevision: true }), expectedRevision);
           return { status: 200, body: { package: record } };
         }
         if (method === "DELETE") {

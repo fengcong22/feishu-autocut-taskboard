@@ -61,6 +61,21 @@ test("local Auto-Cut package API exposes CRUD and catalog discovery", async () =
   }
 });
 
+test("POST package creation rejects all server-managed fields", async () => {
+  const store = createFeishuPackageStore({ packages: {} });
+  const api = createFeishuPackageApi({ store });
+  for (const field of ["revision", "expectedRevision", "state", "updatedAt"]) {
+    await assert.rejects(
+      () => api.handle({
+        method: "POST",
+        pathname: "/api/local/autocut/packages",
+        body: { alias: `Auto-cut-post-${field}`, name: "Post", projectId: "post", [field]: field === "state" ? "enabled" : 1 },
+      }),
+      (error) => error.code === "UNKNOWN_FIELD",
+    );
+  }
+});
+
 test("package mutations reject server-managed fields and catalog validates workspace first", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-api-invalid-"));
   const workspace = path.join(directory, "workspace");
@@ -72,6 +87,9 @@ test("package mutations reject server-managed fields and catalog validates works
   try {
     await assert.rejects(() => call("POST", "/api/local/autocut/packages", {
       alias: "Auto-cut-invalid", name: "Invalid", projectId: "auto-cut-invalid", state: "enabled",
+    }), (error) => error.code === "UNKNOWN_FIELD");
+    await assert.rejects(() => call("POST", "/api/local/autocut/packages", {
+      alias: "Auto-cut-invalid", name: "Invalid", projectId: "auto-cut-invalid", revision: 99,
     }), (error) => error.code === "UNKNOWN_FIELD");
     await assert.rejects(() => call("POST", "/api/local/autocut/packages/catalog", {
       workspacePath: path.join(directory, "missing"),

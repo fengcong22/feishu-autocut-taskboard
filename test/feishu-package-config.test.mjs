@@ -158,6 +158,44 @@ test("concurrent mutations serialize compare-and-swap against the latest revisio
   assert.equal((await store.get("Auto-cut-race")).revision, 2);
 });
 
+test("separate stores sharing a registry serialize compare-and-swap", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-shared-race-"));
+  const filename = path.join(directory, "packages.json");
+  try {
+    const firstStore = createFeishuPackageStore({ filename });
+    const secondStore = createFeishuPackageStore({ filename });
+    const draft = await firstStore.saveDraft({ alias: "Auto-cut-shared", name: "Shared", projectId: "shared" });
+    const results = await Promise.allSettled([
+      firstStore.saveDraft("Auto-cut-shared", { name: "first" }, draft.revision),
+      secondStore.saveDraft("Auto-cut-shared", { name: "second" }, draft.revision),
+    ]);
+    assert.equal(results.filter((entry) => entry.status === "fulfilled").length, 1);
+    assert.equal(results.filter((entry) => entry.status === "rejected")[0].reason.code, "PACKAGE_REVISION_CONFLICT");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("separate stores sharing a registry serialize remove and update", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-shared-remove-"));
+  const filename = path.join(directory, "packages.json");
+  try {
+    const firstStore = createFeishuPackageStore({ filename });
+    const secondStore = createFeishuPackageStore({ filename });
+    const draft = await firstStore.saveDraft({ alias: "Auto-cut-shared-remove", name: "Shared", projectId: "shared-remove" });
+    const results = await Promise.allSettled([
+      secondStore.saveDraft(draft.alias, { name: "updated" }, draft.revision),
+      firstStore.remove(draft.alias, draft.revision),
+    ]);
+    assert.equal(results.filter((entry) => entry.status === "fulfilled").length, 1);
+    assert.ok(["PACKAGE_REVISION_CONFLICT", "PACKAGE_NOT_FOUND"].includes(
+      results.filter((entry) => entry.status === "rejected")[0].reason.code,
+    ));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("malformed registry fails closed instead of becoming an empty catalog", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-malformed-"));
   const filename = path.join(directory, "packages.json");
