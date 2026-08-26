@@ -32,7 +32,10 @@ test("local Auto-Cut package API exposes CRUD and catalog discovery", async () =
     assert.equal(catalog.status, 200);
     assert.equal(catalog.body.models[0].slug, "gpt-test");
     const saved = await call("PATCH", "/api/local/autocut/packages/Auto-cut-api", {
-      ...draft,
+      alias: draft.alias,
+      name: draft.name,
+      projectId: draft.projectId,
+      expectedRevision: draft.revision,
       workspacePath: workspace,
       model: "gpt-test",
       reasoningEffort: "high",
@@ -52,6 +55,28 @@ test("local Auto-Cut package API exposes CRUD and catalog discovery", async () =
       revision: disabled.body.package.revision,
     });
     assert.equal(removed.body.package.alias, "Auto-cut-api");
+    await assert.rejects(() => call("DELETE", "/api/local/autocut/packages/Auto-cut-api"), (error) => error.code === "INVALID_FIELD");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("package mutations reject server-managed fields and catalog validates workspace first", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-api-invalid-"));
+  const workspace = path.join(directory, "workspace");
+  await mkdir(workspace);
+  let catalogCalls = 0;
+  const store = createFeishuPackageStore({ filename: path.join(directory, "packages.json") });
+  const api = createFeishuPackageApi({ store, getModelCatalog: async () => { catalogCalls += 1; throw new Error("internal"); } });
+  const call = (method, pathname, body = null) => api.handle({ method, pathname, body });
+  try {
+    await assert.rejects(() => call("POST", "/api/local/autocut/packages", {
+      alias: "Auto-cut-invalid", name: "Invalid", projectId: "auto-cut-invalid", state: "enabled",
+    }), (error) => error.code === "UNKNOWN_FIELD");
+    await assert.rejects(() => call("POST", "/api/local/autocut/packages/catalog", {
+      workspacePath: path.join(directory, "missing"),
+    }), (error) => error.code === "PACKAGE_WORKSPACE_UNAVAILABLE");
+    assert.equal(catalogCalls, 0);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

@@ -113,18 +113,12 @@ export function normalizeFeishuPackages(value, { now = nowIso } = {}) {
   const wrapped = root.packages !== undefined;
   const source = wrapped ? plainObject(root.packages, "packages") : root;
   const packages = {};
-  const projectIds = new Map();
   for (const [key, raw] of Object.entries(source)) {
     if (wrapped && ["version", "host", "port", "taskboardUrl", "stateFile", "tables"].includes(key)) continue;
     const record = normalizeRecord(key, raw, { now, legacy: !wrapped || raw?.state === undefined });
     if (packages[record.alias]) {
       throw new PackageConfigError("PACKAGE_ALIAS_EXISTS", `duplicate package alias: ${record.alias}`, undefined, 409);
     }
-    const previous = projectIds.get(record.projectId);
-    if (previous && previous !== record.alias) {
-      throw new PackageConfigError("PACKAGE_PROJECT_ID_EXISTS", `duplicate package projectId: ${record.projectId}`, undefined, 409);
-    }
-    projectIds.set(record.projectId, record.alias);
     packages[record.alias] = record;
   }
   return packages;
@@ -196,7 +190,7 @@ export function createFeishuPackageStore({
   getModelCatalog = null,
 } = {}) {
   let inline = packages === undefined ? null : normalizeFeishuPackages(packages, { now });
-  let writeQueue = Promise.resolve();
+  let mutationQueue = Promise.resolve();
 
   async function readCatalog() {
     if (inline !== null) return clone(inline);
@@ -206,11 +200,14 @@ export function createFeishuPackageStore({
       return normalizeFeishuPackages(JSON.parse(await readFile(filename, "utf8")), { now });
     } catch (error) {
       if (error?.code === "ENOENT") return {};
+      if (error instanceof SyntaxError) {
+        throw new PackageConfigError("PACKAGE_REGISTRY_INVALID", "Package registry is malformed", undefined, 503);
+      }
       throw error;
     }
   }
 
-  async function writeCatalog(next) {
+  async function persistCatalog(next) {
     const normalized = normalizeFeishuPackages({ version: REGISTRY_VERSION, packages: next }, { now });
     if (inline !== null) {
       inline = normalized;
@@ -220,14 +217,17 @@ export function createFeishuPackageStore({
     await assertSafeRegistryPath(filename);
     await mkdir(path.dirname(filename), { recursive: true });
     const temporaryPath = `${filename}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
-    writeQueue = writeQueue.catch(() => {}).then(async () => {
-      await writeFile(temporaryPath, `${JSON.stringify({ version: REGISTRY_VERSION, packages: normalized }, null, 2)}\n`, { mode: 0o600 });
-      await chmod(temporaryPath, 0o600);
-      await rename(temporaryPath, filename);
-      await chmod(filename, 0o600);
-    });
-    await writeQueue;
+    await writeFile(temporaryPath, `${JSON.stringify({ version: REGISTRY_VERSION, packages: normalized }, null, 2)}\n`, { mode: 0o600 });
+    await chmod(temporaryPath, 0o600);
+    await rename(temporaryPath, filename);
+    await chmod(filename, 0o600);
     return clone(normalized);
+  }
+
+  function enqueueMutation(operation) {
+    const result = mutationQueue.catch(() => {}).then(operation);
+    mutationQueue = result.catch(() => {});
+    return result;
   }
 
   async function current(alias) {
@@ -249,7 +249,7 @@ export function createFeishuPackageStore({
     }
   }
 
-  async function saveDraft(input, expectedRevision = undefined, patch = undefined) {
+  function saveDraft(input, expectedRevision = undefined, patch = undefined) {
     let originalAlias = null;
     let changes = input;
     if (typeof input === "string") {
@@ -265,7 +265,8 @@ export function createFeishuPackageStore({
     changes = plainObject(changes, "package");
     const aliasFromChanges = changes.alias === undefined ? originalAlias : packageAlias(changes.alias);
     if (!aliasFromChanges) throw new PackageConfigError("PACKAGE_INVALID", "package alias is required", undefined, 400);
-    const catalog = await readCatalog();
+    return enqueueMutation(async () => {
+      const catalog = await readCatalog();
     const existing = catalog[originalAlias ?? aliasFromChanges] ?? null;
     if (existing && !originalAlias && expectedRevision === undefined && changes.expectedRevision === undefined) {
       throw new PackageConfigError("PACKAGE_ALIAS_EXISTS", `Package alias '${aliasFromChanges}' already exists`);
@@ -284,10 +285,12 @@ export function createFeishuPackageStore({
     record.revision = (existing?.revision ?? 0) + 1;
     record.updatedAt = now();
     catalog[record.alias] = record;
-    return (await writeCatalog(catalog))[record.alias];
+      return (await persistCatalog(catalog))[record.alias];
+    });
   }
 
-  async function enable(alias, expectedRevision, options = {}) {
+  function enable(alias, expectedRevision, options = {}) {
+    return enqueueMutation(async () => {
     const currentValue = await current(alias);
     if (!currentValue.record) throw new PackageConfigError("PACKAGE_NOT_FOUND", `Package '${alias}' does not exist`, undefined, 404);
     assertRevision(currentValue.record, expectedRevision);
@@ -296,35 +299,42 @@ export function createFeishuPackageStore({
     if (!record.prompt) throw new PackageConfigError("PACKAGE_ENABLE_INVALID", "prompt is required before enabling");
     if (!Number.isSafeInteger(record.maxConcurrent) || record.maxConcurrent <= 0) throw new PackageConfigError("PACKAGE_ENABLE_INVALID", "maxConcurrent must be a positive integer");
     if (record.zipSourceDirectory) await assertDirectory(record.zipSourceDirectory, "PACKAGE_ENABLE_INVALID", "zipSourceDirectory");
-    const catalog = options.modelCatalog ?? (typeof getModelCatalog === "function" ? await getModelCatalog(record.workspacePath) : modelCatalog);
+    const catalog = options.modelCatalog ?? (typeof options.getModelCatalog === "function"
+      ? await options.getModelCatalog(record.workspacePath)
+      : typeof getModelCatalog === "function" ? await getModelCatalog(record.workspacePath) : modelCatalog);
     validateModel(record, catalog);
     record.state = "enabled";
     record.revision += 1;
     record.updatedAt = now();
     currentValue.catalog[record.alias] = record;
-    return (await writeCatalog(currentValue.catalog))[record.alias];
+    return (await persistCatalog(currentValue.catalog))[record.alias];
+    });
   }
 
-  async function disable(alias, expectedRevision) {
+  function disable(alias, expectedRevision) {
+    return enqueueMutation(async () => {
     const currentValue = await current(alias);
     if (!currentValue.record) throw new PackageConfigError("PACKAGE_NOT_FOUND", `Package '${alias}' does not exist`, undefined, 404);
     assertRevision(currentValue.record, expectedRevision);
     const record = { ...currentValue.record, state: "disabled", revision: currentValue.record.revision + 1, updatedAt: now() };
     currentValue.catalog[record.alias] = record;
-    return (await writeCatalog(currentValue.catalog))[record.alias];
+    return (await persistCatalog(currentValue.catalog))[record.alias];
+    });
   }
 
-  async function remove(alias, expectedRevision = undefined) {
+  function remove(alias, expectedRevision = undefined) {
+    return enqueueMutation(async () => {
     const currentValue = await current(alias);
     if (!currentValue.record) throw new PackageConfigError("PACKAGE_NOT_FOUND", `Package '${alias}' does not exist`, undefined, 404);
-    if (expectedRevision !== undefined) assertRevision(currentValue.record, expectedRevision);
+    assertRevision(currentValue.record, expectedRevision);
     const references = await listReferences(currentValue.alias);
     if (Array.isArray(references) && references.length > 0) {
       throw new PackageConfigError("PACKAGE_IN_USE", `Package '${currentValue.alias}' is still referenced`, { references: clone(references) });
     }
     delete currentValue.catalog[currentValue.alias];
-    await writeCatalog(currentValue.catalog);
+    await persistCatalog(currentValue.catalog);
     return clone(currentValue.record);
+    });
   }
 
   return {

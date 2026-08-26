@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -82,7 +82,7 @@ test("remove reports Base/table/task references and aliases remain unique", asyn
     listReferences: async () => refs,
   });
   await assert.rejects(
-    () => store.remove("Auto-cut-a"),
+    () => store.remove("Auto-cut-a", 1),
     (error) => error instanceof PackageConfigError
       && error.code === "PACKAGE_IN_USE"
       && error.details.references.length === 2,
@@ -115,6 +115,30 @@ test("enable rejects an unsupported model and reasoning effort", async () => {
       () => store.enable(draft.alias, draft.revision),
       (error) => error instanceof PackageConfigError && error.code === "PACKAGE_MODEL_UNAVAILABLE",
     );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("concurrent mutations serialize compare-and-swap against the latest revision", async () => {
+  const store = createFeishuPackageStore({ packages: {} });
+  const draft = await store.saveDraft({ alias: "Auto-cut-race", name: "Race", projectId: "auto-cut-race" });
+  const results = await Promise.allSettled([
+    store.saveDraft("Auto-cut-race", { name: "first" }, draft.revision),
+    store.saveDraft("Auto-cut-race", { name: "second" }, draft.revision),
+  ]);
+  assert.equal(results.filter((entry) => entry.status === "fulfilled").length, 1);
+  assert.equal(results.filter((entry) => entry.status === "rejected")[0].reason.code, "PACKAGE_REVISION_CONFLICT");
+  assert.equal((await store.get("Auto-cut-race")).revision, 2);
+});
+
+test("malformed registry fails closed instead of becoming an empty catalog", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-malformed-"));
+  const filename = path.join(directory, "packages.json");
+  await writeFile(filename, "{not-json", "utf8");
+  try {
+    const store = createFeishuPackageStore({ filename });
+    await assert.rejects(() => store.list(), (error) => error.code === "PACKAGE_REGISTRY_INVALID");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

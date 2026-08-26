@@ -7,7 +7,7 @@ import { PackageConfigError } from "./feishu-package-config.mjs";
 const PACKAGE_ROOT = "/api/local/autocut/packages";
 const PACKAGE_FIELDS = new Set([
   "alias", "name", "projectName", "projectId", "workspacePath", "model", "reasoningEffort",
-  "prompt", "zipSourceDirectory", "maxConcurrent", "state", "updatedAt", "revision", "expectedRevision",
+  "prompt", "zipSourceDirectory", "maxConcurrent", "revision", "expectedRevision",
 ]);
 
 function plainObject(value, name) {
@@ -47,6 +47,17 @@ function toApiError(error) {
     return new ApiError(error.status ?? 409, error.code, error.message, error.details);
   }
   return new ApiError(500, "PACKAGE_REGISTRY_FAILED", "Unable to update the Auto-Cut package registry");
+}
+
+async function discoverCatalog(getModelCatalog, workspacePath) {
+  if (typeof getModelCatalog !== "function") {
+    throw new PackageConfigError("PACKAGE_MODEL_CATALOG_UNAVAILABLE", "Codex model catalog is unavailable", undefined, 503);
+  }
+  try {
+    return await getModelCatalog(workspacePath);
+  } catch {
+    throw new PackageConfigError("PACKAGE_MODEL_UNAVAILABLE", "Codex model catalog could not be loaded", undefined, 503);
+  }
 }
 
 function packagePatch(body) {
@@ -111,9 +122,7 @@ export function createFeishuPackageApi({ store, getModelCatalog = null } = {}) {
           const expectedRevision = revision(input);
           const record = action === "enable"
             ? await store.enable(alias, expectedRevision, {
-              modelCatalog: typeof getModelCatalog === "function"
-                ? await getModelCatalog((await store.get(alias))?.workspacePath)
-                : undefined,
+              getModelCatalog: (workspacePath) => discoverCatalog(getModelCatalog, workspacePath),
             })
             : await store.disable(alias, expectedRevision);
           return { status: 200, body: { package: record } };
@@ -132,7 +141,7 @@ export function createFeishuPackageApi({ store, getModelCatalog = null } = {}) {
         if (method === "DELETE") {
           const input = body === null || body === undefined ? {} : plainObject(body, "package delete");
           assertAllowed(input, new Set(["revision", "expectedRevision"]), "package delete");
-          const record = await store.remove(alias, revision(input, { required: false }));
+          const record = await store.remove(alias, revision(input));
           return { status: 200, body: { package: record } };
         }
         throw new ApiError(405, "METHOD_NOT_ALLOWED", "Method not allowed");
