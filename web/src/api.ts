@@ -27,7 +27,9 @@ import type {
   FeishuSubjectConfig,
   FeishuWorkflowShareConfiguration,
   FeishuWorkflowShareResult,
+  AutoCutPackageDraft,
   FeishuPackage,
+  FeishuPackageSummary,
 } from "./types";
 
 const DEFAULT_USER_ACTOR: ActorIdentity = {
@@ -405,8 +407,8 @@ export async function listFeishuWorkflowCatalog(signal?: AbortSignal): Promise<F
   return data.catalog;
 }
 
-export async function listFeishuPackages(signal?: AbortSignal): Promise<FeishuPackage[]> {
-  const data = await request<{ packages: FeishuPackage[] }>("/api/local/autocut/packages", { signal });
+export async function listFeishuPackages(signal?: AbortSignal): Promise<FeishuPackageSummary[]> {
+  const data = await request<{ packages: FeishuPackageSummary[] }>("/api/local/autocut/packages", { signal });
   return data.packages;
 }
 
@@ -415,7 +417,10 @@ export async function getFeishuPackage(alias: string): Promise<FeishuPackage> {
   return data.package;
 }
 
-export async function saveFeishuPackageDraft(alias: string | null, patch: Partial<FeishuPackage> & { expectedRevision?: number }): Promise<FeishuPackage> {
+export async function saveFeishuPackageDraft(
+  alias: string | null,
+  patch: AutoCutPackageDraft & { expectedRevision?: number },
+): Promise<FeishuPackage> {
   const data = await request<{ package: FeishuPackage }>(alias
     ? `/api/local/autocut/packages/${encodeURIComponent(alias)}`
     : "/api/local/autocut/packages", {
@@ -439,7 +444,7 @@ export async function removeFeishuPackage(alias: string, revision: number): Prom
   return data.package;
 }
 
-export async function discoverFeishuPackageModels(workspacePath: string): Promise<AiChatCatalog | { models?: AiChatModel[] }> {
+export async function discoverFeishuPackageModels(workspacePath: string): Promise<AiChatCatalog> {
   return request(`/api/local/autocut/packages/catalog`, { method: "POST", body: JSON.stringify({ workspacePath }) });
 }
 

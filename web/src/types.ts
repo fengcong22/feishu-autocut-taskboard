@@ -183,10 +183,9 @@ export interface Project {
 
 export type FeishuPackageState = "draft" | "enabled" | "disabled";
 
-export interface FeishuPackage {
+export interface AutoCutPackageDraft {
   alias: string;
   name: string;
-  projectName?: string;
   projectId: string;
   workspacePath: string | null;
   model: string | null;
@@ -194,11 +193,37 @@ export interface FeishuPackage {
   prompt: string | null;
   zipSourceDirectory: string | null;
   maxConcurrent: number;
+}
+
+export interface FeishuPackage extends AutoCutPackageDraft {
+  projectName?: string;
   state: FeishuPackageState;
   revision: number;
   updatedAt: string;
-  referenceCount?: number;
-  references?: unknown[];
+}
+
+export type AutoCutPackageReference =
+  | {
+    type: "subject";
+    subjectKey: string;
+    baseToken: string;
+    baseName: string;
+    tableId: string;
+    tableName: string;
+    lifecycle: "enabled";
+  }
+  | {
+    type: "task";
+    taskId: string;
+    identifier: string;
+    title: string;
+    status: TaskStatus;
+    subjectKey?: string;
+  };
+
+export interface FeishuPackageSummary extends FeishuPackage {
+  referenceCount: number;
+  references: AutoCutPackageReference[];
 }
 
 export interface FeishuFieldOption {

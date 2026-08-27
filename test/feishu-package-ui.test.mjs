@@ -31,6 +31,8 @@ test("global Auto-Cut package manager exposes package CRUD editor", async () => 
   assert.match(api, /removeFeishuPackage/);
   assert.match(api, /discoverFeishuPackageModels/);
   assert.match(types, /interface FeishuPackage/);
+  assert.match(types, /interface AutoCutPackageDraft/);
+  assert.match(types, /type AutoCutPackageReference/);
 });
 
 test("package manager is global and hides project creation controls", async () => {
@@ -39,6 +41,11 @@ test("package manager is global and hides project creation controls", async () =
   assert.match(app, /type BoardView[\s\S]*autocut_packages/);
   assert.match(app, /boardView === "autocut_packages"/);
   assert.match(component, /onPackageChange/);
+  assert.match(component, /refreshKey/);
+  assert.match(component, /ApiError/);
+  assert.match(component, /details/);
+  assert.match(component, /window\.confirm/);
+  assert.match(component, /const references = packageReferences\(error\);[\s\S]{0,220}await refresh\(selectedAlias\);[\s\S]{0,120}if \(references\.length > 0\) setReferenceDrawer\(references\)/);
   assert.match(component, /aria-label=.*Auto-Cut/);
   assert.doesNotMatch(component, /selectedProject/);
 });
@@ -50,6 +57,9 @@ test("package manager has responsive two-pane layout without exposing local path
   assert.match(component, /package-editor/);
   assert.match(component, /state/);
   assert.match(component, /referenceCount/);
+  assert.match(component, /模型 \/ 推理/);
+  assert.match(component, /最大并发/);
+  assert.match(component, /LinearIcon/);
   assert.match(styles, /feishu-package-manager/);
   assert.match(styles, /@media/);
   assert.match(styles, /feishu-package-editor/);
