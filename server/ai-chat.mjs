@@ -143,6 +143,7 @@ export class AiChatService {
     const issue = resolved.issue;
 
     return this.database.createAiChatThread({
+      id: input.id,
       title: input.title ?? issue?.identifier ?? "New conversation",
       origin: {
         projectId: resolved.project.id,
@@ -194,7 +195,7 @@ export class AiChatService {
     return this.database.deleteAiChatThread(threadId);
   }
 
-  async startTurn(threadId, input) {
+  async startTurn(threadId, input, { onRunCreated = null } = {}) {
     let thread = this.getThread(threadId);
     if (this.#threadIsActive(thread)) {
       throw new ApiError(
@@ -274,6 +275,12 @@ export class AiChatService {
         this.manageTaskboardSkillPath,
       );
       const run = this.database.createAiChatRun({ threadId });
+      try {
+        if (onRunCreated) await onRunCreated(run);
+      } catch (error) {
+        this.database.deleteAiChatRun(run.id);
+        throw error;
+      }
       this.#emit(threadId, { type: "ai.run", run });
       const userEventData = {};
       if (skillIds.length > 0) userEventData.skillIds = skillIds;

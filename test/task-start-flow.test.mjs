@@ -50,6 +50,11 @@ async function waitForTaskAiStartSettled(app, taskId, timeoutMs = 3_000) {
 async function createFixture({
   packageWorkspacePath,
   packagePrompt = "trusted fixture prompt",
+  catalogModels = [{
+    slug: "fixture",
+    default_reasoning_level: "low",
+    supported_reasoning_levels: [{ effort: "low" }],
+  }],
   failSkillDiscovery = false,
   turnDelayMs = 0,
   allowAutomaticExecution = false,
@@ -64,7 +69,7 @@ async function createFixture({
   await writeFile(codexExecutable, `
 const args = process.argv.slice(2);
 if (args[0] === "debug") {
-  process.stdout.write('{"models":[{"slug":"fixture","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"}],"service_tiers":[]}]}');
+  process.stdout.write(${JSON.stringify(JSON.stringify({ models: catalogModels }))});
 } else if (args[0] === "app-server") {
   if (${JSON.stringify(failSkillDiscovery)}) process.exit(1);
   process.stdin.setEncoding("utf8");
@@ -207,6 +212,15 @@ function feishuDescription() {
   const metadata = {
     ...feishuOrigin(),
     prompt: "tampered description prompt",
+  };
+  const encoded = Buffer.from(JSON.stringify(metadata), "utf8").toString("base64url");
+  return `<!-- feishu-codex-task:v1:${encoded} -->\n\nfixture prompt`;
+}
+
+function feishuDescriptionWith(overrides = {}) {
+  const metadata = {
+    ...feishuOrigin(),
+    ...overrides,
   };
   const encoded = Buffer.from(JSON.stringify(metadata), "utf8").toString("base64url");
   return `<!-- feishu-codex-task:v1:${encoded} -->\n\nfixture prompt`;
@@ -1960,6 +1974,248 @@ test("task execution uses the live package concurrency limit after a snapshot is
     assert.equal(started.response.status, 202);
     assert.ok(requests.length > 0, JSON.stringify(started.body));
     assert.equal(requests.at(-1).maxConcurrent, 2);
+  } finally {
+    await fixture.app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("task execution uses the captured package workspace and prompt after live edits", async () => {
+  let currentPackage = {
+    alias: "Auto-cut-copyA",
+    name: "Auto-cut-copyA",
+    projectId: "auto-cut-copy-a",
+    workspacePath: null,
+    model: "fixture",
+    reasoningEffort: "low",
+    prompt: "original package prompt",
+    zipSourceDirectory: null,
+    maxConcurrent: 1,
+    state: "enabled",
+    revision: 1,
+  };
+  const packageStore = {
+    async get(alias) {
+      return alias === currentPackage.alias ? { ...currentPackage } : null;
+    },
+    async read() {
+      return { [currentPackage.alias]: { ...currentPackage } };
+    },
+    async list() {
+      return [{ ...currentPackage }];
+    },
+  };
+  const fixture = await createFixture({
+    feishuPackageStore: packageStore,
+    packagePrompt: currentPackage.prompt,
+  });
+  const editedWorkspace = await mkdtemp(path.join(fixture.directory, "edited-package-workspace-"));
+  currentPackage.workspacePath = fixture.workspace;
+  try {
+    const project = await request(fixture.baseUrl, "/api/projects", {
+      method: "POST",
+      body: { id: "auto-cut-copy-a", name: "Auto-cut-copyA", workspacePath: fixture.workspace },
+    });
+    assert.equal(project.response.status, 201);
+    const created = await request(fixture.baseUrl, "/api/tasks", {
+      method: "POST",
+      body: {
+        projectId: "auto-cut-copy-a",
+        title: "Snapshot package settings",
+        description: feishuDescription(),
+        status: "todo",
+        priority: "high",
+        labels: ["feishu"],
+      },
+    });
+    assert.equal(created.response.status, 201);
+    assert.deepEqual(fixture.app.database.getFeishuTaskPackageSnapshot(created.body.task.id), {
+      packageAlias: "Auto-cut-copyA",
+      packageRevision: 1,
+      name: "Auto-cut-copyA",
+      projectId: "auto-cut-copy-a",
+      workspacePath: fixture.workspace,
+      model: "fixture",
+      reasoningEffort: "low",
+      prompt: "original package prompt",
+      maxConcurrent: 1,
+    });
+
+    currentPackage = {
+      ...currentPackage,
+      workspacePath: editedWorkspace,
+      model: "edited-model",
+      reasoningEffort: "high",
+      prompt: "edited package prompt",
+      revision: 2,
+    };
+    const started = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    assert.equal(started.response.status, 202, JSON.stringify(started.body));
+    assert.equal(started.body.thread.origin.workspacePath, fixture.workspace);
+    assert.equal(started.body.thread.model, "fixture");
+    assert.equal(started.body.thread.reasoningEffort, "low");
+    const snapshot = await request(
+      fixture.baseUrl,
+      `/api/local/ai/threads/${encodeURIComponent(started.body.thread.id)}`,
+    );
+    assert.equal(snapshot.response.status, 200);
+    assert.equal(snapshot.body.events[0].content, "original package prompt");
+  } finally {
+    await fixture.app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("different Auto-Cut packages keep their own Codex settings", async () => {
+  const packages = {
+    "Auto-cut-A": {
+      alias: "Auto-cut-A",
+      name: "Auto-cut-A",
+      projectId: "auto-cut-a",
+      workspacePath: null,
+      model: "fixture",
+      reasoningEffort: "low",
+      prompt: "package A prompt",
+      maxConcurrent: 1,
+      state: "enabled",
+      revision: 1,
+    },
+    "Auto-cut-B": {
+      alias: "Auto-cut-B",
+      name: "Auto-cut-B",
+      projectId: "auto-cut-b",
+      workspacePath: null,
+      model: "fixture-two",
+      reasoningEffort: "high",
+      prompt: "package B prompt",
+      maxConcurrent: 1,
+      state: "enabled",
+      revision: 1,
+    },
+  };
+  const packageStore = {
+    async get(alias) { return packages[alias] ? { ...packages[alias] } : null; },
+    async read() {
+      return Object.fromEntries(Object.entries(packages).map(([alias, record]) => [alias, { ...record }]));
+    },
+    async list() { return Object.values(packages).map((record) => ({ ...record })); },
+  };
+  const fixture = await createFixture({
+    feishuPackageStore: packageStore,
+    catalogModels: [
+      { slug: "fixture", default_reasoning_level: "low", supported_reasoning_levels: [{ effort: "low" }] },
+      { slug: "fixture-two", default_reasoning_level: "high", supported_reasoning_levels: [{ effort: "high" }] },
+    ],
+  });
+  const packageBWorkspace = await mkdtemp(path.join(fixture.directory, "package-b-workspace-"));
+  packages["Auto-cut-A"].workspacePath = fixture.workspace;
+  packages["Auto-cut-B"].workspacePath = packageBWorkspace;
+  try {
+    const project = await request(fixture.baseUrl, "/api/projects", {
+      method: "POST",
+      body: { id: "auto-cut-copy-a", name: "Fixture subject", workspacePath: fixture.workspace },
+    });
+    assert.equal(project.response.status, 201);
+    const first = await request(fixture.baseUrl, "/api/tasks", {
+      method: "POST",
+      body: {
+        projectId: "auto-cut-copy-a",
+        title: "Package A task",
+        description: feishuDescriptionWith({ eventId: "fixture-package-a", packageAlias: "Auto-cut-A" }),
+        status: "todo",
+        priority: "high",
+        labels: ["feishu"],
+      },
+    });
+    const second = await request(fixture.baseUrl, "/api/tasks", {
+      method: "POST",
+      body: {
+        projectId: "auto-cut-copy-a",
+        title: "Package B task",
+        description: feishuDescriptionWith({ eventId: "fixture-package-b", packageAlias: "Auto-cut-B" }),
+        status: "todo",
+        priority: "high",
+        labels: ["feishu"],
+      },
+    });
+    assert.equal(first.response.status, 201);
+    assert.equal(second.response.status, 201);
+
+    const startedA = await request(fixture.baseUrl, `/api/tasks/${first.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    const startedB = await request(fixture.baseUrl, `/api/tasks/${second.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    assert.equal(startedA.response.status, 202, JSON.stringify(startedA.body));
+    assert.equal(startedB.response.status, 202, JSON.stringify(startedB.body));
+    assert.equal(startedA.body.thread.origin.workspacePath, fixture.workspace);
+    assert.equal(startedA.body.thread.model, "fixture");
+    assert.equal(startedA.body.thread.reasoningEffort, "low");
+    assert.equal(startedB.body.thread.origin.workspacePath, packageBWorkspace);
+    assert.equal(startedB.body.thread.model, "fixture-two");
+    assert.equal(startedB.body.thread.reasoningEffort, "high");
+
+    const [snapshotA, snapshotB] = await Promise.all([
+      request(fixture.baseUrl, `/api/local/ai/threads/${encodeURIComponent(startedA.body.thread.id)}`),
+      request(fixture.baseUrl, `/api/local/ai/threads/${encodeURIComponent(startedB.body.thread.id)}`),
+    ]);
+    assert.equal(snapshotA.body.events[0].content, "package A prompt");
+    assert.equal(snapshotB.body.events[0].content, "package B prompt");
+  } finally {
+    await fixture.app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("an unavailable snapshotted model returns a safe package error", async () => {
+  const packageRecord = {
+    alias: "Auto-cut-retired",
+    name: "Auto-cut-retired",
+    projectId: "auto-cut-retired",
+    workspacePath: null,
+    model: "retired-model",
+    reasoningEffort: "high",
+    prompt: "retired package prompt",
+    maxConcurrent: 1,
+    state: "enabled",
+    revision: 1,
+  };
+  const packageStore = {
+    async get(alias) { return alias === packageRecord.alias ? { ...packageRecord } : null; },
+    async read() { return { [packageRecord.alias]: { ...packageRecord } }; },
+    async list() { return [{ ...packageRecord }]; },
+  };
+  const fixture = await createFixture({ feishuPackageStore: packageStore });
+  packageRecord.workspacePath = fixture.workspace;
+  try {
+    const project = await request(fixture.baseUrl, "/api/projects", {
+      method: "POST",
+      body: { id: "auto-cut-copy-a", name: "Fixture subject", workspacePath: fixture.workspace },
+    });
+    assert.equal(project.response.status, 201);
+    const created = await request(fixture.baseUrl, "/api/tasks", {
+      method: "POST",
+      body: {
+        projectId: "auto-cut-copy-a",
+        title: "Retired model task",
+        description: feishuDescriptionWith({ eventId: "fixture-retired-model", packageAlias: "Auto-cut-retired" }),
+        status: "todo",
+        priority: "high",
+        labels: ["feishu"],
+      },
+    });
+    const started = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    assert.equal(started.response.status, 409);
+    assert.equal(started.body.error.code, "PACKAGE_MODEL_UNAVAILABLE");
   } finally {
     await fixture.app.close();
     await rm(fixture.directory, { recursive: true, force: true });

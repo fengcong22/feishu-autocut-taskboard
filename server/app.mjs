@@ -2092,13 +2092,17 @@ export function createTaskboardServer(options = {}) {
         ? trustedFeishuTaskOrigin(issue, { requirePackage: true })
         : null;
       const packageCatalog = await feishuPackages.read();
+      const packageSnapshot = trustedOrigin?.packageAlias && issue
+        && typeof database.getFeishuTaskPackageSnapshot === "function"
+        ? database.getFeishuTaskPackageSnapshot(issue.id)
+        : null;
       // Subject projects are identified by Base/table, while the package
       // alias identifies the trusted Auto-Cut workspace.  Resolve a Feishu
       // task by its server-owned alias instead of requiring project IDs to
       // match.  An ordinary task must use the normal project workspace even
       // when its description contains a Feishu-looking marker.
       const packageConfig = trustedOrigin?.packageAlias
-        ? packageCatalog[trustedOrigin.packageAlias]
+        ? packageSnapshot ?? packageCatalog[trustedOrigin.packageAlias]
         : issue
           ? null
           : Object.values(packageCatalog).find((entry) => entry.projectId === projectId);
@@ -2453,6 +2457,17 @@ export function createTaskboardServer(options = {}) {
     };
   }
 
+  function normalizePackageModelError(error, packageConfig) {
+    if (error?.code !== "INVALID_MODEL" && error?.code !== "INVALID_REASONING_EFFORT") {
+      return error;
+    }
+    return new ApiError(
+      409,
+      "PACKAGE_MODEL_UNAVAILABLE",
+      `Configured model settings for package '${packageConfig?.projectName ?? packageConfig?.name ?? "Auto-Cut"}' are unavailable`,
+    );
+  }
+
   async function startClaimedTaskWithAi(claimedTask, actor, metadata, packageConfig, lease, trigger) {
     const threadId = randomUUID();
     let thread;
@@ -2507,7 +2522,7 @@ export function createTaskboardServer(options = {}) {
       if (thread) {
         try { aiChat.deleteThread(thread.id); } catch {}
       }
-      throw error;
+      throw normalizePackageModelError(error, packageConfig);
     }
     let run;
     try {
@@ -2537,7 +2552,7 @@ export function createTaskboardServer(options = {}) {
         events.emit("task.updated", { task: rollback });
       } catch {}
       try { aiChat.deleteThread(thread.id); } catch {}
-      throw error;
+      throw normalizePackageModelError(error, packageConfig);
     }
     return {
       task: database.getTask(claimedTask.id),
