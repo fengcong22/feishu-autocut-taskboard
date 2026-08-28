@@ -412,6 +412,11 @@ export async function listFeishuPackages(signal?: AbortSignal): Promise<FeishuPa
   return data.packages;
 }
 
+export async function listFeishuWorkflowPackageAliases(signal?: AbortSignal): Promise<string[]> {
+  const data = await request<{ aliases: string[] }>("/api/local/feishu/workflow/package-aliases", { signal });
+  return data.aliases;
+}
+
 export async function getFeishuPackage(alias: string): Promise<FeishuPackage> {
   const data = await request<{ package: FeishuPackage }>(`/api/local/autocut/packages/${encodeURIComponent(alias)}`);
   return data.package;
@@ -481,6 +486,14 @@ export async function setFeishuSubjectDisplayEnabled(subjectKey: string, display
     method: "PATCH", body: JSON.stringify({ displayEnabled }),
   });
   return data.subject;
+}
+
+export async function refreshFeishuTaskPackage(task: Task): Promise<Task> {
+  const data = await request<{ task: Task }>(`/api/local/tasks/${encodeURIComponent(task.id)}/package-refresh`, {
+    method: "POST",
+    body: JSON.stringify({ version: task.version }),
+  });
+  return data.task;
 }
 
 export async function removeFeishuBase(baseToken: string): Promise<FeishuBaseCatalog[]> {

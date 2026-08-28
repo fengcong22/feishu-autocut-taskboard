@@ -3,6 +3,13 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import {
+  ARTIFACT_UPLOAD_LEASE_DURATION_MS,
+  ARTIFACT_UPLOAD_MAX_FUTURE_MS,
+  artifactUploadLeaseNeedsRecovery,
+  parseArtifactUploadTimestamp,
+} from "./artifact-upload-lease.mjs";
+
 export class ApiError extends Error {
   constructor(status, code, message, details) {
     super(message);
@@ -137,6 +144,107 @@ function attachAiStartClaim(task, claimToken) {
   return task;
 }
 
+function normalizeFeishuTaskOrigin(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task origin must be an object");
+  }
+  for (const key of ["source", "eventId", "baseToken", "tableId", "recordId"]) {
+    if (typeof value[key] !== "string" || value[key].trim() === "") {
+      throw new ApiError(400, "INVALID_FEISHU_ORIGIN", `Feishu task origin '${key}' is required`);
+    }
+  }
+  if (value.source !== "feishu-base") {
+    throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Unsupported Feishu task origin");
+  }
+  if (value.mode !== undefined && !["manual", "automatic"].includes(value.mode)) {
+    throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task origin mode is invalid");
+  }
+  const origin = {
+    version: value.version === undefined ? 1 : value.version,
+    source: "feishu-base",
+    eventId: value.eventId.trim(),
+    baseToken: value.baseToken.trim(),
+    tableId: value.tableId.trim(),
+    recordId: value.recordId.trim(),
+    ...(typeof value.triggerField === "string" && value.triggerField.trim()
+      ? { triggerField: value.triggerField.trim() } : {}),
+    ...(typeof value.triggerFieldId === "string" && value.triggerFieldId.trim()
+      ? { triggerFieldId: value.triggerFieldId.trim() } : {}),
+    ...(typeof value.triggerValue === "string" && value.triggerValue.trim()
+      ? { triggerValue: value.triggerValue.trim() } : {}),
+    ...(value.mode ? { mode: value.mode } : {}),
+    ...(typeof value.subjectKey === "string" && value.subjectKey.trim()
+      ? { subjectKey: value.subjectKey.trim() } : {}),
+    ...(Number.isSafeInteger(value.configVersion) && value.configVersion > 0
+      ? { configVersion: value.configVersion } : {}),
+    ...(typeof value.executionMode === "string" && value.executionMode.trim()
+      ? { executionMode: value.executionMode.trim() } : {}),
+    ...(typeof value.uploadMode === "string" && value.uploadMode.trim()
+      ? { uploadMode: value.uploadMode.trim() } : {}),
+    ...(typeof value.packageAlias === "string" && value.packageAlias.trim()
+      ? { packageAlias: value.packageAlias.trim() } : {}),
+    ...(typeof value.packageSource === "string" && value.packageSource.trim()
+      ? { packageSource: value.packageSource.trim() } : {}),
+    ...(typeof value.concurrencyGroup === "string" && value.concurrencyGroup.trim()
+      ? { concurrencyGroup: value.concurrencyGroup.trim() } : {}),
+    ...(Number.isSafeInteger(value.maxConcurrent) && value.maxConcurrent > 0
+      ? { maxConcurrent: value.maxConcurrent } : {}),
+    ...(Array.isArray(value.resourceGroups)
+      ? { resourceGroups: value.resourceGroups.filter((group) => typeof group === "string" && group.trim()) } : {}),
+  };
+  if (!Number.isSafeInteger(origin.version) || origin.version < 1) {
+    throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task origin version is invalid");
+  }
+  if (origin.subjectKey !== undefined && origin.subjectKey !== `${origin.baseToken}:${origin.tableId}`) {
+    throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task origin subjectKey is invalid");
+  }
+  if (origin.executionMode !== undefined && !["manual", "automatic"].includes(origin.executionMode)) {
+    throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task origin executionMode is invalid");
+  }
+  if (origin.uploadMode !== undefined && !["manual", "automatic"].includes(origin.uploadMode)) {
+    throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task origin uploadMode is invalid");
+  }
+  return origin;
+}
+
+function normalizeFeishuPackageSnapshot(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ApiError(400, "INVALID_PACKAGE_SNAPSHOT", "Auto-Cut package snapshot must be an object");
+  }
+  if (typeof value.packageAlias !== "string" || value.packageAlias.trim() === "" || value.packageAlias.includes("\0")) {
+    throw new ApiError(400, "INVALID_PACKAGE_SNAPSHOT", "Package snapshot 'packageAlias' is required");
+  }
+  if (!Number.isSafeInteger(value.packageRevision) || value.packageRevision < 1) {
+    throw new ApiError(400, "INVALID_PACKAGE_SNAPSHOT", "Package snapshot revision is invalid");
+  }
+  const optionalText = ["name", "projectId", "model", "reasoningEffort", "zipSourceDirectory"];
+  const snapshot = {
+    packageAlias: value.packageAlias.trim(),
+    packageRevision: value.packageRevision,
+    workspacePath: value.workspacePath === null || value.workspacePath === undefined ? null : typeof value.workspacePath === "string" ? value.workspacePath.trim() : value.workspacePath,
+    prompt: value.prompt === null || value.prompt === undefined ? null : typeof value.prompt === "string" ? value.prompt.trim() : value.prompt,
+  };
+  for (const key of ["workspacePath", "prompt"]) {
+    if (snapshot[key] !== null && (typeof value[key] !== "string" || value[key].includes("\0") || snapshot[key] === "")) {
+      throw new ApiError(400, "INVALID_PACKAGE_SNAPSHOT", `Package snapshot '${key}' is invalid`);
+    }
+  }
+  for (const key of optionalText) {
+    if (value[key] !== undefined && value[key] !== null) {
+      if (typeof value[key] !== "string" || value[key].includes("\0")) {
+        throw new ApiError(400, "INVALID_PACKAGE_SNAPSHOT", `Package snapshot '${key}' is invalid`);
+      }
+      snapshot[key] = value[key].trim();
+    }
+  }
+  if (value.maxConcurrent !== undefined
+    && (!Number.isSafeInteger(value.maxConcurrent) || value.maxConcurrent < 1)) {
+    throw new ApiError(400, "INVALID_PACKAGE_SNAPSHOT", "Package snapshot maxConcurrent is invalid");
+  }
+  if (value.maxConcurrent !== undefined) snapshot.maxConcurrent = value.maxConcurrent;
+  return snapshot;
+}
+
 function relationActivityValue(type, task) {
   return {
     type,
@@ -250,6 +358,60 @@ function attachmentFromRow(row) {
     contentType: row.content_type,
     size: row.size,
     createdAt: row.created_at,
+  };
+}
+
+function taskArtifactFromRow(row) {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    filename: row.filename,
+    contentType: row.content_type,
+    size: row.size,
+    sha256: row.sha256,
+    sourceMode: row.source_mode,
+    validationStatus: row.validation_status,
+    entryCount: row.entry_count,
+    draftRoot: row.draft_root,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function taskArtifactWorkFromRow(row) {
+  return {
+    ...taskArtifactFromRow(row),
+    storageKey: row.storage_key,
+  };
+}
+
+function artifactUploadFromRow(row) {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    artifactId: row.artifact_id,
+    subjectKey: row.subject_key,
+    targetId: row.target_id,
+    filename: row.filename,
+    sha256: row.sha256,
+    status: row.status,
+    attemptCount: row.attempt_count,
+    errorCode: row.error_code,
+    errorMessage: row.error_message,
+    createdAt: row.created_at,
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function artifactUploadWorkFromRow(row) {
+  return {
+    ...artifactUploadFromRow(row),
+    storageKey: row.storage_key,
+    targetPath: row.target_path,
+    uploadConcurrency: row.upload_concurrency,
+    claimToken: row.claim_token,
   };
 }
 
@@ -438,6 +600,43 @@ export class TaskboardDatabase {
       CREATE INDEX IF NOT EXISTS attachments_task_created
         ON attachments(task_id, created_at, id);
 
+      CREATE TABLE IF NOT EXISTS task_artifacts (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        storage_key TEXT NOT NULL UNIQUE,
+        filename TEXT NOT NULL,
+        content_type TEXT NOT NULL,
+        size INTEGER NOT NULL CHECK (size >= 0),
+        sha256 TEXT NOT NULL,
+        source_mode TEXT NOT NULL CHECK (source_mode = 'manual_select'),
+        validation_status TEXT NOT NULL CHECK (validation_status = 'verified'),
+        entry_count INTEGER NOT NULL CHECK (entry_count > 0),
+        draft_root TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS task_artifacts_task_created
+        ON task_artifacts(task_id, created_at, id);
+
+      CREATE TABLE IF NOT EXISTS feishu_task_origins (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS feishu_task_package_snapshots (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        package_alias TEXT NOT NULL,
+        package_revision INTEGER NOT NULL CHECK (package_revision > 0),
+        snapshot_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS feishu_task_package_snapshots_alias
+        ON feishu_task_package_snapshots(package_alias, package_revision);
+
       CREATE TABLE IF NOT EXISTS workflow_workspaces (
         project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
         workspace TEXT NOT NULL,
@@ -513,6 +712,7 @@ export class TaskboardDatabase {
         base_name TEXT NOT NULL,
         source_url_label TEXT,
         metadata_refreshed_at INTEGER,
+        removed_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -528,10 +728,41 @@ export class TaskboardDatabase {
         config_version INTEGER NOT NULL CHECK (config_version > 0),
         config_json TEXT NOT NULL,
         metadata_json TEXT NOT NULL DEFAULT '{}',
+        removed_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(base_token, table_id)
       );
+
+      CREATE TABLE IF NOT EXISTS artifact_uploads (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        artifact_id TEXT NOT NULL REFERENCES task_artifacts(id) ON DELETE CASCADE,
+        subject_key TEXT NOT NULL REFERENCES feishu_subjects(subject_key) ON DELETE CASCADE,
+        storage_key TEXT NOT NULL,
+        target_id TEXT,
+        target_path TEXT NOT NULL,
+        filename TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('queued', 'uploading', 'uploaded', 'failed')),
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        error_code TEXT,
+        error_message TEXT,
+        upload_concurrency INTEGER NOT NULL DEFAULT 1 CHECK (upload_concurrency > 0),
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        updated_at TEXT NOT NULL,
+        claim_token TEXT,
+        lease_until TEXT,
+        UNIQUE(artifact_id, target_path)
+      );
+
+      CREATE INDEX IF NOT EXISTS artifact_uploads_task_created
+        ON artifact_uploads(task_id, created_at DESC, id DESC);
+
+      CREATE INDEX IF NOT EXISTS artifact_uploads_queue
+        ON artifact_uploads(status, created_at, id);
 
       CREATE TABLE IF NOT EXISTS feishu_subject_versions (
         subject_key TEXT NOT NULL REFERENCES feishu_subjects(subject_key) ON DELETE CASCADE,
@@ -542,6 +773,26 @@ export class TaskboardDatabase {
       );
 
     `);
+
+    const feishuBaseColumns = this.database.prepare("PRAGMA table_info(feishu_bases)").all();
+    if (!feishuBaseColumns.some((column) => column.name === "removed_at")) {
+      this.database.exec("ALTER TABLE feishu_bases ADD COLUMN removed_at TEXT");
+    }
+    const feishuSubjectColumns = this.database.prepare("PRAGMA table_info(feishu_subjects)").all();
+    if (!feishuSubjectColumns.some((column) => column.name === "removed_at")) {
+      this.database.exec("ALTER TABLE feishu_subjects ADD COLUMN removed_at TEXT");
+    }
+
+    const artifactUploadColumns = this.database.prepare("PRAGMA table_info(artifact_uploads)").all();
+    if (!artifactUploadColumns.some((column) => column.name === "claim_token")) {
+      this.database.exec("ALTER TABLE artifact_uploads ADD COLUMN claim_token TEXT");
+    }
+    if (!artifactUploadColumns.some((column) => column.name === "lease_until")) {
+      this.database.exec("ALTER TABLE artifact_uploads ADD COLUMN lease_until TEXT");
+    }
+    if (!artifactUploadColumns.some((column) => column.name === "upload_concurrency")) {
+      this.database.exec("ALTER TABLE artifact_uploads ADD COLUMN upload_concurrency INTEGER NOT NULL DEFAULT 1 CHECK (upload_concurrency > 0)");
+    }
 
     const projectColumns = this.database.prepare("PRAGMA table_info(projects)").all();
     if (!projectColumns.some((column) => column.name === "workspace_path")) {
@@ -1376,12 +1627,17 @@ export class TaskboardDatabase {
     const commentsByTask = this.#commentsForTaskActivity(rows.map((row) => row.id));
     const activitiesByTask = this.#activitiesForTasks(rows.map((row) => row.id));
     const previewImagesByTask = this.#taskPreviewImages(rows.map((row) => row.id));
-    return rows.map((row) => attachTaskActivity(
-      this.#taskWithRelations(row),
-      commentsByTask.get(row.id) ?? [],
-      activitiesByTask.get(row.id) ?? [],
-      previewImagesByTask.get(row.id) ?? null,
-    ));
+    return rows.map((row) => {
+      const task = attachTaskActivity(
+        this.#taskWithRelations(row),
+        commentsByTask.get(row.id) ?? [],
+        activitiesByTask.get(row.id) ?? [],
+        previewImagesByTask.get(row.id) ?? null,
+      );
+      const feishuOrigin = this.getFeishuTaskOrigin(task.id);
+      if (feishuOrigin) task.feishuOrigin = feishuOrigin;
+      return task;
+    });
   }
 
   getTask(id) {
@@ -1391,7 +1647,10 @@ export class TaskboardDatabase {
     const comments = this.#commentsForTaskActivity([task.id]).get(task.id) ?? [];
     const activities = this.#activitiesForTasks([task.id]).get(task.id) ?? [];
     const previewImage = this.#taskPreviewImages([task.id]).get(task.id) ?? null;
-    return attachTaskActivity(task, comments, activities, previewImage);
+    const enriched = attachTaskActivity(task, comments, activities, previewImage);
+    const feishuOrigin = this.getFeishuTaskOrigin(task.id);
+    if (feishuOrigin) enriched.feishuOrigin = feishuOrigin;
+    return enriched;
   }
 
   createTask(input) {
@@ -1479,6 +1738,21 @@ export class TaskboardDatabase {
         timestamp,
         timestamp,
       );
+      if (input.feishuOrigin !== undefined) {
+        const origin = normalizeFeishuTaskOrigin(input.feishuOrigin);
+        this.database.prepare(`
+          INSERT INTO feishu_task_origins (task_id, metadata_json, created_at, updated_at)
+          VALUES (?, ?, ?, ?)
+        `).run(id, JSON.stringify(origin), timestamp, timestamp);
+      }
+      if (input.packageSnapshot !== undefined) {
+        const snapshot = normalizeFeishuPackageSnapshot(input.packageSnapshot);
+        this.database.prepare(`
+          INSERT INTO feishu_task_package_snapshots
+            (task_id, package_alias, package_revision, snapshot_json, created_at)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(id, snapshot.packageAlias, snapshot.packageRevision, JSON.stringify(snapshot), timestamp);
+      }
       this.database.exec("COMMIT");
       return this.getTask(id);
     } catch (error) {
@@ -1499,6 +1773,13 @@ export class TaskboardDatabase {
     }
     const projectChanged = Boolean(targetProject && targetProject.id !== current.projectId);
     if (projectChanged) {
+      if (this.getFeishuTaskOrigin(current.id)) {
+        throw new ApiError(
+          409,
+          "FEISHU_PROJECT_MOVE_BLOCKED",
+          "Server-registered Feishu workflow tasks cannot be moved to another project",
+        );
+      }
       const relation = this.database.prepare(`
         SELECT 1
         FROM task_relations
@@ -1605,6 +1886,203 @@ export class TaskboardDatabase {
       throw error;
     }
     return this.getTask(current.id);
+  }
+
+  createFeishuTask(input, packageSnapshot = undefined) {
+    if (!input || typeof input !== "object" || !input.feishuOrigin) {
+      throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task origin is required");
+    }
+    if (packageSnapshot === undefined && input.feishuOrigin.packageAlias) {
+      throw new ApiError(409, "PACKAGE_SNAPSHOT_REQUIRED", "A trusted Auto-Cut package snapshot is required");
+    }
+    return this.createTask({ ...input, packageSnapshot });
+  }
+
+  getFeishuTaskOrigin(taskId) {
+    const row = this.database.prepare(`
+      SELECT task_id, metadata_json, created_at, updated_at
+      FROM feishu_task_origins WHERE task_id = ?
+    `).get(taskId);
+    if (!row) return null;
+    try {
+      return {
+        taskId: row.task_id,
+        ...normalizeFeishuTaskOrigin(JSON.parse(row.metadata_json)),
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  getFeishuTaskPackageSnapshot(taskId) {
+    const row = this.database.prepare(`
+      SELECT snapshot_json FROM feishu_task_package_snapshots WHERE task_id = ?
+    `).get(taskId);
+    if (!row) return null;
+    try {
+      return structuredClone(normalizeFeishuPackageSnapshot(JSON.parse(row.snapshot_json)));
+    } catch {
+      return null;
+    }
+  }
+
+  refreshFeishuTaskPackageSnapshot(taskId, expectedVersion, packageSnapshot, actor) {
+    const current = this.#requireTask(taskId);
+    this.#requireVersion(current, expectedVersion);
+    if (!this.getFeishuTaskOrigin(taskId)) {
+      throw new ApiError(409, "TASK_NOT_STARTABLE", "This task is not a server-registered Feishu workflow task");
+    }
+    if (!["todo", "queued"].includes(current.status)) {
+      throw new ApiError(409, "TASK_PACKAGE_REFRESH_BLOCKED", "Only waiting or queued tasks can refresh their package configuration");
+    }
+    const snapshot = normalizeFeishuPackageSnapshot(packageSnapshot);
+    const timestamp = now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const locked = this.#requireTask(taskId);
+      this.#requireVersion(locked, expectedVersion);
+      this.database.prepare(`
+        UPDATE tasks SET version = version + 1, updated_at = ? WHERE id = ? AND version = ?
+      `).run(timestamp, taskId, expectedVersion);
+      this.database.prepare(`
+        INSERT INTO feishu_task_package_snapshots
+          (task_id, package_alias, package_revision, snapshot_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(task_id) DO UPDATE SET package_alias=excluded.package_alias,
+          package_revision=excluded.package_revision, snapshot_json=excluded.snapshot_json,
+          created_at=excluded.created_at
+      `).run(taskId, snapshot.packageAlias, snapshot.packageRevision, JSON.stringify(snapshot), timestamp);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return this.getTask(taskId);
+  }
+
+  findFeishuTaskByEventId(eventId, projectId = null) {
+    const rows = this.database.prepare(`
+      SELECT feishu_task_origins.task_id, feishu_task_origins.metadata_json
+      FROM feishu_task_origins JOIN tasks ON tasks.id = feishu_task_origins.task_id
+      WHERE (? IS NULL OR tasks.project_id = ?)
+      ORDER BY tasks.created_at, tasks.id
+    `).all(projectId, projectId);
+    for (const row of rows) {
+      try {
+        if (normalizeFeishuTaskOrigin(JSON.parse(row.metadata_json)).eventId === eventId) {
+          return this.getTask(row.task_id);
+        }
+      } catch {}
+    }
+    return null;
+  }
+
+  listFeishuTasks(scope = {}) {
+    const rows = this.database.prepare(`
+      SELECT feishu_task_origins.task_id, feishu_task_origins.metadata_json
+      FROM feishu_task_origins JOIN tasks ON tasks.id = feishu_task_origins.task_id
+      WHERE (? IS NULL OR tasks.project_id = ?)
+        AND (? IS NULL OR tasks.status = ?)
+        AND (? IS NULL OR tasks.archived_at IS NULL)
+      ORDER BY tasks.created_at, tasks.id
+    `).all(
+      scope.projectId ?? null, scope.projectId ?? null,
+      scope.status ?? null, scope.status ?? null,
+      scope.archived === false ? 1 : null,
+    );
+    return rows.flatMap((row) => {
+      try {
+        const metadata = normalizeFeishuTaskOrigin(JSON.parse(row.metadata_json));
+        for (const key of ["baseToken", "tableId", "recordId", "triggerFieldId", "triggerField", "triggerValue"]) {
+          if (scope[key] !== undefined && metadata[key] !== scope[key]) return [];
+        }
+        const task = this.getTask(row.task_id);
+        return task ? [task] : [];
+      } catch { return []; }
+    });
+  }
+
+  listPackageReferences(alias) {
+    if (typeof alias !== "string" || alias.trim() === "") return [];
+    const packageAlias = alias.trim();
+    const references = [];
+    const subjects = this.database.prepare(`
+      SELECT
+        feishu_subjects.subject_key,
+        feishu_subjects.base_token,
+        feishu_subjects.table_id,
+        feishu_subjects.table_name,
+        feishu_subjects.lifecycle,
+        feishu_subjects.config_json,
+        feishu_bases.base_name
+      FROM feishu_subjects
+      JOIN feishu_bases ON feishu_bases.base_token = feishu_subjects.base_token
+      WHERE feishu_subjects.lifecycle = 'enabled'
+        AND feishu_subjects.removed_at IS NULL
+        AND feishu_bases.removed_at IS NULL
+      ORDER BY feishu_bases.base_name, feishu_subjects.table_name, feishu_subjects.subject_key
+    `).all();
+    for (const row of subjects) {
+      try {
+        const route = JSON.parse(row.config_json)?.packageRoute;
+        const aliases = new Set([
+          route?.packageAlias,
+          ...Object.values(route?.branchMap ?? {}),
+        ].filter((value) => typeof value === "string" && value.trim() !== ""));
+        if (!aliases.has(packageAlias)) continue;
+        references.push({
+          type: "subject",
+          subjectKey: row.subject_key,
+          baseToken: row.base_token,
+          baseName: row.base_name,
+          tableId: row.table_id,
+          tableName: row.table_name,
+          lifecycle: row.lifecycle,
+        });
+      } catch {}
+    }
+
+    const tasks = this.database.prepare(`
+      SELECT
+        tasks.id,
+        tasks.identifier,
+        tasks.title,
+        tasks.status,
+        feishu_task_origins.metadata_json
+      FROM feishu_task_origins
+      JOIN tasks ON tasks.id = feishu_task_origins.task_id
+      WHERE tasks.status NOT IN ('done', 'canceled')
+      ORDER BY tasks.created_at, tasks.id
+    `).all();
+    for (const row of tasks) {
+      try {
+        const origin = normalizeFeishuTaskOrigin(JSON.parse(row.metadata_json));
+        if (origin.packageAlias !== packageAlias) continue;
+        references.push({
+          type: "task",
+          taskId: row.id,
+          identifier: row.identifier,
+          title: row.title,
+          status: row.status,
+          ...(origin.subjectKey ? { subjectKey: origin.subjectKey } : {}),
+        });
+      } catch {}
+    }
+    return references;
+  }
+
+  archiveFeishuTask(taskId, version, actor) {
+    this.#requireTask(taskId);
+    if (!this.getFeishuTaskOrigin(taskId)) {
+      throw new ApiError(409, "TASK_NOT_STARTABLE", "This task is not a server-registered Feishu workflow task");
+    }
+    const task = this.#requireTask(taskId);
+    if (task.archivedAt !== null || task.status !== "todo") {
+      throw new ApiError(409, "TASK_NOT_WAITING", "Only unarchived todo Feishu tasks can be archived");
+    }
+    return this.archiveTask(taskId, version, null, actor);
   }
 
   deleteAiChatRun(id) {
@@ -1836,7 +2314,7 @@ export class TaskboardDatabase {
   }
 
   settleTaskAiStart(id, claimToken, runId, status, actor) {
-    if (!["in_review", "blocked"].includes(status)) {
+    if (!["in_progress", "in_review", "done", "blocked"].includes(status)) {
       throw new ApiError(400, "INVALID_FIELD", "Invalid AI start terminal status");
     }
     this.database.exec("BEGIN IMMEDIATE");
@@ -1863,6 +2341,12 @@ export class TaskboardDatabase {
       }
       const latestStatusChange = this.latestTaskStatusChange(id, claim.claimed_activity_rowid);
       if (latestStatusChange) {
+        this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
+          .run(id, claimToken);
+        this.database.exec("COMMIT");
+        return current;
+      }
+      if (status === "in_progress") {
         this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
           .run(id, claimToken);
         this.database.exec("COMMIT");
@@ -2015,15 +2499,30 @@ export class TaskboardDatabase {
       if (current.archivedAt === null) {
         throw new ApiError(409, "TASK_NOT_ARCHIVED", "Only archived tasks can be deleted");
       }
+      const activeUpload = this.database.prepare(`
+        SELECT 1 FROM artifact_uploads
+        WHERE task_id = ? AND status IN ('queued', 'uploading')
+        LIMIT 1
+      `).get(current.id);
+      if (activeUpload) {
+        throw new ApiError(
+          409,
+          "ARTIFACT_UPLOAD_ACTIVE",
+          "The task cannot be deleted while a ZIP upload is queued or uploading",
+        );
+      }
       const attachmentIds = this.database.prepare(
         "SELECT id FROM attachments WHERE task_id = ? ORDER BY created_at, id",
       ).all(current.id).map((attachment) => attachment.id);
+      const artifactStorageKeys = this.database.prepare(
+        "SELECT storage_key FROM task_artifacts WHERE task_id = ? ORDER BY created_at, id",
+      ).all(current.id).map((artifact) => artifact.storage_key);
       const result = this.database.prepare(
         "DELETE FROM tasks WHERE id = ? AND version = ? AND archived_at IS NOT NULL",
       ).run(current.id, version);
       if (result.changes !== 1) this.#throwMissingOrConflict(id, version);
       this.database.exec("COMMIT");
-      return { task: current, attachmentIds };
+      return { task: current, attachmentIds, artifactStorageKeys };
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
@@ -2253,6 +2752,446 @@ export class TaskboardDatabase {
     }
     this.database.prepare("DELETE FROM attachments WHERE id = ?").run(id);
     return attachment;
+  }
+
+  listTaskArtifacts(taskId) {
+    const task = this.#requireTask(taskId);
+    return this.database.prepare(`
+      SELECT * FROM task_artifacts
+      WHERE task_id = ?
+      ORDER BY created_at DESC, id DESC
+    `).all(task.id).map(taskArtifactFromRow);
+  }
+
+  getTaskArtifact(id) {
+    const row = this.database.prepare("SELECT * FROM task_artifacts WHERE id = ?").get(id);
+    return row ? taskArtifactFromRow(row) : null;
+  }
+
+  getTaskArtifactForWork(id) {
+    const row = this.database.prepare("SELECT * FROM task_artifacts WHERE id = ?").get(id);
+    return row ? taskArtifactWorkFromRow(row) : null;
+  }
+
+  createTaskArtifact(taskId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(taskId);
+      const acceptedStatuses = [input.requiredTaskStatus, input.completedTaskStatus].filter(Boolean);
+      if (acceptedStatuses.length > 0 && !acceptedStatuses.includes(task.status)) {
+        throw new ApiError(
+          409,
+          "TASK_NOT_ARTIFACT_READY",
+          `This task accepts artifacts only while it is ${acceptedStatuses.join(" or ")}`,
+        );
+      }
+      const existing = this.database.prepare(`
+        SELECT * FROM task_artifacts
+        WHERE task_id = ? AND filename = ? AND sha256 = ?
+        ORDER BY created_at, id
+        LIMIT 1
+      `).get(task.id, input.filename, input.sha256);
+      if (!existing) {
+        this.database.prepare(`
+          INSERT INTO task_artifacts (
+            id, task_id, storage_key, filename, content_type, size, sha256, source_mode,
+            validation_status, entry_count, draft_root, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          input.id,
+          task.id,
+          input.storageKey,
+          input.filename,
+          input.contentType,
+          input.size,
+          input.sha256,
+          input.sourceMode,
+          input.validationStatus,
+          input.entryCount,
+          input.draftRoot,
+          input.createdAt,
+          input.updatedAt,
+        );
+      }
+      if (
+        input.completedTaskStatus
+        && input.requiredTaskStatus
+        && task.status === input.requiredTaskStatus
+        && task.status !== input.completedTaskStatus
+      ) {
+        const timestamp = now();
+        const result = this.database.prepare(`
+          UPDATE tasks SET status = ?, version = version + 1, updated_at = ?
+          WHERE id = ? AND status = ?
+        `).run(input.completedTaskStatus, timestamp, task.id, input.requiredTaskStatus);
+        if (result.changes !== 1) {
+          throw new ApiError(409, "TASK_NOT_ARTIFACT_READY", "Task status changed while storing the ZIP artifact");
+        }
+        this.#recordTaskActivity(
+          task.id,
+          input.actor,
+          taskFieldChanges(task, { status: input.completedTaskStatus }),
+          timestamp,
+        );
+      }
+      this.database.exec("COMMIT");
+      return this.getTaskArtifact(existing?.id ?? input.id);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  deleteTaskArtifact(id) {
+    const artifact = this.getTaskArtifact(id);
+    if (!artifact) {
+      throw new ApiError(404, "ARTIFACT_NOT_FOUND", `Artifact '${id}' does not exist`);
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const activeUpload = this.database.prepare(`
+        SELECT 1 FROM artifact_uploads
+        WHERE artifact_id = ? AND status IN ('queued', 'uploading')
+        LIMIT 1
+      `).get(artifact.id);
+      if (activeUpload) {
+        throw new ApiError(
+          409,
+          "ARTIFACT_UPLOAD_ACTIVE",
+          "The ZIP cannot be deleted while it is queued or uploading",
+        );
+      }
+      this.database.prepare("DELETE FROM task_artifacts WHERE id = ?").run(artifact.id);
+      this.database.exec("COMMIT");
+      return artifact;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getFeishuSubjectUploadTarget(projectId) {
+    const row = this.database.prepare(`
+      SELECT subject_key, config_json
+      FROM feishu_subjects
+      WHERE project_id = ?
+    `).get(projectId);
+    return this.#subjectUploadTargetFromRow(row);
+  }
+
+  getFeishuSubjectUploadTargetByOrigin(baseToken, tableId) {
+    const row = this.database.prepare(`
+      SELECT subject_key, config_json
+      FROM feishu_subjects
+      WHERE base_token = ? AND table_id = ?
+    `).get(baseToken, tableId);
+    return this.#subjectUploadTargetFromRow(row);
+  }
+
+  getFeishuSubjectUploadTargetByVersion(subjectKey, configVersion) {
+    const row = this.database.prepare(`
+      SELECT subject_key, snapshot_json AS config_json
+      FROM feishu_subject_versions
+      WHERE subject_key = ? AND version = ?
+    `).get(subjectKey, configVersion);
+    return this.#subjectUploadTargetFromRow(row);
+  }
+
+  #subjectUploadTargetFromRow(row) {
+    if (!row) return null;
+    let config;
+    try {
+      config = JSON.parse(row.config_json);
+    } catch {
+      throw new ApiError(409, "TASK_UPLOAD_NOT_CONFIGURED", "The subject upload configuration is invalid");
+    }
+    const upload = config?.upload;
+    const targetPath = typeof upload?.targetPath === "string" ? upload.targetPath.trim() : "";
+    return {
+      subjectKey: row.subject_key,
+      enqueueMode: upload?.enqueueMode === "automatic" ? "automatic" : "manual",
+      targetId: typeof upload?.targetId === "string" && upload.targetId.trim()
+        ? upload.targetId.trim()
+        : null,
+      targetPath: targetPath || null,
+      uploadConcurrency: Number.isSafeInteger(upload?.uploadConcurrency)
+        ? upload.uploadConcurrency
+        : null,
+    };
+  }
+
+  listTaskArtifactUploads(taskId) {
+    const task = this.#requireTask(taskId);
+    return this.database.prepare(`
+      SELECT * FROM artifact_uploads
+      WHERE task_id = ?
+      ORDER BY created_at DESC, id DESC
+    `).all(task.id).map(artifactUploadFromRow);
+  }
+
+  listArtifactUploadItems(projectId) {
+    const rows = this.database.prepare(`
+      SELECT artifact_uploads.*
+      FROM artifact_uploads
+      JOIN tasks ON tasks.id = artifact_uploads.task_id
+      WHERE tasks.project_id = ?
+      ORDER BY artifact_uploads.updated_at DESC, artifact_uploads.id DESC
+    `).all(projectId);
+    return rows.flatMap((row) => {
+      const task = this.getTask(row.task_id);
+      return task ? [{ upload: artifactUploadFromRow(row), task }] : [];
+    });
+  }
+
+  getArtifactUpload(id) {
+    const row = this.database.prepare("SELECT * FROM artifact_uploads WHERE id = ?").get(id);
+    return row ? artifactUploadFromRow(row) : null;
+  }
+
+  createArtifactUpload(input) {
+    const timestamp = now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = this.database.prepare(`
+        SELECT * FROM artifact_uploads
+        WHERE artifact_id = ? AND target_path = ?
+      `).get(input.artifactId, input.targetPath);
+      if (existing) {
+        this.database.exec("COMMIT");
+        return artifactUploadFromRow(existing);
+      }
+      const uploadConcurrency = input.uploadConcurrency;
+      if (!Number.isSafeInteger(uploadConcurrency) || uploadConcurrency < 1) {
+        throw new ApiError(409, "TASK_UPLOAD_NOT_CONFIGURED", "The subject upload concurrency is invalid");
+      }
+      const id = randomUUID();
+      this.database.prepare(`
+        INSERT INTO artifact_uploads (
+          id, task_id, artifact_id, subject_key, storage_key, target_id, target_path,
+          filename, sha256, status, attempt_count, error_code, error_message, upload_concurrency,
+          created_at, started_at, completed_at, updated_at, claim_token, lease_until
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, NULL, NULL, ?, ?, NULL, NULL, ?, NULL, NULL)
+      `).run(
+        id,
+        input.taskId,
+        input.artifactId,
+        input.subjectKey,
+        input.storageKey,
+        input.targetId,
+        input.targetPath,
+        input.filename,
+        input.sha256,
+        uploadConcurrency,
+        timestamp,
+        timestamp,
+      );
+      const row = this.database.prepare("SELECT * FROM artifact_uploads WHERE id = ?").get(id);
+      this.database.exec("COMMIT");
+      return artifactUploadFromRow(row);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  claimNextArtifactUpload(leaseMs = ARTIFACT_UPLOAD_LEASE_DURATION_MS) {
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 1 || leaseMs > ARTIFACT_UPLOAD_MAX_FUTURE_MS) {
+      throw new TypeError("artifact upload lease duration is invalid");
+    }
+    const timestamp = now();
+    const leaseUntil = new Date(Date.now() + leaseMs).toISOString();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.database.prepare(`
+        SELECT queued.* FROM artifact_uploads AS queued
+        WHERE queued.status = 'queued'
+          AND (
+            SELECT COUNT(*) FROM artifact_uploads AS active
+            WHERE active.subject_key = queued.subject_key
+              AND active.status = 'uploading'
+          ) < queued.upload_concurrency
+        ORDER BY queued.created_at, queued.id
+        LIMIT 1
+      `).get();
+      if (!row) {
+        this.database.exec("COMMIT");
+        return null;
+      }
+      const claimToken = randomUUID();
+      const result = this.database.prepare(`
+        UPDATE artifact_uploads
+        SET status = 'uploading', attempt_count = attempt_count + 1,
+            error_code = NULL, error_message = NULL, started_at = ?, completed_at = NULL,
+            updated_at = ?, claim_token = ?, lease_until = ?
+        WHERE id = ? AND status = 'queued'
+      `).run(timestamp, timestamp, claimToken, leaseUntil, row.id);
+      if (result.changes !== 1) {
+        this.database.exec("COMMIT");
+        return null;
+      }
+      const claimed = this.database.prepare("SELECT * FROM artifact_uploads WHERE id = ?").get(row.id);
+      this.database.exec("COMMIT");
+      return artifactUploadWorkFromRow(claimed);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  renewArtifactUploadLease(id, claimToken, leaseMs = ARTIFACT_UPLOAD_LEASE_DURATION_MS) {
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 1 || leaseMs > ARTIFACT_UPLOAD_MAX_FUTURE_MS) {
+      throw new TypeError("artifact upload lease duration is invalid");
+    }
+    const timestamp = now();
+    const leaseUntil = new Date(Date.now() + leaseMs).toISOString();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.database.prepare(`
+        UPDATE artifact_uploads
+        SET lease_until = ?, updated_at = ?
+        WHERE id = ? AND status = 'uploading' AND claim_token = ?
+      `).run(leaseUntil, timestamp, id, claimToken);
+      if (result.changes !== 1) {
+        this.database.exec("COMMIT");
+        return null;
+      }
+      const renewed = this.database.prepare("SELECT * FROM artifact_uploads WHERE id = ?").get(id);
+      this.database.exec("COMMIT");
+      return artifactUploadWorkFromRow(renewed);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  markArtifactUploadUploaded(id, claimToken, validateTask = null) {
+    const timestamp = now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.database.prepare(`
+        SELECT * FROM artifact_uploads
+        WHERE id = ? AND status = 'uploading' AND claim_token = ?
+      `).get(id, claimToken);
+      if (!current) {
+        this.database.exec("COMMIT");
+        return null;
+      }
+      if (typeof validateTask === "function") {
+        const task = this.getTask(current.task_id);
+        const origin = this.getFeishuTaskOrigin(current.task_id);
+        if (!validateTask(task, origin)) {
+          this.database.prepare(`
+            UPDATE artifact_uploads
+            SET status = 'failed', error_code = 'TASK_PROVENANCE_CHANGED',
+                error_message = 'The task is no longer an eligible Feishu Auto-Cut task',
+                completed_at = ?, updated_at = ?, claim_token = NULL, lease_until = NULL
+            WHERE id = ? AND status = 'uploading' AND claim_token = ?
+          `).run(timestamp, timestamp, id, claimToken);
+          const failed = this.database.prepare("SELECT * FROM artifact_uploads WHERE id = ?").get(id);
+          this.database.exec("COMMIT");
+          return artifactUploadFromRow(failed);
+        }
+      }
+      const result = this.database.prepare(`
+        UPDATE artifact_uploads
+        SET status = 'uploaded', error_code = NULL, error_message = NULL,
+            completed_at = ?, updated_at = ?, claim_token = NULL, lease_until = NULL
+        WHERE id = ? AND status = 'uploading' AND claim_token = ?
+      `).run(timestamp, timestamp, id, claimToken);
+      const uploaded = result.changes === 1
+        ? this.database.prepare("SELECT * FROM artifact_uploads WHERE id = ?").get(id)
+        : null;
+      this.database.exec("COMMIT");
+      return uploaded ? artifactUploadFromRow(uploaded) : null;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  markArtifactUploadFailed(id, claimToken, { code, message }) {
+    const timestamp = now();
+    const result = this.database.prepare(`
+      UPDATE artifact_uploads
+      SET status = 'failed', error_code = ?, error_message = ?, completed_at = ?, updated_at = ?,
+          claim_token = NULL, lease_until = NULL
+      WHERE id = ? AND status = 'uploading' AND claim_token = ?
+    `).run(code, message, timestamp, timestamp, id, claimToken);
+    if (result.changes !== 1) return null;
+    return this.getArtifactUpload(id);
+  }
+
+  retryArtifactUpload(id) {
+    const timestamp = now();
+    const result = this.database.prepare(`
+      UPDATE artifact_uploads
+      SET status = 'queued', error_code = NULL, error_message = NULL,
+          started_at = NULL, completed_at = NULL, updated_at = ?, claim_token = NULL, lease_until = NULL
+      WHERE id = ? AND status = 'failed'
+    `).run(timestamp, id);
+    if (result.changes !== 1) return null;
+    return this.getArtifactUpload(id);
+  }
+
+  getNextArtifactUploadLeaseExpiry(excludedIds = []) {
+    const ids = [...new Set(excludedIds)];
+    const exclusion = ids.length > 0
+      ? `AND id NOT IN (${ids.map(() => "?").join(", ")})`
+      : "";
+    const rows = this.database.prepare(`
+      SELECT lease_until FROM artifact_uploads
+      WHERE status = 'uploading' AND lease_until IS NOT NULL
+        ${exclusion}
+    `).all(...ids);
+    let earliest = null;
+    let earliestMs = Number.POSITIVE_INFINITY;
+    for (const row of rows) {
+      const leaseUntilMs = parseArtifactUploadTimestamp(row.lease_until);
+      if (leaseUntilMs !== null && leaseUntilMs < earliestMs) {
+        earliest = row.lease_until;
+        earliestMs = leaseUntilMs;
+      }
+    }
+    return earliest;
+  }
+
+  recoverUploadingArtifactUploads(excludedIds = []) {
+    const timestampMs = Date.now();
+    const timestamp = new Date(timestampMs).toISOString();
+    const ids = [...new Set(excludedIds)];
+    const exclusion = ids.length > 0
+      ? `AND id NOT IN (${ids.map(() => "?").join(", ")})`
+      : "";
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const rows = this.database.prepare(`
+        SELECT id, started_at, claim_token, lease_until
+        FROM artifact_uploads
+        WHERE status = 'uploading' ${exclusion}
+      `).all(...ids);
+      const recoverableIds = rows
+        .filter((row) => artifactUploadLeaseNeedsRecovery({
+          startedAt: row.started_at,
+          claimToken: row.claim_token,
+          leaseUntil: row.lease_until,
+        }, timestampMs))
+        .map((row) => row.id);
+      let changes = 0;
+      if (recoverableIds.length > 0) {
+        changes = this.database.prepare(`
+          UPDATE artifact_uploads
+          SET status = 'queued', error_code = NULL, error_message = NULL,
+              started_at = NULL, completed_at = NULL, updated_at = ?, claim_token = NULL, lease_until = NULL
+          WHERE status = 'uploading'
+            AND id IN (${recoverableIds.map(() => "?").join(", ")})
+        `).run(timestamp, ...recoverableIds).changes;
+      }
+      this.database.exec("COMMIT");
+      return changes;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   #commentWithAttachments(row) {
