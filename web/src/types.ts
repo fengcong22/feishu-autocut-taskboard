@@ -362,6 +362,7 @@ export interface Task {
   createdAt: string;
   updatedAt: string;
   feishuOrigin?: FeishuTaskOrigin;
+  feishuPackageSnapshot?: FeishuTaskPackageSnapshot;
 }
 
 export interface Comment {
@@ -442,6 +443,10 @@ export interface FeishuTaskOrigin {
   concurrencyGroup?: string;
   maxConcurrent?: number;
   resourceGroups?: string[];
+}
+
+export interface FeishuTaskPackageSnapshot {
+  zipSourceDirectory: string | null;
 }
 
 export interface ArtifactUpload {

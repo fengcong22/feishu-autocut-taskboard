@@ -1683,6 +1683,12 @@ export class TaskboardDatabase {
       );
       const feishuOrigin = this.getFeishuTaskOrigin(task.id);
       if (feishuOrigin) task.feishuOrigin = feishuOrigin;
+      const packageSnapshot = this.getFeishuTaskPackageSnapshot(task.id);
+      if (packageSnapshot) {
+        task.feishuPackageSnapshot = {
+          zipSourceDirectory: packageSnapshot.zipSourceDirectory ?? null,
+        };
+      }
       return task;
     });
   }
@@ -1697,6 +1703,12 @@ export class TaskboardDatabase {
     const enriched = attachTaskActivity(task, comments, activities, previewImage);
     const feishuOrigin = this.getFeishuTaskOrigin(task.id);
     if (feishuOrigin) enriched.feishuOrigin = feishuOrigin;
+    const packageSnapshot = this.getFeishuTaskPackageSnapshot(task.id);
+    if (packageSnapshot) {
+      enriched.feishuPackageSnapshot = {
+        zipSourceDirectory: packageSnapshot.zipSourceDirectory ?? null,
+      };
+    }
     return enriched;
   }
 

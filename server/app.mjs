@@ -1972,7 +1972,9 @@ export function createTaskboardServer(options = {}) {
   const uploadWorker = options.uploadWorker ?? createArtifactUploadWorker({
     database,
     artifactService,
-    validateTaskForCompletion: (task, origin) => Boolean(matchingFeishuTaskOrigin(task, origin)),
+    validateTaskForCompletion: (task, origin) => Boolean(
+      task?.status === "done" && matchingFeishuTaskOrigin(task, origin),
+    ),
     onUpdate: (upload) => events.emit("artifact.upload.updated", {
       upload,
       task: upload?.taskId ? database.getTask(upload.taskId) : null,
@@ -2314,6 +2316,25 @@ export function createTaskboardServer(options = {}) {
           message: "Editing completed, but the verified ZIP could not join the upload queue",
         },
       };
+    }
+  }
+
+  function reconcileAutomaticArtifactUploads() {
+    let tasks;
+    try {
+      tasks = database.listTasks({ status: "done", archived: "false" });
+    } catch (error) {
+      console.error(`Automatic artifact upload recovery failed: ${error?.code ?? "UPLOAD_RECOVERY_FAILED"}`);
+      return;
+    }
+    for (const task of tasks) {
+      try {
+        maybeAutomaticallyEnqueueCompletedTask(task);
+      } catch (error) {
+        console.error(
+          `Automatic artifact upload recovery failed for task '${task.id}': ${error?.code ?? "UPLOAD_RECOVERY_FAILED"}`,
+        );
+      }
     }
   }
 
@@ -3733,6 +3754,22 @@ export function createTaskboardServer(options = {}) {
           });
           let artifact;
           try {
+            const existing = database.listTaskArtifacts(task.id).find((candidate) => (
+              candidate.filename === stored.filename && candidate.sha256 === stored.sha256
+            ));
+            if (existing) {
+              const existingWork = database.getTaskArtifactForWork(existing.id);
+              const existingContent = existingWork
+                ? await artifactService.getStoredArtifactStats(existingWork.storageKey)
+                : null;
+              if (!existingContent?.isFile()) {
+                throw new ApiError(
+                  409,
+                  "ARTIFACT_CONTENT_MISSING",
+                  "A matching ZIP is already registered but its local content is missing; remove it before re-uploading",
+                );
+              }
+            }
             artifact = database.createTaskArtifact(task.id, {
               ...stored,
               requiredTaskStatus: "in_progress",
@@ -4185,6 +4222,7 @@ export function createTaskboardServer(options = {}) {
         throw error;
       }
       listening = true;
+      reconcileAutomaticArtifactUploads();
       startUploadWorker();
       return address;
     },

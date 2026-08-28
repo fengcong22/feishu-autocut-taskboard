@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type KeyboardEvent, type MouseEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import { defaultUrlTransform } from "react-markdown";
 import remarkBreaks from "remark-breaks";
@@ -6,18 +6,25 @@ import remarkGfm from "remark-gfm";
 import { taskboardStorage } from "../storage";
 import {
   ApiError,
+  artifactDownloadUrl,
   attachmentDownloadUrl,
   createComment,
   deleteAttachment,
   deleteComment,
+  deleteTaskArtifact,
+  enqueueTaskArtifactUpload,
   listAttachments,
   listComments,
+  listTaskArtifacts,
+  listTaskArtifactUploads,
   listTaskActivities,
   markdownIncludesAttachment,
   resolveTaskboardUrl,
   resolvePersistedAttachmentUrl,
+  retryTaskArtifactUpload,
   uploadAttachment,
   uploadCommentAttachment,
+  uploadTaskArtifact,
   updateComment,
 } from "../api";
 import {
@@ -30,12 +37,14 @@ import { TASK_PRIORITIES, TASK_STATUSES } from "../types";
 import type {
   ActorIdentity,
   Attachment,
+  ArtifactUpload,
   Comment,
   DevelopmentContext,
   DevelopmentScan,
   IssueRelationType,
   Recurrence,
   Task,
+  TaskArtifact,
   TaskChangeActivity,
   TaskDraft,
   TaskPriority,
@@ -103,8 +112,10 @@ interface TaskDetailProps {
   ) => Promise<RelationMutationResult>;
   onOpenThread: (threadId: string) => void;
   onOpenInThread: (task: Task) => void;
+  onStartCodex: (task: Task) => void;
   onCopy: (text: string, announcement: string) => void;
   openingThread: boolean;
+  startingCodex: boolean;
   onError: (message: TaskDetailError | null) => void;
 }
 
@@ -169,6 +180,16 @@ async function downloadAttachmentFile(attachment: Attachment) {
   link.click();
   link.remove();
   URL.revokeObjectURL(url);
+}
+
+function uploadStatusLabel(
+  status: ArtifactUpload["status"],
+  text: (chinese: string, english: string) => string,
+): string {
+  if (status === "queued") return text("等待上传", "Queued for upload");
+  if (status === "uploading") return text("上传中", "Uploading");
+  if (status === "uploaded") return text("已上传", "Uploaded");
+  return text("上传失败", "Upload failed");
 }
 
 function contextValue(context: DevelopmentContext | null): string {
@@ -348,8 +369,10 @@ export function TaskDetail({
   onRemoveRelation,
   onOpenThread,
   onOpenInThread,
+  onStartCodex,
   onCopy,
   openingThread,
+  startingCodex,
   onError,
 }: TaskDetailProps) {
   const { language, locale, text } = useTaskboardI18n();
@@ -368,6 +391,16 @@ export function TaskDetail({
   const [uploadingAttachments, setUploadingAttachments] = useState(false);
   const [pendingAttachmentDelete, setPendingAttachmentDelete] = useState<Attachment | null>(null);
   const [deletingAttachment, setDeletingAttachment] = useState(false);
+  const [artifacts, setArtifacts] = useState<TaskArtifact[]>([]);
+  const [artifactsLoading, setArtifactsLoading] = useState(false);
+  const [artifactsError, setArtifactsError] = useState<TaskDetailError | null>(null);
+  const [uploadingArtifact, setUploadingArtifact] = useState(false);
+  const [deletingArtifactId, setDeletingArtifactId] = useState<string | null>(null);
+  const [artifactUploads, setArtifactUploads] = useState<ArtifactUpload[]>([]);
+  const [artifactUploadsLoading, setArtifactUploadsLoading] = useState(false);
+  const [artifactUploadsError, setArtifactUploadsError] = useState<TaskDetailError | null>(null);
+  const [enqueueingArtifactId, setEnqueueingArtifactId] = useState<string | null>(null);
+  const [retryingUploadId, setRetryingUploadId] = useState<string | null>(null);
   const [comments, setComments] = useState<Comment[]>([]);
   const [taskActivities, setTaskActivities] = useState<TaskChangeActivity[]>([]);
   const [commentsLoading, setCommentsLoading] = useState(true);
@@ -392,6 +425,7 @@ export function TaskDetail({
   const composerRef = useRef<InlineMediaComposerHandle>(null);
   const editingComposerRef = useRef<InlineMediaComposerHandle>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
+  const artifactInputRef = useRef<HTMLInputElement>(null);
   const commentAttachmentInputRef = useRef<HTMLInputElement>(null);
   const editCommentImageInputRef = useRef<HTMLInputElement>(null);
   const editingUploadedAttachmentsRef = useRef<Map<string, Attachment>>(new Map());
@@ -399,6 +433,42 @@ export function TaskDetail({
   const commentInlineImages = inlineMediaImages(commentSegments);
   const editingDraft = serializeInlineMedia(editingSegments);
   const editingInlineImages = inlineMediaImages(editingSegments);
+  const feishuMetadata = currentTask.feishuOrigin?.source === "feishu-base"
+    ? {
+      mode: currentTask.feishuOrigin.executionMode === "automatic"
+        || currentTask.feishuOrigin.mode === "automatic"
+        ? "automatic" as const
+        : "manual" as const,
+    }
+    : null;
+  const isFeishuAutoCutTask = Boolean(
+    feishuMetadata
+    && currentTask.labels.includes("feishu")
+  );
+  const canUploadTaskArtifact = Boolean(
+    isFeishuAutoCutTask
+    && feishuMetadata
+    && (currentTask.status === "in_progress"
+      || (feishuMetadata.mode === "manual" && currentTask.status === "in_review")
+      || (feishuMetadata.mode === "automatic" && currentTask.status === "done")),
+  );
+  const canQueueArtifactUpload = Boolean(
+    isFeishuAutoCutTask
+    && currentTask.status === "done",
+  );
+  const latestUploadByArtifact = useMemo(() => {
+    const uploads = new Map<string, ArtifactUpload>();
+    for (const upload of artifactUploads) {
+      const current = uploads.get(upload.artifactId);
+      if (!current || current.updatedAt < upload.updatedAt) uploads.set(upload.artifactId, upload);
+    }
+    return uploads;
+  }, [artifactUploads]);
+  const uploadSummary = useMemo(() => {
+    const summary = { queued: 0, uploading: 0, uploaded: 0, failed: 0 };
+    for (const upload of artifactUploads) summary[upload.status] += 1;
+    return summary;
+  }, [artifactUploads]);
 
   useEffect(() => {
     const taskChanged = currentTask.id !== task.id;
@@ -468,6 +538,54 @@ export function TaskDetail({
     );
     return () => controller.abort();
   }, [attachmentsRevision, task.id]);
+
+  useEffect(() => {
+    if (!isFeishuAutoCutTask) {
+      setArtifacts([]);
+      setArtifactsError(null);
+      setArtifactsLoading(false);
+      return undefined;
+    }
+    const controller = new AbortController();
+    setArtifactsLoading(true);
+    setArtifactsError(null);
+    void listTaskArtifacts(task.id, controller.signal).then(
+      (nextArtifacts) => {
+        setArtifacts(nextArtifacts);
+        setArtifactsLoading(false);
+      },
+      (error) => {
+        if ((error as Error).name === "AbortError") return;
+        setArtifactsError(messageFor(error));
+        setArtifactsLoading(false);
+      },
+    );
+    return () => controller.abort();
+  }, [attachmentsRevision, isFeishuAutoCutTask, task.id]);
+
+  useEffect(() => {
+    if (!isFeishuAutoCutTask) {
+      setArtifactUploads([]);
+      setArtifactUploadsError(null);
+      setArtifactUploadsLoading(false);
+      return undefined;
+    }
+    const controller = new AbortController();
+    setArtifactUploadsLoading(true);
+    setArtifactUploadsError(null);
+    void listTaskArtifactUploads(task.id, controller.signal).then(
+      (nextUploads) => {
+        setArtifactUploads(nextUploads);
+        setArtifactUploadsLoading(false);
+      },
+      (error) => {
+        if ((error as Error).name === "AbortError") return;
+        setArtifactUploadsError(messageFor(error));
+        setArtifactUploadsLoading(false);
+      },
+    );
+    return () => controller.abort();
+  }, [attachmentsRevision, isFeishuAutoCutTask, task.id]);
 
   useEffect(() => {
     const key = `taskboard.comment-draft.${task.id}`;
@@ -761,6 +879,85 @@ export function TaskDetail({
     }
   }
 
+  async function uploadArtifact(files: FileList) {
+    const file = files.item(0);
+    if (!file || uploadingArtifact) return;
+    if (!file.name.toLowerCase().endsWith(".zip")) {
+      setArtifactsError([
+        `“${file.name}” 不是 ZIP 文件。`,
+        `“${file.name}” is not a ZIP file.`,
+      ]);
+      if (artifactInputRef.current) artifactInputRef.current.value = "";
+      return;
+    }
+
+    setUploadingArtifact(true);
+    setArtifactsError(null);
+    try {
+      const result = await uploadTaskArtifact(currentTask.id, file);
+      const { artifact } = result;
+      setArtifacts((current) => [
+        artifact,
+        ...current.filter((candidate) => candidate.id !== artifact.id),
+      ]);
+      setCurrentTask(result.task);
+      if (result.upload) updateArtifactUpload(result.upload);
+      if (result.uploadEnqueueError) setArtifactUploadsError(result.uploadEnqueueError.message);
+    } catch (error) {
+      setArtifactsError(messageFor(error));
+    } finally {
+      setUploadingArtifact(false);
+      if (artifactInputRef.current) artifactInputRef.current.value = "";
+    }
+  }
+
+  async function removeArtifact(artifact: TaskArtifact) {
+    if (deletingArtifactId) return;
+    setDeletingArtifactId(artifact.id);
+    setArtifactsError(null);
+    try {
+      await deleteTaskArtifact(artifact.id);
+      setArtifacts((current) => current.filter((candidate) => candidate.id !== artifact.id));
+    } catch (error) {
+      setArtifactsError(messageFor(error));
+    } finally {
+      setDeletingArtifactId(null);
+    }
+  }
+
+  function updateArtifactUpload(nextUpload: ArtifactUpload) {
+    setArtifactUploads((current) => [
+      nextUpload,
+      ...current.filter((upload) => upload.id !== nextUpload.id),
+    ]);
+  }
+
+  async function enqueueArtifactUpload(artifact: TaskArtifact) {
+    if (enqueueingArtifactId || retryingUploadId || artifact.validationStatus !== "verified") return;
+    setEnqueueingArtifactId(artifact.id);
+    setArtifactUploadsError(null);
+    try {
+      updateArtifactUpload(await enqueueTaskArtifactUpload(currentTask.id, artifact.id));
+    } catch (error) {
+      setArtifactUploadsError(messageFor(error));
+    } finally {
+      setEnqueueingArtifactId(null);
+    }
+  }
+
+  async function retryArtifactUpload(upload: ArtifactUpload) {
+    if (enqueueingArtifactId || retryingUploadId || upload.status !== "failed") return;
+    setRetryingUploadId(upload.id);
+    setArtifactUploadsError(null);
+    try {
+      updateArtifactUpload(await retryTaskArtifactUpload(currentTask.id, upload.id));
+    } catch (error) {
+      setArtifactUploadsError(messageFor(error));
+    } finally {
+      setRetryingUploadId(null);
+    }
+  }
+
   async function confirmAttachmentDelete() {
     if (!pendingAttachmentDelete || deletingAttachment) return;
     setDeletingAttachment(true);
@@ -1012,6 +1209,176 @@ export function TaskDetail({
                 </div>
               )}
             </section>
+
+            {isFeishuAutoCutTask && (
+              <section className="issue-artifacts" aria-labelledby="artifacts-heading">
+                <header className="attachments-heading">
+                  <div>
+                    <h2 id="artifacts-heading">{text("剪映草稿 ZIP", "Jianying draft ZIP")}</h2>
+                    <span>{artifacts.length}</span>
+                  </div>
+                  {canUploadTaskArtifact && (
+                    <>
+                      <button
+                        className="attachment-add-button"
+                        type="button"
+                        disabled={uploadingArtifact || deletingArtifactId !== null}
+                        onClick={() => artifactInputRef.current?.click()}
+                      >
+                        <LinearIcon name="attachment" />
+                        {uploadingArtifact
+                          ? text("校验并上传中…", "Validating and uploading…")
+                          : artifacts.length > 0
+                            ? text("重新选择", "Choose another")
+                            : text("选择 ZIP", "Choose ZIP")}
+                      </button>
+                      <input
+                        ref={artifactInputRef}
+                        type="file"
+                        accept=".zip,application/zip,application/x-zip-compressed"
+                        hidden
+                        onChange={(event) => {
+                          if (event.currentTarget.files) void uploadArtifact(event.currentTarget.files);
+                        }}
+                      />
+                    </>
+                  )}
+                </header>
+                <p className="artifact-mode-result">{feishuMetadata?.mode === "manual"
+                  ? text("验证后待验收", "Moves to review after validation")
+                  : text("验证后完成", "Completes after validation")}</p>
+                {currentTask.feishuPackageSnapshot?.zipSourceDirectory && (
+                  <p className="artifact-source-directory">
+                    <span>{text("ZIP 获取目录", "ZIP source directory")}</span>
+                    <code>{currentTask.feishuPackageSnapshot.zipSourceDirectory}</code>
+                  </p>
+                )}
+
+                {artifactsLoading ? (
+                  <div className="attachments-loading" aria-label={text("正在加载剪映草稿 ZIP", "Loading Jianying draft ZIPs")} aria-busy="true"><i /><i /></div>
+                ) : artifacts.length > 0 ? (
+                  <ul className="artifact-list">
+                    {artifacts.map((artifact) => {
+                      const artifactUpload = latestUploadByArtifact.get(artifact.id);
+                      const artifactUploadActive = artifactUpload?.status === "queued" || artifactUpload?.status === "uploading";
+                      const canEnqueue = canQueueArtifactUpload
+                        && artifact.validationStatus === "verified"
+                        && !artifactUpload;
+                      return <li key={artifact.id}>
+                        <a
+                          className="artifact-link"
+                          href={artifactDownloadUrl(artifact.id)}
+                          download={artifact.filename}
+                          title={text(`下载 ${artifact.filename}`, `Download ${artifact.filename}`)}
+                        >
+                          <span className="artifact-file-icon" aria-hidden="true"><LinearIcon name="file" /></span>
+                          <span className="artifact-copy">
+                            <strong>{artifact.filename}</strong>
+                            <span>{fileSize(artifact.size)} · {artifact.validationStatus === "verified"
+                              ? text("已验证", "Verified")
+                              : artifact.validationStatus}</span>
+                            <code title={artifact.sha256}>SHA-256 {artifact.sha256}</code>
+                          </span>
+                        </a>
+                        <div className="artifact-actions">
+                          <a
+                            href={artifactDownloadUrl(artifact.id)}
+                            download={artifact.filename}
+                            aria-label={text(`下载 ${artifact.filename}`, `Download ${artifact.filename}`)}
+                            title={text("下载 ZIP", "Download ZIP")}
+                          >
+                            <LinearIcon name="openExternal" />
+                          </a>
+                          {canEnqueue && (
+                            <button
+                              type="button"
+                              disabled={enqueueingArtifactId === artifact.id || deletingArtifactId === artifact.id || uploadingArtifact}
+                              aria-label={text(`将 ${artifact.filename} 加入上传队列`, `Queue ${artifact.filename} for upload`)}
+                              title={text("加入上传队列", "Queue for upload")}
+                              onClick={() => void enqueueArtifactUpload(artifact)}
+                            >
+                              <LinearIcon name="send" />
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            disabled={deletingArtifactId === artifact.id || uploadingArtifact || enqueueingArtifactId === artifact.id || artifactUploadActive}
+                            aria-label={text(`移除 ${artifact.filename}`, `Remove ${artifact.filename}`)}
+                            title={text("移除 ZIP", "Remove ZIP")}
+                            onClick={() => void removeArtifact(artifact)}
+                          >
+                            <LinearIcon name="trash" />
+                          </button>
+                        </div>
+                      </li>;
+                    })}
+                  </ul>
+                ) : (
+                  <p className="artifacts-empty">{text(
+                    canUploadTaskArtifact
+                      ? "选择 Auto-Cut 打包生成的完整剪映草稿 ZIP。"
+                      : "暂无已上传的剪映草稿 ZIP。",
+                    canUploadTaskArtifact
+                      ? "Choose the complete Jianying draft ZIP produced by Auto-Cut."
+                      : "No Jianying draft ZIP has been uploaded.",
+                  )}</p>
+                )}
+                {artifactUploadsLoading ? (
+                  <div className="attachments-loading" aria-label={text("正在加载上传队列", "Loading upload queue")} aria-busy="true"><i /><i /></div>
+                ) : artifactUploads.length > 0 ? (
+                  <section className="artifact-upload-queue" aria-labelledby="artifact-upload-queue-heading">
+                    <h3 id="artifact-upload-queue-heading">{text("上传队列", "Upload queue")}</h3>
+                    <div className="artifact-upload-summary">
+                      <span>{text("等待", "Queued")} {uploadSummary.queued}</span>
+                      <span>{text("上传中", "Uploading")} {uploadSummary.uploading}</span>
+                      <span>{text("已上传", "Uploaded")} {uploadSummary.uploaded}</span>
+                      <span>{text("失败", "Failed")} {uploadSummary.failed}</span>
+                    </div>
+                    <ul>
+                      {artifactUploads.map((upload) => (
+                        <li key={upload.id} className={`is-${upload.status}`}>
+                          <div className="artifact-upload-copy">
+                            <div>
+                              <strong>{upload.filename}</strong>
+                              <span className="artifact-upload-status">{uploadStatusLabel(upload.status, text)}</span>
+                            </div>
+                            <span>SHA-256 {upload.sha256}</span>
+                            {upload.status === "failed" && upload.errorMessage && (
+                              <span className="artifact-upload-error">{upload.errorMessage}</span>
+                            )}
+                          </div>
+                          {upload.status === "failed" && (
+                            <button
+                              type="button"
+                              disabled={retryingUploadId === upload.id || enqueueingArtifactId !== null}
+                              aria-label={text(`重新上传 ${upload.filename}`, `Retry uploading ${upload.filename}`)}
+                              title={text("重新上传", "Retry upload")}
+                              onClick={() => void retryArtifactUpload(upload)}
+                            >
+                              <LinearIcon name="recurrence" />
+                            </button>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  </section>
+                ) : null}
+                {artifactUploadsError && (
+                  <div className="attachments-error" role="alert">
+                    {typeof artifactUploadsError === "string"
+                      ? artifactUploadsError
+                      : text(artifactUploadsError[0], artifactUploadsError[1])}
+                  </div>
+                )}
+                {artifactsError && (
+                  <div className="attachments-error" role="alert">
+                    {typeof artifactsError === "string"
+                      ? artifactsError
+                      : text(artifactsError[0], artifactsError[1])}
+                  </div>
+                )}
+              </section>
+            )}
 
             <section className="activity-section" aria-labelledby="activity-heading">
               <header className="activity-heading">
@@ -1361,6 +1728,19 @@ export function TaskDetail({
 
           <aside className="issue-properties" aria-label={text("议题属性", "Issue properties")}>
             <div className="detail-primary-actions">
+              {currentTask.labels.includes("feishu") && currentTask.status === "todo" && (
+                <button
+                  className="detail-open-thread-action"
+                  type="button"
+                  disabled={startingCodex}
+                  onClick={() => onStartCodex(currentTask)}
+                >
+                  <ActorAvatar actor={CODEX_AGENT_ACTOR} className="detail-thread-avatar" />
+                  <span>{startingCodex
+                    ? text("Codex 启动中…", "Starting Codex…")
+                    : text("启动 Codex", "Start Codex")}</span>
+                </button>
+              )}
               <button
                 className="detail-open-thread-action"
                 type="button"
