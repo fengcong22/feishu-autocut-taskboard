@@ -191,6 +191,7 @@ export function LinearIcon({ name, title, style, ...props }: LinearIconProps) {
 const STATUS_ICON_NAMES: Record<TaskStatus, LinearIconName> = {
   backlog: "statusBacklog",
   todo: "statusTodo",
+  queued: "statusStarted",
   in_progress: "statusStarted",
   in_review: "statusStarted",
   blocked: "alert",

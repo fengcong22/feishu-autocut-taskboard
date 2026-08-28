@@ -34,6 +34,7 @@ import { codexInvocation } from "../shared/codex-invocation.mjs";
 import { createFeishuWorkflowStore, subjectProjectId } from "./feishu-workflow-store.mjs";
 import { createFeishuWorkflowApi } from "./feishu-workflow-api.mjs";
 import { createResourceScheduler } from "./resource-scheduler.mjs";
+import { createFeishuExecutionCoordinator } from "./feishu-execution-coordinator.mjs";
 import { ArtifactServiceError, createArtifactService } from "./artifact-service.mjs";
 import { createArtifactUploadWorker } from "./upload-worker.mjs";
 
@@ -2203,6 +2204,13 @@ export function createTaskboardServer(options = {}) {
     return executionModeForMetadata(metadata) === "automatic" ? "done" : "in_review";
   }
 
+  function clearFeishuExecutionAfterRun(taskId, lease = null) {
+    const execution = database.getFeishuExecution(taskId);
+    if (!execution || execution.state !== "running") return;
+    if (lease?.leaseId && execution.leaseId && execution.leaseId !== lease.leaseId) return;
+    database.clearFeishuExecution(taskId);
+  }
+
   function assertTaskArtifactEligible(task) {
     try {
       return requireTrustedFeishuTask(task);
@@ -2310,6 +2318,7 @@ export function createTaskboardServer(options = {}) {
     if (!status) return;
     const current = database.getTask(taskId);
     if (!current || current.threadId !== threadId) {
+      clearFeishuExecutionAfterRun(taskId, lease);
       if (lease) resourceScheduler.release(lease);
       return;
     }
@@ -2319,6 +2328,7 @@ export function createTaskboardServer(options = {}) {
       && entry.runId === run.id
     ));
     if (!claim) {
+      clearFeishuExecutionAfterRun(taskId, lease);
       if (lease) resourceScheduler.release(lease);
       return;
     }
@@ -2329,6 +2339,7 @@ export function createTaskboardServer(options = {}) {
       status,
       actor,
     );
+    clearFeishuExecutionAfterRun(taskId, lease);
     events.emit("task.updated", { task });
     if (lease) resourceScheduler.release(lease);
   }
@@ -2421,22 +2432,21 @@ export function createTaskboardServer(options = {}) {
           status,
           CODEX_AGENT_ACTOR,
         );
+        clearFeishuExecutionAfterRun(task.id);
         events.emit("task.updated", { task: updated });
       } catch (error) {
         console.error("Failed to recover terminal Feishu task", error);
       }
     }
   }
-  reconcileClaimedFeishuTasks();
-
-  function executionRequestForTask(task, metadata) {
+  function executionRequestForTask(task, metadata, packageConfig = null) {
     const mode = executionModeForMetadata(metadata);
     const packageAlias = metadata.packageAlias || "default";
     return {
       requestId: task.id,
-      concurrencyGroup: metadata.concurrencyGroup || `autocut:${packageAlias}`,
-      maxConcurrent: Number.isSafeInteger(metadata.maxConcurrent) && metadata.maxConcurrent > 0
-        ? metadata.maxConcurrent
+      concurrencyGroup: `autocut:${packageAlias}`,
+      maxConcurrent: Number.isSafeInteger(packageConfig?.maxConcurrent) && packageConfig.maxConcurrent > 0
+        ? packageConfig.maxConcurrent
         : 1,
       resourceGroups: Array.isArray(metadata.resourceGroups) ? metadata.resourceGroups : [],
       mode,
@@ -2462,6 +2472,8 @@ export function createTaskboardServer(options = {}) {
         projectId: claimedTask.projectId,
         issueId: claimedTask.id,
         title: `${claimedTask.identifier} · ${metadata.packageAlias}`,
+        ...(packageConfig.model ? { model: packageConfig.model } : {}),
+        ...(packageConfig.reasoningEffort ? { reasoningEffort: packageConfig.reasoningEffort } : {}),
         sandbox: "workspace-write",
       });
       database.verifyTaskAiStart(
@@ -2536,7 +2548,7 @@ export function createTaskboardServer(options = {}) {
         leaseId: lease.leaseId,
         state: "running",
         trigger,
-        mode: executionRequestForTask(claimedTask, metadata).mode,
+        mode: executionRequestForTask(claimedTask, metadata, packageConfig).mode,
         concurrencyGroup: lease.concurrencyGroup,
         resourceGroups: lease.resourceGroups,
       },
@@ -2547,7 +2559,7 @@ export function createTaskboardServer(options = {}) {
     task,
     actor,
     metadata,
-    { trigger = "manual", signal = taskStartAbortController.signal } = {},
+    { trigger = "manual", signal = taskStartAbortController.signal, lease: providedLease = null } = {},
   ) {
     if (trigger === "automatic" && !allowAutomaticExecution) {
       throw new ApiError(
@@ -2572,7 +2584,12 @@ export function createTaskboardServer(options = {}) {
     }
     const storedSnapshot = database.getFeishuTaskPackageSnapshot(task.id);
     const packageConfig = storedSnapshot
-      ? { ...livePackage, ...storedSnapshot, state: livePackage.state }
+      ? {
+          ...livePackage,
+          ...storedSnapshot,
+          maxConcurrent: livePackage.maxConcurrent,
+          state: livePackage.state,
+        }
       : livePackage;
     // A Feishu subject project identifies the Base/table queue.  The trusted
     // package alias identifies the Auto-Cut workspace and may be shared by
@@ -2590,10 +2607,10 @@ export function createTaskboardServer(options = {}) {
     assertTaskStartAllowed(signal);
     const claimedTask = database.claimTaskForAiStart(task.id, task.version, actor);
     events.emit("task.updated", { task: claimedTask });
-    const execution = executionRequestForTask(claimedTask, metadata);
-    let lease;
+    const execution = executionRequestForTask(claimedTask, metadata, packageConfig);
+    let lease = providedLease;
     try {
-      lease = await resourceScheduler.request(execution);
+      if (!lease) lease = await resourceScheduler.request(execution);
       assertTaskStartAllowed(signal);
       return await startClaimedTaskWithAi(
         claimedTask,
@@ -2616,6 +2633,23 @@ export function createTaskboardServer(options = {}) {
       throw error;
     }
   }
+  const executionCoordinator = createFeishuExecutionCoordinator({
+    database,
+    packageStore: feishuPackages,
+    scheduler: resourceScheduler,
+    allowAutomaticExecution,
+    onTaskUpdated: (task) => events.emit("task.updated", { task }),
+    startClaimedTask: (task, metadata, lease, trigger, actor) => startTaskWithAi(
+      task,
+      actor ?? CODEX_AGENT_ACTOR,
+      metadata,
+      { trigger, lease },
+    ),
+  });
+  reconcileClaimedFeishuTasks();
+  void executionCoordinator.recover().catch((error) => {
+    console.error(`Failed to recover Feishu execution queue: ${error?.code ?? "RECOVERY_FAILED"}`);
+  });
   const projectSummary = new ProjectSummaryService({
     database,
     codexExecutable: resolved.codexExecutable,
@@ -2824,6 +2858,9 @@ export function createTaskboardServer(options = {}) {
         if (result) {
           if (request.method !== "GET" && pathname !== "/api/local/autocut/packages/catalog") {
             events.emit("autocut.package.updated", {});
+            void executionCoordinator.wake().catch((error) => {
+              console.error(`Failed to wake Auto-Cut execution queue: ${error?.code ?? "QUEUE_WAKE_FAILED"}`);
+            });
           }
           return sendJson(response, result.status, result.body);
         }
@@ -3295,10 +3332,6 @@ export function createTaskboardServer(options = {}) {
         validateFeishuTaskRegistration(input, metadata);
         let packageSnapshot;
         if (metadata.packageAlias) {
-          // The production registry exposes an atomic get() operation.  Keep
-          // legacy embedders that only implement read() compatible; they can
-          // still register a visible task, while the built-in store always
-          // captures the trusted snapshot below.
           const packageRecord = typeof feishuPackages.get === "function"
             ? await feishuPackages.get(metadata.packageAlias)
             : null;
@@ -3311,7 +3344,7 @@ export function createTaskboardServer(options = {}) {
           }
           if (packageRecord) packageSnapshot = {
             packageAlias: packageRecord.alias ?? metadata.packageAlias,
-            packageRevision: packageRecord.revision,
+            packageRevision: packageRecord.revision ?? 1,
             name: packageRecord.name ?? packageRecord.projectName ?? packageRecord.alias ?? metadata.packageAlias,
             projectId: packageRecord.projectId ?? null,
             workspacePath: packageRecord.workspacePath,
@@ -3335,11 +3368,8 @@ export function createTaskboardServer(options = {}) {
         if (allowAutomaticExecution && !closing) {
           const metadata = trustedFeishuTaskOrigin(task, { requirePackage: true });
           if (metadata && executionModeForMetadata(metadata) === "automatic") {
-            void startTrackedTask(task.id, () => startTaskWithAi(
-              task,
-              CODEX_AGENT_ACTOR,
-              metadata,
-              { trigger: "automatic" },
+            void startTrackedTask(task.id, () => executionCoordinator.schedule(
+              task, metadata, "automatic", { actor: CODEX_AGENT_ACTOR },
             )).catch((error) => {
               if (["SERVER_SHUTTING_DOWN", "REQUEST_CANCELLED"].includes(error?.code)) return;
               console.error(`Automatic execution failed for task '${task.id}': ${error.code ?? "EXECUTION_FAILED"}`);
@@ -3420,11 +3450,8 @@ export function createTaskboardServer(options = {}) {
           if (allowAutomaticExecution && !closing) {
             const metadata = parseFeishuTaskMetadata(task.description);
             if (metadata && trustedFeishuTaskOrigin(task) && executionModeForMetadata(metadata) === "automatic") {
-              void startTrackedTask(task.id, () => startTaskWithAi(
-                task,
-                CODEX_AGENT_ACTOR,
-                metadata,
-                { trigger: "automatic" },
+              void startTrackedTask(task.id, () => executionCoordinator.schedule(
+                task, metadata, "automatic", { actor: CODEX_AGENT_ACTOR },
               ))
                 .catch((error) => {
                   if (["SERVER_SHUTTING_DOWN", "REQUEST_CANCELLED"].includes(error?.code)) return;
@@ -3907,15 +3934,12 @@ export function createTaskboardServer(options = {}) {
         const { trigger } = parseExecutionBody(await readJson(request));
         const task = database.getTask(id);
         if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
-        if (task.status !== "todo") {
+        if (task.status !== "todo" && task.status !== "queued") {
           throw new ApiError(409, "TASK_NOT_STARTABLE", "Only ready tasks can be executed");
         }
         const metadata = requireTrustedFeishuTask(task, { requirePackage: true });
-        return sendJson(response, 202, await startTrackedTask(task.id, () => startTaskWithAi(
-          task,
-          actorFromRequest(request),
-          metadata,
-          { trigger },
+        return sendJson(response, 202, await startTrackedTask(task.id, () => executionCoordinator.schedule(
+          task, metadata, trigger, { actor: actorFromRequest(request) },
         )));
       }
 
@@ -4019,7 +4043,7 @@ export function createTaskboardServer(options = {}) {
           await parseStartAiBody(await readJson(request));
           const task = database.getTask(id);
           if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
-          if (task.status !== "todo") {
+          if (task.status !== "todo" && task.status !== "queued") {
             throw new ApiError(
               409,
               "TASK_NOT_STARTABLE",
@@ -4027,25 +4051,26 @@ export function createTaskboardServer(options = {}) {
             );
           }
           const metadata = requireTrustedFeishuTask(task, { requirePackage: true });
-          return sendJson(response, 202, await startTrackedTask(task.id, () => startTaskWithAi(
-            task,
-            actorFromRequest(request),
-            metadata,
-            { trigger: "manual" },
+          return sendJson(response, 202, await startTrackedTask(task.id, () => executionCoordinator.schedule(
+            task, metadata, "manual", { actor: actorFromRequest(request) },
           )));
         }
         if (action === "move" && request.method === "POST") {
           const move = parseMove(await readJson(request));
           const current = database.getTask(id);
           const marker = current ? parseFeishuTaskMetadata(current.description) : null;
+          if (current?.status === "queued" && move.status === "in_progress") {
+            throw new ApiError(
+              409,
+              "TASK_EXECUTION_PENDING",
+              "Queued executions start automatically when their package slot is available",
+            );
+          }
           if (current && current.status === "todo" && move.status === "in_progress" && marker) {
             assertAiLoopbackRequest(request);
             const metadata = requireTrustedFeishuTask(current, { requirePackage: true });
-            return sendJson(response, 202, await startTrackedTask(current.id, () => startTaskWithAi(
-              current,
-              actorFromRequest(request),
-              metadata,
-              { trigger: "move" },
+            return sendJson(response, 202, await startTrackedTask(current.id, () => executionCoordinator.schedule(
+              current, metadata, "move", { actor: actorFromRequest(request) },
             )));
           }
           const task = database.moveTask(
@@ -4160,6 +4185,7 @@ export function createTaskboardServer(options = {}) {
       events.close();
       for (const response of aiEventResponses) response.end();
       aiEventResponses.clear();
+      await executionCoordinator.close();
       await settleTaskStarts();
       await uploadWorker.close();
       await aiChat.close();

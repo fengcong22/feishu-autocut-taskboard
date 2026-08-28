@@ -419,7 +419,7 @@ export function TaskEditor({
           <div className="property-row">
             <TaskPropertyPicker
               value={status}
-              options={TASK_STATUSES.map((value) => ({
+              options={TASK_STATUSES.filter((value) => value !== "queued").map((value) => ({
                 value,
                 label: taskStatusLabel(language, value),
                 icon: <StatusIcon status={value} />,

@@ -525,7 +525,7 @@ export class TaskboardDatabase {
         title TEXT NOT NULL,
         description TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL CHECK (status IN (
-          'backlog', 'todo', 'in_progress', 'in_review', 'blocked', 'done', 'canceled'
+          'backlog', 'todo', 'queued', 'in_progress', 'in_review', 'blocked', 'done', 'canceled'
         )),
         priority TEXT NOT NULL CHECK (priority IN ('none', 'urgent', 'high', 'medium', 'low')),
         labels TEXT NOT NULL DEFAULT '[]',
@@ -636,6 +636,24 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS feishu_task_package_snapshots_alias
         ON feishu_task_package_snapshots(package_alias, package_revision);
+
+      CREATE TABLE IF NOT EXISTS feishu_task_executions (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        state TEXT NOT NULL CHECK (state IN ('delayed', 'queued', 'running')),
+        mode TEXT NOT NULL CHECK (mode IN ('manual', 'automatic')),
+        ready_at INTEGER NOT NULL,
+        package_alias TEXT NOT NULL,
+        package_revision INTEGER NOT NULL CHECK (package_revision > 0),
+        trigger TEXT NOT NULL CHECK (trigger IN ('manual', 'move', 'automatic')),
+        lease_id TEXT,
+        version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_error TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS feishu_task_executions_pending
+        ON feishu_task_executions(state, ready_at, created_at, task_id);
 
       CREATE TABLE IF NOT EXISTS workflow_workspaces (
         project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
@@ -1064,9 +1082,24 @@ export class TaskboardDatabase {
       tasksSql.includes("'in_review'")
       && tasksSql.includes("'blocked'")
       && tasksSql.includes("'canceled'")
+      && tasksSql.includes("'queued'")
     ) {
       return;
     }
+
+    const taskColumns = new Set(
+      this.database.prepare("PRAGMA table_info(tasks)").all().map((column) => column.name),
+    );
+    const sourceColumn = (name, fallback) => taskColumns.has(name) ? name : fallback;
+    const creatorType = sourceColumn("creator_type", "'user'");
+    const creatorId = sourceColumn("creator_id", "'local-user'");
+    const creatorName = sourceColumn("creator_name", "'本地用户'");
+    const creatorAvatarUrl = sourceColumn("creator_avatar_url", "NULL");
+    const assigneeType = sourceColumn("assignee_type", creatorType);
+    const assigneeId = sourceColumn("assignee_id", creatorId);
+    const assigneeName = sourceColumn("assignee_name", creatorName);
+    const assigneeAvatarUrl = sourceColumn("assignee_avatar_url", creatorAvatarUrl);
+    const workflowId = sourceColumn("workflow_id", "NULL");
 
     this.database.exec("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE");
     try {
@@ -1078,12 +1111,21 @@ export class TaskboardDatabase {
           title TEXT NOT NULL,
           description TEXT NOT NULL DEFAULT '',
           status TEXT NOT NULL CHECK (status IN (
-            'backlog', 'todo', 'in_progress', 'in_review', 'blocked', 'done', 'canceled'
+            'backlog', 'todo', 'queued', 'in_progress', 'in_review', 'blocked', 'done', 'canceled'
           )),
           priority TEXT NOT NULL CHECK (priority IN ('none', 'urgent', 'high', 'medium', 'low')),
           labels TEXT NOT NULL DEFAULT '[]',
           sort_order REAL NOT NULL,
           thread_id TEXT,
+          creator_type TEXT NOT NULL DEFAULT 'user',
+          creator_id TEXT NOT NULL DEFAULT 'local-user',
+          creator_name TEXT NOT NULL DEFAULT '本地用户',
+          creator_avatar_url TEXT,
+          assignee_type TEXT NOT NULL DEFAULT 'user' CHECK (assignee_type IN ('user', 'agent')),
+          assignee_id TEXT NOT NULL DEFAULT 'local-user',
+          assignee_name TEXT NOT NULL DEFAULT '本地用户',
+          assignee_avatar_url TEXT,
+          workflow_id TEXT,
           git_branch TEXT,
           worktree_path TEXT,
           worktree_branch TEXT,
@@ -1099,13 +1141,17 @@ export class TaskboardDatabase {
 
         INSERT INTO tasks_status_migration (
           id, identifier, project_id, title, description, status, priority, labels,
-          sort_order, thread_id, git_branch, worktree_path, worktree_branch,
+          sort_order, thread_id, creator_type, creator_id, creator_name, creator_avatar_url,
+          assignee_type, assignee_id, assignee_name, assignee_avatar_url, workflow_id,
+          git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
           archived_at, version, created_at, updated_at
         )
         SELECT
           id, identifier, project_id, title, description, status, priority, labels,
-          sort_order, thread_id, git_branch, worktree_path, worktree_branch,
+          sort_order, thread_id, ${creatorType}, ${creatorId}, ${creatorName}, ${creatorAvatarUrl},
+          ${assigneeType}, ${assigneeId}, ${assigneeName}, ${assigneeAvatarUrl}, ${workflowId},
+          git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
           archived_at, version, created_at, updated_at
         FROM tasks;
@@ -1613,11 +1659,12 @@ export class TaskboardDatabase {
         CASE status
           WHEN 'backlog' THEN 1
           WHEN 'todo' THEN 2
-          WHEN 'in_progress' THEN 3
-          WHEN 'in_review' THEN 4
-          WHEN 'blocked' THEN 5
-          WHEN 'done' THEN 6
-          WHEN 'canceled' THEN 7
+          WHEN 'queued' THEN 3
+          WHEN 'in_progress' THEN 4
+          WHEN 'in_review' THEN 5
+          WHEN 'blocked' THEN 6
+          WHEN 'done' THEN 7
+          WHEN 'canceled' THEN 8
         END,
         sort_order,
         created_at,
@@ -1654,6 +1701,9 @@ export class TaskboardDatabase {
   }
 
   createTask(input) {
+    if (input.status === "queued" && !input.feishuOrigin) {
+      throw new ApiError(409, "QUEUED_STATUS_RESERVED", "Queued status is reserved for server-managed executions");
+    }
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const project = this.database.prepare(`
@@ -1764,6 +1814,16 @@ export class TaskboardDatabase {
   updateTask(id, version, changes, threadId, actor) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
+    if (current.status === "queued" && changes.status === "in_progress") {
+      throw new ApiError(
+        409,
+        "TASK_EXECUTION_PENDING",
+        "Queued executions start automatically when their package slot is available",
+      );
+    }
+    if (changes.status === "queued" && !this.getFeishuTaskOrigin(id)) {
+      throw new ApiError(409, "QUEUED_STATUS_RESERVED", "Queued status is reserved for server-managed executions");
+    }
     const activityChanges = taskFieldChanges(current, changes);
     const targetProject = Object.hasOwn(changes, "projectId")
       ? this.database.prepare("SELECT id, name, workspace_path FROM projects WHERE id = ?").get(changes.projectId)
@@ -1928,9 +1988,149 @@ export class TaskboardDatabase {
     }
   }
 
+  createFeishuExecution(input) {
+    if (!input || typeof input !== "object") throw new ApiError(400, "INVALID_FIELD", "Execution input is required");
+    const taskId = String(input.taskId ?? "").trim();
+    const packageAlias = String(input.packageAlias ?? "").trim();
+    if (!taskId || !packageAlias) throw new ApiError(400, "INVALID_FIELD", "taskId and packageAlias are required");
+    if (!Number.isSafeInteger(input.readyAt) || input.readyAt < 0) {
+      throw new ApiError(400, "INVALID_FIELD", "readyAt must be a non-negative timestamp");
+    }
+    if (!Number.isSafeInteger(input.packageRevision) || input.packageRevision < 1) {
+      throw new ApiError(400, "INVALID_FIELD", "packageRevision must be a positive integer");
+    }
+    if (!['manual', 'automatic'].includes(input.mode) || !['manual', 'move', 'automatic'].includes(input.trigger)) {
+      throw new ApiError(400, "INVALID_FIELD", "Invalid execution mode or trigger");
+    }
+    const timestamp = now();
+    try {
+      this.database.prepare(`
+        INSERT INTO feishu_task_executions
+          (task_id, state, mode, ready_at, package_alias, package_revision, trigger,
+           lease_id, version, created_at, updated_at, last_error)
+        VALUES (?, 'delayed', ?, ?, ?, ?, ?, NULL, 1, ?, ?, NULL)
+      `).run(taskId, input.mode, input.readyAt, packageAlias, input.packageRevision, input.trigger, timestamp, timestamp);
+    } catch (error) {
+      if (String(error.message).includes("UNIQUE constraint failed")) {
+        throw new ApiError(409, "EXECUTION_EXISTS", "An execution is already scheduled for this task");
+      }
+      throw error;
+    }
+    return this.getFeishuExecution(taskId);
+  }
+
+  getFeishuExecution(taskId) {
+    const row = this.database.prepare(`SELECT * FROM feishu_task_executions WHERE task_id = ?`).get(taskId);
+    return row ? {
+      taskId: row.task_id,
+      state: row.state,
+      mode: row.mode,
+      readyAt: row.ready_at,
+      packageAlias: row.package_alias,
+      packageRevision: row.package_revision,
+      trigger: row.trigger,
+      leaseId: row.lease_id,
+      version: row.version,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      lastError: row.last_error,
+    } : null;
+  }
+
+  listPendingFeishuExecutions() {
+    return this.database.prepare(`
+      SELECT * FROM feishu_task_executions
+      WHERE state IN ('delayed', 'queued')
+      ORDER BY ready_at, created_at, task_id
+    `).all().map((row) => ({
+      taskId: row.task_id,
+      state: row.state,
+      mode: row.mode,
+      readyAt: row.ready_at,
+      packageAlias: row.package_alias,
+      packageRevision: row.package_revision,
+      trigger: row.trigger,
+      leaseId: row.lease_id,
+      version: row.version,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      lastError: row.last_error,
+    }));
+  }
+
+  setFeishuExecutionState(taskId, expectedVersion, state, patch = {}) {
+    if (!['delayed', 'queued', 'running'].includes(state)) {
+      throw new ApiError(400, "INVALID_FIELD", "Invalid Feishu execution state");
+    }
+    const allowed = new Set(['readyAt', 'leaseId', 'lastError']);
+    const unknown = Object.keys(patch).find((key) => !allowed.has(key));
+    if (unknown) throw new ApiError(400, "INVALID_FIELD", `Unsupported execution field '${unknown}'`);
+    const current = this.getFeishuExecution(taskId);
+    if (!current) throw new ApiError(404, "EXECUTION_NOT_FOUND", "Execution does not exist");
+    if (current.version !== expectedVersion) throw new ApiError(409, "EXECUTION_VERSION_CONFLICT", "Execution state changed");
+    const timestamp = now();
+    const result = this.database.prepare(`
+      UPDATE feishu_task_executions
+      SET state = ?, ready_at = COALESCE(?, ready_at), lease_id = COALESCE(?, lease_id),
+          last_error = CASE WHEN ? THEN ? ELSE last_error END,
+          version = version + 1, updated_at = ?
+      WHERE task_id = ? AND version = ?
+    `).run(
+      state,
+      patch.readyAt ?? null,
+      patch.leaseId ?? null,
+      Object.hasOwn(patch, 'lastError') ? 1 : 0,
+      patch.lastError ?? null,
+      timestamp,
+      taskId,
+      expectedVersion,
+    );
+    if (result.changes !== 1) throw new ApiError(409, "EXECUTION_VERSION_CONFLICT", "Execution state changed");
+    return this.getFeishuExecution(taskId);
+  }
+
+  clearFeishuExecution(taskId) {
+    this.database.prepare("DELETE FROM feishu_task_executions WHERE task_id = ?").run(taskId);
+  }
+
+  transitionFeishuTaskExecution(taskId, expectedVersion, status, actor = {
+    type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null,
+  }) {
+    if (!['todo', 'queued', 'in_progress'].includes(status)) {
+      throw new ApiError(400, "INVALID_FIELD", "Invalid Feishu execution task status");
+    }
+    const current = this.#requireTask(taskId);
+    this.#requireVersion(current, expectedVersion);
+    if (current.archivedAt !== null) throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot change execution state");
+    if (current.status === status) return current;
+    const row = this.database.prepare(`
+      SELECT MIN(sort_order) AS minimum FROM tasks
+      WHERE project_id = ? AND status = ? AND archived_at IS NULL AND id != ?
+    `).get(current.projectId, status, current.id);
+    const sortOrder = row.minimum === null ? 1000 : row.minimum - 1000;
+    const timestamp = now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.database.prepare(`
+        UPDATE tasks SET status = ?, sort_order = ?, version = version + 1, updated_at = ?
+        WHERE id = ? AND version = ?
+      `).run(status, sortOrder, timestamp, taskId, expectedVersion);
+      if (result.changes !== 1) this.#throwMissingOrConflict(taskId, expectedVersion);
+      this.#recordTaskActivity(taskId, actor, taskFieldChanges(current, { status }), timestamp);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return this.getTask(taskId);
+  }
+
   refreshFeishuTaskPackageSnapshot(taskId, expectedVersion, packageSnapshot, actor) {
     const current = this.#requireTask(taskId);
     this.#requireVersion(current, expectedVersion);
+    if (current.archivedAt !== null) {
+      throw new ApiError(409, "TASK_PACKAGE_REFRESH_BLOCKED", "Archived tasks cannot refresh package configuration");
+    }
     if (!this.getFeishuTaskOrigin(taskId)) {
       throw new ApiError(409, "TASK_NOT_STARTABLE", "This task is not a server-registered Feishu workflow task");
     }
@@ -2116,7 +2316,7 @@ export class TaskboardDatabase {
         throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
       }
       this.#requireVersion(current, expectedVersion);
-      if (current.status !== "todo" || current.archivedAt !== null || current.threadId !== null) {
+      if (!(current.status === "todo" || current.status === "queued") || current.archivedAt !== null || current.threadId !== null) {
         throw new ApiError(409, "TASK_NOT_STARTABLE", "Only ready tasks can be started with Codex");
       }
       const row = this.database.prepare(`
@@ -2129,7 +2329,7 @@ export class TaskboardDatabase {
       const result = this.database.prepare(`
         UPDATE tasks
         SET status = 'in_progress', sort_order = ?, version = version + 1, updated_at = ?
-        WHERE id = ? AND version = ? AND status = 'todo' AND archived_at IS NULL
+        WHERE id = ? AND version = ? AND status IN ('todo', 'queued') AND archived_at IS NULL
       `).run(sortOrder, timestamp, current.id, expectedVersion);
       if (result.changes !== 1) {
         throw new ApiError(409, "TASK_NOT_STARTABLE", "Only ready tasks can be started with Codex");
@@ -2388,6 +2588,16 @@ export class TaskboardDatabase {
   moveTask(id, version, status, sortOrder, threadId, actor) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
+    if (current.status === "queued" && status === "in_progress") {
+      throw new ApiError(
+        409,
+        "TASK_EXECUTION_PENDING",
+        "Queued executions start automatically when their package slot is available",
+      );
+    }
+    if (status === "queued" && !this.getFeishuTaskOrigin(id)) {
+      throw new ApiError(409, "QUEUED_STATUS_RESERVED", "Queued status is reserved for server-managed executions");
+    }
     if (current.archivedAt !== null) {
       throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
     }

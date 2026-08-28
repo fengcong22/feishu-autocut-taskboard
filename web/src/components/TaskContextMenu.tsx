@@ -274,7 +274,7 @@ export function TaskContextMenu({
         >
           {submenu === "status" && (
             <div className="context-submenu" role="menu" data-submenu-panel="status" style={{ "--submenu-shift": `${submenuShift}px` } as CSSProperties}>
-              {TASK_STATUSES.map((status, index) => (
+              {TASK_STATUSES.filter((status) => status !== "queued").map((status, index) => (
                 <MenuItem
                   key={status}
                   label={taskStatusLabel(language, status)}

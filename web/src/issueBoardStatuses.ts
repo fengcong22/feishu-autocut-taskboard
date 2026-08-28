@@ -2,6 +2,7 @@ import type { TaskStatus } from "./types";
 
 export const MAIN_STATUSES = [
   "todo",
+  "queued",
   "in_progress",
   "blocked",
   "in_review",

@@ -26,6 +26,7 @@ import {
   createTask as createTaskRequest,
   deleteArchivedTask as deleteArchivedTaskRequest,
   deleteProject as deleteProjectRequest,
+  executeTaskWithCodex,
   getCodexThreadProgress,
   getHostRuntime,
   getTaskboardRevision,
@@ -56,6 +57,7 @@ import {
 import { BoardColumn } from "./components/BoardColumn";
 import { AiChat, type AiChatOpenThreadRequest } from "./components/AiChat";
 import { DashboardView } from "./components/DashboardView";
+import { ArtifactUploadView } from "./components/ArtifactUploadView";
 import { IssueListView } from "./components/IssueListView";
 import { OtherTasksPanel } from "./components/OtherTasksPanel";
 import {
@@ -67,8 +69,16 @@ import { ProjectAutomationMenu } from "./components/ProjectAutomationMenu";
 import { TaskboardIcon } from "./components/TaskboardIcon";
 import { TaskContextMenu } from "./components/TaskContextMenu";
 import { TaskDetail } from "./components/TaskDetail";
+import { FeishuBaseNavigator } from "./components/FeishuBaseNavigator";
 import { FeishuWorkflowPanel } from "./components/FeishuWorkflowPanel";
 import { FeishuPackageManager } from "./components/FeishuPackageManager";
+import {
+  addFeishuBaseFromUrl,
+  removeFeishuBase,
+  removeFeishuSubject,
+  setFeishuSubjectDisabled,
+  setFeishuSubjectDisplay,
+} from "./feishuWorkflow";
 import { TaskEditor, type NewTaskEditorDraft } from "./components/TaskEditor";
 import { TaskFilterMenu } from "./components/TaskFilterMenu";
 import { taskboardStorage } from "./storage";
@@ -128,14 +138,19 @@ import { createRevisionPoller, getRevisionPollingInterval } from "./revisionPoll
 
 type ConnectionState = "connecting" | "live" | "reconnecting";
 type Theme = "light" | "dark";
-type BoardView = "dashboard" | "issues" | "list" | "gantt" | "workflow" | "autocut_packages";
+type BoardView = "dashboard" | "issues" | "list" | "gantt" | "workflow" | "completed_editing"
+  | "upload_queue" | "uploading" | "uploaded" | "autocut_packages";
 type DetailSourceScroll =
   | { projectId: string; view: "issues"; status: TaskStatus; scrollTop: number }
-  | { projectId: string; view: "list"; scrollTop: number };
+  | { projectId: string; view: "list" | "completed_editing"; scrollTop: number };
 type GanttZoom = "day" | "week" | "month";
 type ActionError = string | readonly [string, string];
 const SHOW_WORKFLOW_BOARD_ENTRY = true;
 const GANTT_ZOOM_OPTIONS: GanttZoom[] = ["day", "week", "month"];
+
+function isFeishuWorkflowTask(task: Task): boolean {
+  return task.feishuOrigin?.source === "feishu-base";
+}
 
 const WorkflowBoard = lazy(() => import("./components/WorkflowBoard").then((module) => ({
   default: module.WorkflowBoard,
@@ -291,8 +306,8 @@ function readIssueActivityKeys(storageKey: string): Record<string, string> {
 
 function readProjectBoardView(projectId: string): BoardView {
   const view = taskboardStorage.getItem(`${PROJECT_VIEW_KEY_PREFIX}${projectId}`);
-  return view === "dashboard" || view === "list" || view === "gantt" || view === "issues"
-    || view === "autocut_packages"
+  return view === "dashboard" || view === "list" || view === "gantt" || view === "issues" || view === "completed_editing"
+    || view === "upload_queue" || view === "uploading" || view === "uploaded" || view === "workflow" || view === "autocut_packages"
     ? view
     : "issues";
 }
@@ -321,6 +336,10 @@ const EVENT_NAMES = [
   "comment.deleted",
   "attachment.created",
   "attachment.deleted",
+  "artifact.created",
+  "artifact.deleted",
+  "artifact.upload.updated",
+  "autocut.package.updated",
   "project.created",
   "workflow.updated",
 ] as const;
@@ -492,6 +511,7 @@ interface LocalRealtimeSyncProps {
   setConnection: Dispatch<SetStateAction<ConnectionState>>;
   setCommentsRevision: Dispatch<SetStateAction<number>>;
   setAttachmentsRevision: Dispatch<SetStateAction<number>>;
+  setAutoCutPackagesRevision: Dispatch<SetStateAction<number>>;
 }
 
 function LocalRealtimeSync({
@@ -503,6 +523,7 @@ function LocalRealtimeSync({
   setConnection,
   setCommentsRevision,
   setAttachmentsRevision,
+  setAutoCutPackagesRevision,
 }: LocalRealtimeSyncProps) {
   useEffect(() => {
     const source = new EventSource(resolveTaskboardUrl("/api/events"));
@@ -538,6 +559,10 @@ function LocalRealtimeSync({
         scheduleRefresh({ projects: true });
         return;
       }
+      if (event.type === "autocut.package.updated") {
+        setAutoCutPackagesRevision((current) => current + 1);
+        return;
+      }
       if (event.type.startsWith("task.")) {
         scheduleRefresh({ projects: true, tasks: affectsSelectedProject });
         return;
@@ -554,10 +579,12 @@ function LocalRealtimeSync({
         scheduleRefresh({ tasks: true });
         return;
       }
-      if (event.type.startsWith("attachment.")) {
+      if (event.type.startsWith("attachment.") || event.type.startsWith("artifact.")) {
         if (!detailTaskId || !payload.taskId || payload.taskId === detailTaskId) {
           setAttachmentsRevision((current) => current + 1);
-          setCommentsRevision((current) => current + 1);
+          if (event.type.startsWith("attachment.")) {
+            setCommentsRevision((current) => current + 1);
+          }
         }
       }
     };
@@ -586,6 +613,7 @@ function LocalRealtimeSync({
     refreshWorkflowOptions,
     selectedProjectId,
     setAttachmentsRevision,
+    setAutoCutPackagesRevision,
     setCommentsRevision,
     setConnection,
   ]);
@@ -660,9 +688,11 @@ export function App() {
   const [commentsRevision, setCommentsRevision] = useState(0);
   const [attachmentsRevision, setAttachmentsRevision] = useState(0);
   const [workflowRevision, setWorkflowRevision] = useState(0);
+  const [autoCutPackagesRevision, setAutoCutPackagesRevision] = useState(0);
   const [workflowOptions, setWorkflowOptions] = useState<WorkflowOption[]>(DEFAULT_WORKFLOW_OPTIONS);
   const [feishuCatalog, setFeishuCatalog] = useState<import("./types").FeishuBaseCatalog[]>([]);
   const [selectedFeishuSubjectKey, setSelectedFeishuSubjectKey] = useState<string | null>(null);
+  const [feishuConfigurationBaseToken, setFeishuConfigurationBaseToken] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [draggedTaskId, setDraggedTaskId] = useState<string | null>(null);
   const [draggedTaskHeight, setDraggedTaskHeight] = useState(0);
@@ -1153,10 +1183,10 @@ export function App() {
   function openTaskDetail(task: Pick<Task, "identifier" | "projectId">) {
     const fullTask = tasksRef.current.find((candidate) => candidate.identifier === task.identifier);
     if (fullTask) markTaskRead(fullTask);
-    if (boardView === "list" && issueListRef.current) {
+    if ((boardView === "list" || boardView === "completed_editing") && issueListRef.current) {
       pendingDetailSourceScrollRef.current = {
         projectId: selectedProjectId,
-        view: "list",
+        view: boardView,
         scrollTop: issueListRef.current.scrollTop,
       };
     } else if (boardView === "issues" && fullTask) {
@@ -1200,9 +1230,9 @@ export function App() {
       pendingDetailSourceScrollRef.current = null;
       return;
     }
-    const scrollContainer = pendingScroll.view === "list"
-      ? issueListRef.current
-      : boardColumnScrollRefs.current[pendingScroll.status];
+    const scrollContainer = pendingScroll.view === "issues"
+      ? boardColumnScrollRefs.current[pendingScroll.status]
+      : issueListRef.current;
     pendingDetailSourceScrollRef.current = null;
     if (!scrollContainer) return;
     scrollContainer.scrollTop = pendingScroll.scrollTop;
@@ -1213,10 +1243,14 @@ export function App() {
       const url = new URL(window.location.href);
       const routeProjectId = url.searchParams.get("project") ?? GLOBAL_PROJECT_ID;
       const routeIssueIdentifier = readIssueIdentifier(url.search);
-      if (routeIssueIdentifier && boardView === "list" && issueListRef.current) {
+      if (
+        routeIssueIdentifier
+        && (boardView === "list" || boardView === "completed_editing")
+        && issueListRef.current
+      ) {
         pendingDetailSourceScrollRef.current = {
           projectId: selectedProjectId,
-          view: "list",
+          view: boardView,
           scrollTop: issueListRef.current.scrollTop,
         };
       } else if (routeIssueIdentifier && boardView === "issues") {
@@ -1558,13 +1592,58 @@ export function App() {
       .then((catalog) => {
         if (controller.signal.aborted) return;
         setFeishuCatalog(catalog);
+        setFeishuConfigurationBaseToken((current) => current && catalog.some((base) => base.baseToken === current)
+          ? current
+          : catalog.find((base) => base.subjects.some((subject) => subject.projectId === selectedProjectId))?.baseToken
+            ?? catalog[0]?.baseToken
+            ?? null);
         setSelectedFeishuSubjectKey((current) => current && catalog.flatMap((base) => base.subjects).some((subject) => subject.subjectKey === current)
           ? current
-          : catalog.flatMap((base) => base.subjects).find((subject) => subject.displayEnabled)?.subjectKey ?? null);
+          : catalog.flatMap((base) => base.subjects).find((subject) => subject.projectId === selectedProjectId)?.subjectKey ?? null);
       })
       .catch(() => { /* Feishu is optional; ordinary projects remain unaffected. */ });
     return () => controller.abort();
+  }, [selectedProjectId]);
+
+  const addFeishuBaseAndRefreshProjects = useCallback(async (url: string) => {
+    const next = await addFeishuBaseFromUrl(url);
+    // A Base preview creates one Taskboard project per discovered subject.
+    // Refresh before the panel selects a subject so the project context and
+    // task route are valid immediately, without requiring a full reload.
+    await refreshProjectList();
+    return next;
+  }, [refreshProjectList]);
+
+  const updateFeishuSubject = useCallback((subject: import("./types").FeishuSubjectConfig) => {
+    setFeishuCatalog((catalog) => catalog.map((base) => ({
+      ...base,
+      subjects: base.subjects.map((item) => item.subjectKey === subject.subjectKey ? subject : item),
+    })));
   }, []);
+
+  const applyRemovedFeishuCatalog = useCallback((catalog: import("./types").FeishuBaseCatalog[]) => {
+    setFeishuCatalog(catalog);
+    setSelectedFeishuSubjectKey((current) => current && catalog
+      .some((base) => base.subjects.some((subject) => subject.subjectKey === current)) ? current : null);
+    setFeishuConfigurationBaseToken((current) => current && catalog.some((base) => base.baseToken === current)
+      ? current
+      : catalog[0]?.baseToken ?? null);
+  }, []);
+
+  const runFeishuRemoval = useCallback(async (
+    operation: () => Promise<import("./types").FeishuBaseCatalog[]>,
+  ) => {
+    try {
+      applyRemovedFeishuCatalog(await operation());
+    } catch (error) {
+      try {
+        applyRemovedFeishuCatalog(await listFeishuWorkflowCatalog());
+      } catch {
+        // Preserve the original removal error; the regular catalog poll will retry later.
+      }
+      throw error;
+    }
+  }, [applyRemovedFeishuCatalog]);
 
   useEffect(() => {
     if (!selectedProjectId) {
@@ -1711,6 +1790,11 @@ export function App() {
         && !event.ctrlKey
         && selectedProjectId
         && boardView !== "workflow"
+        && boardView !== "completed_editing"
+        && boardView !== "upload_queue"
+        && boardView !== "uploading"
+        && boardView !== "uploaded"
+        && boardView !== "autocut_packages"
       ) {
         event.preventDefault();
         setEditor({ task: null, status: "todo" });
@@ -1719,7 +1803,11 @@ export function App() {
         event.key === "/"
         && !detailTaskId
         && selectedProjectId
-        && (boardView === "issues" || boardView === "list" || boardView === "gantt")
+        && (
+          boardView === "issues" || boardView === "list" || boardView === "gantt"
+          || boardView === "completed_editing" || boardView === "upload_queue"
+          || boardView === "uploading" || boardView === "uploaded"
+        )
       ) {
         event.preventDefault();
         document.getElementById("task-search")?.focus();
@@ -1742,6 +1830,10 @@ export function App() {
   const filteredArchivedTasks = useMemo(() => archivedTasks.filter(
     (task) => matchesTaskSearch(task, search, language) && matchesTaskFilters(task, filters),
   ), [archivedTasks, filters, language, search]);
+
+  const completedEditingTasks = useMemo(() => filteredTasks.filter(
+    (task) => task.status === "done" && isFeishuWorkflowTask(task),
+  ), [filteredTasks]);
 
   const activeFilterCount = taskFilterCount(filters);
   const hasActiveTaskFilters = Boolean(search.trim()) || activeFilterCount > 0;
@@ -1831,6 +1923,7 @@ export function App() {
   function selectBoardView(view: BoardView) {
     closeContextMenu();
     setGanttViewMenuOpen(false);
+    if (view === "autocut_packages") closeTaskDetail();
     setBoardView(view);
     if (selectedProjectId) {
       taskboardStorage.setItem(`${PROJECT_VIEW_KEY_PREFIX}${selectedProjectId}`, view);
@@ -1971,7 +2064,9 @@ export function App() {
     )));
 
     try {
-      const moved = await moveTaskRequest(task, status, sortOrder);
+      const moved = task.status === "todo" && status === "in_progress" && isFeishuWorkflowTask(task)
+        ? (await executeTaskWithCodex(task, "move")).task
+        : await moveTaskRequest(task, status, sortOrder);
       setTasks((current) => sortTasks(current.map((candidate) =>
         candidate.id === moved.id ? moved : candidate,
       )));
@@ -2074,6 +2169,21 @@ export function App() {
       if (selectedProjectId) void refreshTasks(selectedProjectId, { quiet: true });
       throw error;
     }
+  }
+
+  function openFeishuConfiguration(baseToken?: string, subjectKey?: string) {
+    const base = feishuCatalog.find((item) => item.baseToken === baseToken)
+      ?? feishuCatalog.find((item) => item.subjects.some((subject) => subject.subjectKey === selectedFeishuSubjectKey))
+      ?? feishuCatalog[0]
+      ?? null;
+    const subject = base?.subjects.find((item) => item.subjectKey === subjectKey)
+      ?? base?.subjects.find((item) => item.subjectKey === selectedFeishuSubjectKey)
+      ?? base?.subjects[0]
+      ?? null;
+    setFeishuConfigurationBaseToken(base?.baseToken ?? null);
+    setSelectedFeishuSubjectKey(subject?.subjectKey ?? null);
+    closeTaskDetail();
+    selectBoardView("workflow");
   }
 
   async function startCodexForTask(task: Task) {
@@ -2305,12 +2415,19 @@ export function App() {
     });
   }
 
-  function changeProject(projectId: string) {
+  function changeProject(projectId: string, preferredView?: BoardView) {
     closeContextMenu();
     setProjectContextMenu(null);
     setProjectMenuOpen(false);
     setDetailTaskIdentifier(null);
-    setBoardView(readProjectBoardView(projectId));
+    if (preferredView) {
+      setBoardView(preferredView);
+      taskboardStorage.setItem(`${PROJECT_VIEW_KEY_PREFIX}${projectId}`, preferredView);
+    } else {
+      setBoardView(readProjectBoardView(projectId));
+    }
+    const subject = feishuCatalog.flatMap((base) => base.subjects).find((candidate) => candidate.projectId === projectId);
+    setSelectedFeishuSubjectKey(subject?.subjectKey ?? null);
     rememberProjectOpen(projectId);
     setSelectedProjectId(projectId);
     setSearch("");
@@ -2455,6 +2572,7 @@ export function App() {
           setConnection={setConnection}
           setCommentsRevision={setCommentsRevision}
           setAttachmentsRevision={setAttachmentsRevision}
+          setAutoCutPackagesRevision={setAutoCutPackagesRevision}
         />
       )}
       {!embedded && (
@@ -2478,6 +2596,40 @@ export function App() {
               {text("Auto-Cut 包", "Auto-Cut packages")}
             </button>
           </nav>
+
+          <FeishuBaseNavigator
+            catalog={feishuCatalog}
+            selectedSubjectKey={selectedFeishuSubjectKey}
+            onAddBase={async (url) => {
+              const next = await addFeishuBaseAndRefreshProjects(url);
+              setFeishuCatalog((current) => [
+                ...current.filter((base) => base.baseToken !== next.baseToken),
+                next,
+              ]);
+            }}
+            onSelectSubject={(subjectKey) => {
+              const subject = feishuCatalog
+                .flatMap((base) => base.subjects)
+                .find((item) => item.subjectKey === subjectKey);
+              if (!subject) return;
+              setSelectedFeishuSubjectKey(subjectKey);
+              changeProject(subject.projectId, "issues");
+            }}
+            onOpenConfiguration={openFeishuConfiguration}
+            onToggleSubjectDisplay={async (subject, displayEnabled) => {
+              updateFeishuSubject(await setFeishuSubjectDisplay(subject, displayEnabled));
+            }}
+            onDisableSubject={async (subject) => {
+              updateFeishuSubject(await setFeishuSubjectDisabled(subject));
+            }}
+            onRemoveBase={async (baseToken) => {
+              await runFeishuRemoval(() => removeFeishuBase(baseToken));
+            }}
+            onRemoveSubject={async (subjectKey) => {
+              await runFeishuRemoval(() => removeFeishuSubject(subjectKey));
+            }}
+            onError={(message) => setActionError(message)}
+          />
 
           <div className="nav-spacer" />
           <div className="nav-footer">
@@ -2591,7 +2743,7 @@ export function App() {
           <div ref={dragRegionRef} className="workspace-drag-region" aria-hidden="true" />
 
           <div className="header-actions">
-            {selectedProjectId && (
+            {selectedProjectId && boardView !== "autocut_packages" && (
               <ProjectAutomationMenu
                 automation={selectedProjectAutomation}
                 pending={automationPending}
@@ -2601,7 +2753,13 @@ export function App() {
                 onChange={(options) => void saveProjectAutomation(options)}
               />
             )}
-            {selectedProjectId && boardView !== "workflow" && (
+            {selectedProjectId
+              && boardView !== "workflow"
+              && boardView !== "completed_editing"
+              && boardView !== "upload_queue"
+              && boardView !== "uploading"
+              && boardView !== "uploaded"
+              && boardView !== "autocut_packages" && (
               <button
                 className="icon-button header-create-button"
                 type="button"
@@ -2649,6 +2807,38 @@ export function App() {
             >
               {text("甘特图", "Gantt")}
             </button>
+            <button
+              className={`view-tab${boardView === "completed_editing" ? " active" : ""}`}
+              type="button"
+              aria-pressed={boardView === "completed_editing"}
+              onClick={() => selectBoardView("completed_editing")}
+            >
+              {text("已完成剪辑", "Completed editing")}
+            </button>
+            <button
+              className={`view-tab${boardView === "upload_queue" ? " active" : ""}`}
+              type="button"
+              aria-pressed={boardView === "upload_queue"}
+              onClick={() => selectBoardView("upload_queue")}
+            >
+              {text("上传队列", "Upload queue")}
+            </button>
+            <button
+              className={`view-tab${boardView === "uploading" ? " active" : ""}`}
+              type="button"
+              aria-pressed={boardView === "uploading"}
+              onClick={() => selectBoardView("uploading")}
+            >
+              {text("上传中", "Uploading")}
+            </button>
+            <button
+              className={`view-tab${boardView === "uploaded" ? " active" : ""}`}
+              type="button"
+              aria-pressed={boardView === "uploaded"}
+              onClick={() => selectBoardView("uploaded")}
+            >
+              {text("已经上传", "Uploaded")}
+            </button>
             {SHOW_WORKFLOW_BOARD_ENTRY && (
               <button
                 className={`view-tab${boardView === "workflow" ? " active" : ""}`}
@@ -2660,7 +2850,8 @@ export function App() {
               </button>
             )}
           </div>
-          {(boardView === "issues" || boardView === "list" || boardView === "gantt") && <div className="toolbar-tools">
+          {(boardView === "issues" || boardView === "list" || boardView === "gantt" || boardView === "completed_editing"
+            || boardView === "upload_queue" || boardView === "uploading" || boardView === "uploaded") && <div className="toolbar-tools">
             <div className={`search-field${search ? " has-value" : ""}`} title={text("搜索议题 (/)", "Search issues (/)")}>
               <TaskboardIcon className="search-icon" name="search" />
               <input
@@ -2755,7 +2946,12 @@ export function App() {
           </div>
         )}
 
-        {detailTask && selectedProject ? (
+        {boardView === "autocut_packages" ? (
+          <FeishuPackageManager
+            refreshKey={autoCutPackagesRevision}
+            onError={(message) => setActionError(message)}
+          />
+        ) : detailTask && selectedProject ? (
           <TaskDetail
             key={detailTask.id}
             task={detailTask}
@@ -2782,8 +2978,6 @@ export function App() {
             startingCodex={startingCodexTaskId === detailTask.id}
             onError={setActionError}
           />
-        ) : boardView === "autocut_packages" ? (
-          <FeishuPackageManager onError={(message) => setActionError(message)} />
         ) : boardView === "dashboard" ? (
           <DashboardView
             key={selectedProjectId}
@@ -2808,6 +3002,26 @@ export function App() {
             onOpenConversation={openTaskConversation}
             onUpdate={updateTaskProperties}
           />
+        ) : boardView === "completed_editing" ? (
+          <IssueListView
+            scrollRef={issueListRef}
+            tasks={completedEditingTasks}
+            statuses={["done"]}
+            presentations={taskPresentations}
+            currentUser={currentUser}
+            hasActiveFilters={hasActiveTaskFilters}
+            onOpenTask={openTaskDetail}
+            onOpenConversation={openTaskConversation}
+            onUpdate={updateTaskProperties}
+          />
+        ) : boardView === "upload_queue" || boardView === "uploading" || boardView === "uploaded" ? (
+          <ArtifactUploadView
+            projectId={selectedProjectId}
+            view={boardView}
+            revision={attachmentsRevision}
+            search={search}
+            onOpenTask={openTaskDetail}
+          />
         ) : boardView === "gantt" ? (
           <Suspense fallback={<div className="workflow-board-loading">{text("正在打开甘特图…", "Opening Gantt…")}</div>}>
             <GanttView
@@ -2825,17 +3039,21 @@ export function App() {
           <div className="workflow-view-stack">
             <FeishuWorkflowPanel
               catalog={feishuCatalog}
+              configurationBaseToken={feishuConfigurationBaseToken}
               selectedSubjectKey={selectedFeishuSubjectKey}
-              onSelectSubject={(subjectKey) => {
+              onSelectSubject={(subjectKey, openProject = true) => {
                 setSelectedFeishuSubjectKey(subjectKey);
                 const subject = feishuCatalog.flatMap((base) => base.subjects).find((item) => item.subjectKey === subjectKey);
-                if (subject) changeProject(subject.projectId);
+                if (subject && openProject) changeProject(subject.projectId, "issues");
+              }}
+              onAddBase={async (url) => {
+                const next = await addFeishuBaseAndRefreshProjects(url);
+                setFeishuConfigurationBaseToken(next.baseToken);
+                setSelectedFeishuSubjectKey(next.subjects[0]?.subjectKey ?? null);
+                return next;
               }}
               onCatalogChange={setFeishuCatalog}
-              onSubjectChange={(subject) => setFeishuCatalog((catalog) => catalog.map((base) => ({
-                ...base,
-                subjects: base.subjects.map((item) => item.subjectKey === subject.subjectKey ? subject : item),
-              })))}
+              onSubjectChange={updateFeishuSubject}
               onError={(message) => setActionError(message)}
             />
             <Suspense fallback={<div className="workflow-board-loading">{text("正在打开节点模式…", "Opening workflow…")}</div>}>

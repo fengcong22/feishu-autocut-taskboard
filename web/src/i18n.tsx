@@ -26,6 +26,7 @@ const STATUS_LABELS: Record<TaskboardLanguage, Record<TaskStatus, string>> = {
   zh: {
     backlog: "待立项",
     todo: "等待认领",
+    queued: "排队中",
     in_progress: "处理中",
     in_review: "等你确认",
     blocked: "遇到阻碍",
@@ -35,6 +36,7 @@ const STATUS_LABELS: Record<TaskboardLanguage, Record<TaskStatus, string>> = {
   en: {
     backlog: "Backlog",
     todo: "To do",
+    queued: "Queued",
     in_progress: "In progress",
     in_review: "In review",
     blocked: "Blocked",

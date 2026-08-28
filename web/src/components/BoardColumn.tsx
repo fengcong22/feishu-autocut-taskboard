@@ -16,6 +16,7 @@ export const STATUS_DETAILS: Record<
 > = {
   backlog: { label: "待立项", tone: "backlog" },
   todo: { label: "等待认领", tone: "todo" },
+  queued: { label: "排队中", tone: "queued" },
   in_progress: { label: "处理中", tone: "progress" },
   in_review: { label: "等你确认", tone: "review" },
   blocked: { label: "遇到阻碍", tone: "blocked" },
@@ -26,6 +27,7 @@ export const STATUS_DETAILS: Record<
 const STATUS_ICONS: Record<TaskStatus, TaskboardIconName> = {
   backlog: "statusTodo",
   todo: "statusTodo",
+  queued: "statusProgress",
   in_progress: "statusProgress",
   in_review: "statusReview",
   blocked: "statusBlocked",
@@ -36,6 +38,7 @@ const STATUS_ICONS: Record<TaskStatus, TaskboardIconName> = {
 const COLUMN_STATUS_ICONS: Record<TaskStatus, TaskboardIconName> = {
   backlog: "statusTodo",
   todo: "columnStatusTodo",
+  queued: "columnStatusProgress",
   in_progress: "columnStatusProgress",
   in_review: "columnStatusReview",
   blocked: "columnStatusBlocked",
@@ -186,7 +189,7 @@ export function BoardColumn({
           <h2 id={`column-${status}`}>{label}</h2>
         </div>
         <div className="column-actions">
-          <button
+          {status !== "queued" && <button
             type="button"
             className="icon-button add-task-button"
             onClick={() => onCreate(status)}
@@ -194,7 +197,7 @@ export function BoardColumn({
             title={text(`添加到${label}`, `Add to ${label}`)}
           >
             <TaskboardIcon name={COLUMN_ADD_ICONS[status] ?? "columnAdd"} />
-          </button>
+          </button>}
         </div>
       </header>
 

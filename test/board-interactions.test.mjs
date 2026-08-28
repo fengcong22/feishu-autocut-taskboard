@@ -88,6 +88,7 @@ test("the complete Linear-style workflow shares one ordered status source", () =
   assert.deepEqual(workflowStatuses(), [
     "backlog",
     "todo",
+    "queued",
     "in_progress",
     "in_review",
     "blocked",
@@ -96,6 +97,7 @@ test("the complete Linear-style workflow shares one ordered status source", () =
   ]);
   assert.match(boardColumnSource, /backlog: \{ label: "待立项", tone: "backlog" \}/);
   assert.match(boardColumnSource, /todo: \{ label: "等待认领", tone: "todo" \}/);
+  assert.match(boardColumnSource, /queued: \{ label: "排队中", tone: "queued" \}/);
   assert.match(boardColumnSource, /in_progress: \{ label: "处理中", tone: "progress" \}/);
   assert.match(boardColumnSource, /in_review: \{ label: "等你确认", tone: "review" \}/);
   assert.match(boardColumnSource, /blocked: \{ label: "遇到阻碍", tone: "blocked" \}/);
@@ -103,8 +105,8 @@ test("the complete Linear-style workflow shares one ordered status source", () =
   assert.match(boardColumnSource, /canceled: \{ label: "取消", tone: "canceled" \}/);
   assert.doesNotMatch(cardSource, /STATUS_ORDER/);
   assert.match(detailSource, /TASK_STATUSES\.map\(\(status\) =>/);
-  assert.match(editorSource, /TASK_STATUSES\.map\(\(value\) =>/);
-  assert.match(contextMenuSource, /TASK_STATUSES\.map\(\(status, index\) =>/);
+  assert.match(editorSource, /TASK_STATUSES\.filter\(\(value\) => value !== "queued"\)\.map\(\(value\) =>/);
+  assert.match(contextMenuSource, /TASK_STATUSES\.filter\(\(status\) => status !== "queued"\)\.map\(\(status, index\) =>/);
 });
 
 test("review, blocked and canceled statuses round-trip through filter URLs", () => {
