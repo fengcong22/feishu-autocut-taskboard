@@ -55,6 +55,9 @@ function createFixture({ packages = {}, maxConcurrent = 1, allowAutomaticExecuti
 
   const database = {
     createFeishuExecution(input) {
+      if (executions.has(input.taskId)) {
+        throw Object.assign(new Error("execution already exists"), { code: "EXECUTION_EXISTS" });
+      }
       const row = {
         taskId: input.taskId,
         state: "delayed",
@@ -297,4 +300,34 @@ test("a transient launch failure retries with a bounded delay", async () => {
   assert.equal(fixture.starts.length, 2);
   assert.equal(fixture.database.getTask("task-1").status, "in_progress");
   assert.equal(fixture.database.getFeishuExecution("task-1").state, "running");
+});
+
+test("retry exhaustion releases the durable execution so a manual retry can start", async () => {
+  const fixture = createFixture({
+    failStarts: 4,
+    packages: { "Auto-cut-copyA": { maxConcurrent: 1 } },
+  });
+  fixture.tasks.set("task-1", task("task-1"));
+
+  await assert.rejects(
+    () => fixture.coordinator.schedule(fixture.tasks.get("task-1"), metadata("Auto-cut-copyA"), "manual"),
+    (error) => error?.code === "FIXTURE_START_FAILED",
+  );
+  for (const delay of [1_000, 2_000, 4_000]) {
+    await fixture.clock.advance(delay);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  assert.equal(fixture.starts.length, 4);
+  assert.equal(fixture.database.getTask("task-1").status, "todo");
+  assert.equal(fixture.database.getFeishuExecution("task-1"), null);
+
+  const retried = await fixture.coordinator.schedule(
+    fixture.tasks.get("task-1"),
+    metadata("Auto-cut-copyA"),
+    "manual",
+  );
+  assert.equal(retried.task.status, "in_progress");
+  assert.equal(retried.execution.state, "running");
+  assert.equal(fixture.starts.length, 5);
 });

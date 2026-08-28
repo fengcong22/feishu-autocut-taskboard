@@ -130,6 +130,7 @@ export function createFeishuExecutionCoordinator({
         ));
         entries.set(entry.task.id, entry);
       } else {
+        if (!closed) database.clearFeishuExecution(entry.task.id);
         entries.delete(entry.task.id);
       }
       throw error;
