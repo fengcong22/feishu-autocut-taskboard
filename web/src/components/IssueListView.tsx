@@ -1,6 +1,6 @@
 import { useState, type KeyboardEvent, type MouseEvent, type RefObject } from "react";
 import { assigneeTargetForActor } from "../actors";
-import { taskPriorityLabel, taskStatusLabel, useTaskboardI18n } from "../i18n";
+import { taskPriorityLabel, useTaskboardI18n } from "../i18n";
 import { labelPresentation } from "../labels";
 import type { TaskCardPresentation } from "../taskConversations";
 import { TASK_PRIORITIES, TASK_STATUSES, type ActorIdentity, type Task, type TaskDraft, type TaskStatus } from "../types";
@@ -11,11 +11,12 @@ import { TaskConversationMenu } from "./TaskConversationMenu";
 import { TaskPropertyPicker } from "./TaskPropertyPicker";
 import { TaskboardIcon } from "./TaskboardIcon";
 
-const COLLAPSED_BY_DEFAULT = new Set<TaskStatus>(["backlog", "done", "canceled"]);
+const COLLAPSED_BY_DEFAULT: readonly TaskStatus[] = ["backlog", "done", "canceled"];
 
 interface IssueListViewProps {
   scrollRef: RefObject<HTMLDivElement | null>;
   tasks: Task[];
+  statuses?: readonly TaskStatus[];
   presentations: Record<string, TaskCardPresentation>;
   currentUser: ActorIdentity;
   hasActiveFilters: boolean;
@@ -36,6 +37,7 @@ function calendarDate(value: string, locale: string) {
 export function IssueListView({
   scrollRef,
   tasks,
+  statuses,
   presentations,
   currentUser,
   hasActiveFilters,
@@ -43,8 +45,11 @@ export function IssueListView({
   onOpenConversation,
   onUpdate,
 }: IssueListViewProps) {
-  const { language, locale, text } = useTaskboardI18n();
-  const [collapsed, setCollapsed] = useState(() => new Set(COLLAPSED_BY_DEFAULT));
+  const { language, locale, text, statusLabel } = useTaskboardI18n();
+  const visibleStatuses = statuses ?? TASK_STATUSES;
+  const [collapsed, setCollapsed] = useState(() => new Set(
+    COLLAPSED_BY_DEFAULT.filter((status) => !statuses?.includes(status)),
+  ));
   const [priorityMenuTaskId, setPriorityMenuTaskId] = useState<string | null>(null);
 
   function stopRow(event: MouseEvent | KeyboardEvent) {
@@ -63,16 +68,16 @@ export function IssueListView({
   return (
     <div className="issue-list-view" ref={scrollRef}>
       <div className="issue-list-groups">
-        {TASK_STATUSES.map((status) => {
+        {visibleStatuses.map((status) => {
           const statusTasks = tasks.filter((task) => task.status === status);
           const isCollapsed = collapsed.has(status);
-          const statusLabel = taskStatusLabel(language, status);
+          const label = statusLabel(status);
           return (
             <section className={`issue-list-group status-${status}`} key={status}>
               <button className="issue-list-group-header" type="button" onClick={() => toggleStatus(status)} aria-expanded={!isCollapsed}>
                 <LinearIcon name={isCollapsed ? "chevronRight" : "chevronDown"} />
                 <span className="issue-list-status-icon"><StatusIcon status={status} /></span>
-                <strong>{statusLabel}</strong>
+                <strong>{label}</strong>
                 <span>{statusTasks.length}</span>
               </button>
               {!isCollapsed && (
@@ -171,7 +176,7 @@ export function IssueListView({
                     <div className="issue-list-empty">
                       {hasActiveFilters
                         ? text("当前筛选下没有匹配议题", "No issues match the current filters")
-                        : text(`没有${statusLabel}议题`, `No ${statusLabel.toLowerCase()} issues`)}
+                        : text(`没有${label}议题`, `No ${label.toLowerCase()} issues`)}
                     </div>
                   )}
                 </div>

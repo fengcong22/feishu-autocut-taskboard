@@ -5,7 +5,7 @@ import dueDoneIcon from "../assets/figma-taskboard/dashboard-due-done.svg";
 import dueEditIcon from "../assets/figma-taskboard/dashboard-due-edit.svg";
 import processingAnimation from "../assets/figma-taskboard/loading-16.svg";
 import { getProjectSummary } from "../api";
-import { taskPriorityLabel, taskStatusLabel, useTaskboardI18n } from "../i18n";
+import { taskPriorityLabel, useTaskboardI18n } from "../i18n";
 import { labelPresentation } from "../labels";
 import type {
   TaskCardPresentation,
@@ -173,7 +173,7 @@ export function DashboardView({
   onOpenTask,
   onOpenConversation,
 }: DashboardViewProps) {
-  const { language, locale, text } = useTaskboardI18n();
+  const { language, locale, text, statusLabel } = useTaskboardI18n();
   const [projectSummary, setProjectSummary] = useState<ProjectSummary | null>(null);
   const [summaryLoadFailed, setSummaryLoadFailed] = useState(false);
   const [displayedSummary, setDisplayedSummary] = useState("");
@@ -390,23 +390,23 @@ export function DashboardView({
 
   const metrics = [
     {
-      label: taskStatusLabel(language, "in_progress"),
+      label: statusLabel("in_progress"),
       value: tasks.filter((task) => task.status === "in_progress").length,
       tone: "progress",
     },
     {
-      label: taskStatusLabel(language, "in_review"),
+      label: statusLabel("in_review"),
       value: tasks.filter((task) => task.status === "in_review").length,
       tone: "review",
     },
     {
-      label: taskStatusLabel(language, "blocked"),
+      label: statusLabel("blocked"),
       value: tasks.filter((task) => task.status === "blocked").length,
       tone: "blocked",
     },
     { label: text("已逾期", "Overdue"), value: overdueTasks.length, tone: "overdue" },
     {
-      label: taskStatusLabel(language, "backlog"),
+      label: statusLabel("backlog"),
       value: tasks.filter((task) => task.status === "backlog").length,
       tone: "backlog",
     },

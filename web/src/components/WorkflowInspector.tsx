@@ -40,7 +40,7 @@ export function WorkflowInspector({
   onChange,
   onClose,
 }: WorkflowInspectorProps) {
-  const { text } = useTaskboardI18n();
+  const { text, statusLabel } = useTaskboardI18n();
   const [activeTab, setActiveTab] = useState<InspectorTab>("settings");
   const data = node.data;
   const conditionField = data.conditionField ?? CONDITION_FIELDS[0].value;
@@ -64,7 +64,7 @@ export function WorkflowInspector({
         </span>
         <div>
           <small>{data.eyebrow}</small>
-          <strong>{workflowNodeDisplayTitle(data, text)}</strong>
+          <strong>{workflowNodeDisplayTitle(data, text, statusLabel)}</strong>
         </div>
         <button
           className="workflow-panel-toggle"
@@ -183,7 +183,7 @@ export function WorkflowInspector({
                 >
                   {ISSUE_STATUSES.map((status) => (
                     <option key={status.value} value={status.value}>
-                      {workflowText(text, status.label)}
+                      {statusLabel(status.value)}
                     </option>
                   ))}
                 </select>
@@ -380,7 +380,7 @@ export function WorkflowInspector({
                   >
                     {ISSUE_STATUSES.map((status) => (
                       <option key={status.value} value={status.value}>
-                        {workflowText(text, status.label)}
+                        {statusLabel(status.value)}
                       </option>
                     ))}
                   </select>
@@ -732,7 +732,7 @@ export function WorkflowInspector({
                 >
                   {ISSUE_STATUSES.map((status) => (
                     <option key={status.value} value={status.value}>
-                      {workflowText(text, status.label)}
+                      {statusLabel(status.value)}
                     </option>
                   ))}
                 </select>
@@ -788,7 +788,7 @@ export function WorkflowInspector({
                 >
                   {ISSUE_STATUSES.map((status) => (
                     <option key={status.value} value={status.value}>
-                      {workflowText(text, status.label)}
+                      {statusLabel(status.value)}
                     </option>
                   ))}
                 </select>

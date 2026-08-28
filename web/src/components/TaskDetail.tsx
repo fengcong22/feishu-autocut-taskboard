@@ -29,7 +29,6 @@ import {
 } from "../api";
 import {
   taskPriorityLabel,
-  taskStatusLabel,
   useTaskboardI18n,
   type TaskboardLanguage,
 } from "../i18n";
@@ -235,6 +234,7 @@ function activityValue(
   language: TaskboardLanguage,
   locale: string,
   text: (chinese: string, english: string) => string,
+  statusLabel: (status: TaskStatus) => string,
 ): string {
   if (field === "archivedAt") {
     return typeof value === "string"
@@ -243,7 +243,7 @@ function activityValue(
   }
   if (value === null || value === "") return text("未设置", "Not set");
   if (field === "status" && typeof value === "string" && value in STATUS_DETAILS) {
-    return taskStatusLabel(language, value as TaskStatus);
+    return statusLabel(value as TaskStatus);
   }
   if (field === "priority" && typeof value === "string" && TASK_PRIORITIES.includes(value as TaskPriority)) {
     return taskPriorityLabel(language, value as TaskPriority);
@@ -375,7 +375,7 @@ export function TaskDetail({
   startingCodex,
   onError,
 }: TaskDetailProps) {
-  const { language, locale, text } = useTaskboardI18n();
+  const { language, locale, text, statusLabel } = useTaskboardI18n();
   const [currentTask, setCurrentTask] = useState(task);
   const [title, setTitle] = useState(task.title);
   const [description, setDescription] = useState(task.description);
@@ -1421,6 +1421,7 @@ export function TaskDetail({
                       language,
                       locale,
                       text,
+                      statusLabel,
                     );
                     const afterValue = activityValue(
                       change.field,
@@ -1428,6 +1429,7 @@ export function TaskDetail({
                       language,
                       locale,
                       text,
+                      statusLabel,
                     );
                     return (
                       <article
@@ -1791,7 +1793,7 @@ export function TaskDetail({
                 value={currentTask.status}
                 options={TASK_STATUSES.map((status) => ({
                   value: status,
-                  label: taskStatusLabel(language, status),
+                  label: statusLabel(status),
                   icon: <StatusIcon status={status} />,
                   className: `status-icon-${STATUS_DETAILS[status].tone}`,
                 }))}

@@ -24,6 +24,69 @@ function now() {
   return new Date().toISOString();
 }
 
+const BOARD_STAGE_STATUS_IDS = [
+  "backlog",
+  "todo",
+  "queued",
+  "in_progress",
+  "in_review",
+  "blocked",
+  "done",
+  "canceled",
+];
+
+const DEFAULT_BOARD_STAGE_LABELS = {
+  zh: {
+    backlog: "待立项",
+    todo: "待处理",
+    queued: "排队中",
+    in_progress: "处理中",
+    in_review: "待验收",
+    blocked: "遇到阻碍",
+    done: "已完成",
+    canceled: "已取消",
+  },
+  en: {
+    backlog: "Backlog",
+    todo: "To do",
+    queued: "Queued",
+    in_progress: "In progress",
+    in_review: "In review",
+    blocked: "Blocked",
+    done: "Done",
+    canceled: "Canceled",
+  },
+};
+
+function normalizeBoardStageLabels(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ApiError(400, "INVALID_BOARD_STAGE_LABELS", "Board stage labels must be an object");
+  }
+  const result = {};
+  for (const language of ["zh", "en"]) {
+    const source = value[language];
+    if (!source || typeof source !== "object" || Array.isArray(source)) {
+      throw new ApiError(400, "INVALID_BOARD_STAGE_LABELS", `Board stage labels '${language}' must be an object`);
+    }
+    result[language] = {};
+    for (const status of BOARD_STAGE_STATUS_IDS) {
+      const label = source[status];
+      if (typeof label !== "string" || label.trim() === "" || label.length > 80) {
+        throw new ApiError(400, "INVALID_BOARD_STAGE_LABELS", `Board stage label '${language}.${status}' is invalid`);
+      }
+      result[language][status] = label.trim();
+    }
+  }
+  return result;
+}
+
+function boardStageLabelsFromRow(row) {
+  return {
+    version: row.version,
+    labels: normalizeBoardStageLabels(JSON.parse(row.value_json)),
+  };
+}
+
 function commentConversationTitle(body) {
   const firstLine = String(body ?? "")
     .split(/\r?\n/)
@@ -556,6 +619,13 @@ export class TaskboardDatabase {
       CREATE INDEX IF NOT EXISTS tasks_project_status_sort
         ON tasks(project_id, archived_at, status, sort_order, created_at);
 
+      CREATE TABLE IF NOT EXISTS taskboard_settings (
+        key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK (version > 0),
+        updated_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS comments (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -1068,6 +1138,11 @@ export class TaskboardDatabase {
       SET name = '全局', workspace_path = NULL, updated_at = ?
       WHERE id = 'local' AND (name != '全局' OR workspace_path IS NOT NULL)
     `).run(timestamp);
+    this.database.prepare(`
+      INSERT INTO taskboard_settings (key, value_json, version, updated_at)
+      VALUES (?, ?, 1, ?)
+      ON CONFLICT(key) DO NOTHING
+    `).run("board-stage-labels", JSON.stringify(DEFAULT_BOARD_STAGE_LABELS), timestamp);
   }
 
   close() {
@@ -1307,6 +1382,57 @@ export class TaskboardDatabase {
         error = excluded.error
     `).run(projectId, timestamp, error);
     return this.getProjectSummary(projectId);
+  }
+
+  getBoardStageLabels() {
+    const row = this.database.prepare(`
+      SELECT value_json, version
+      FROM taskboard_settings
+      WHERE key = ?
+    `).get("board-stage-labels");
+    if (!row) return { version: 1, labels: structuredClone(DEFAULT_BOARD_STAGE_LABELS) };
+    return boardStageLabelsFromRow(row);
+  }
+
+  saveBoardStageLabels(expectedVersion, labels) {
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) {
+      throw new ApiError(400, "INVALID_FIELD", "expectedVersion must be a positive integer");
+    }
+    const normalized = normalizeBoardStageLabels(labels);
+    const timestamp = now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const currentRow = this.database.prepare(`
+        SELECT value_json, version
+        FROM taskboard_settings
+        WHERE key = ?
+      `).get("board-stage-labels");
+      const current = currentRow ? boardStageLabelsFromRow(currentRow) : {
+        version: 1,
+        labels: structuredClone(DEFAULT_BOARD_STAGE_LABELS),
+      };
+      if (current.version !== expectedVersion) {
+        this.database.exec("COMMIT");
+        throw new ApiError(409, "BOARD_STAGE_LABELS_CONFLICT", "Board stage labels were changed by another client", { current });
+      }
+      const next = {
+        version: current.version + 1,
+        labels: normalized,
+      };
+      this.database.prepare(`
+        INSERT INTO taskboard_settings (key, value_json, version, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+          value_json = excluded.value_json,
+          version = excluded.version,
+          updated_at = excluded.updated_at
+      `).run("board-stage-labels", JSON.stringify(next.labels), next.version, timestamp);
+      this.database.exec("COMMIT");
+      return next;
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
   }
 
   getWorkflowWorkspace(projectId) {

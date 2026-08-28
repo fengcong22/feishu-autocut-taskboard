@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import type { DragEvent } from "react";
 import type { ActorIdentity, Task, TaskDraft, TaskStatus } from "../types";
 import type { TaskCardPresentation, TaskConversationItem } from "../taskConversations";
-import { taskStatusLabel, useTaskboardI18n } from "../i18n";
+import { useTaskboardI18n } from "../i18n";
 import {
   OTHER_TASK_TABS,
   type OtherTaskTab,
@@ -37,7 +37,7 @@ function ArchivedTaskCard({
   onRestore,
   onDelete,
 }: ArchivedTaskCardProps) {
-  const { language, locale, text } = useTaskboardI18n();
+  const { locale, text, statusLabel } = useTaskboardI18n();
   return (
     <article className={`task-card task-card-sidebar archived-task-card status-${task.status}`}>
       <div className="card-topline">
@@ -48,7 +48,7 @@ function ArchivedTaskCard({
       <div className="archived-task-footer">
         <span className="archived-task-status">
           <LinearStatusIcon status={task.status} />
-          {taskStatusLabel(language, task.status)}
+          {statusLabel(task.status)}
         </span>
         <button
           className="archived-task-action archived-task-restore"
@@ -137,11 +137,11 @@ export function OtherTasksPanel({
   onDrop,
   onOpenConversation,
 }: OtherTasksPanelProps) {
-  const { language, text } = useTaskboardI18n();
+  const { text, statusLabel } = useTaskboardI18n();
   const archived = activeTab === "archived";
   const activeLabel = archived
     ? text("已归档", "Archived")
-    : taskStatusLabel(language, activeTab);
+    : statusLabel(activeTab);
   const tasks = archived ? archivedTasks : tasksByStatus[activeTab];
   const [dropBeforeTaskId, setDropBeforeTaskId] = useState<string | null | undefined>();
   const taskIndexes = new Map(tasks.map((task, index) => [task.id, index]));
@@ -197,7 +197,7 @@ export function OtherTasksPanel({
         {OTHER_TASK_TABS.map((tab) => {
           const label = tab === "archived"
             ? text("已归档", "Archived")
-            : taskStatusLabel(language, tab);
+            : statusLabel(tab);
           const count = tab === "archived" ? archivedTasks.length : tasksByStatus[tab].length;
           const selected = tab === activeTab;
           return (

@@ -27,6 +27,7 @@ import {
   deleteArchivedTask as deleteArchivedTaskRequest,
   deleteProject as deleteProjectRequest,
   executeTaskWithCodex,
+  getBoardStageLabels,
   getCodexThreadProgress,
   getHostRuntime,
   getTaskboardRevision,
@@ -72,6 +73,7 @@ import { TaskDetail } from "./components/TaskDetail";
 import { FeishuBaseNavigator } from "./components/FeishuBaseNavigator";
 import { FeishuWorkflowPanel } from "./components/FeishuWorkflowPanel";
 import { FeishuPackageManager } from "./components/FeishuPackageManager";
+import { BoardStageSettings } from "./components/BoardStageSettings";
 import {
   addFeishuBaseFromUrl,
   removeFeishuBase,
@@ -91,7 +93,6 @@ import { buildIssueUrl, readIssueIdentifier } from "./issueRoute";
 import {
   getTaskboardI18n,
   resolveTaskboardLanguage,
-  taskStatusLabel,
   TaskboardLanguageProvider,
 } from "./i18n";
 import {
@@ -340,6 +341,7 @@ const EVENT_NAMES = [
   "artifact.deleted",
   "artifact.upload.updated",
   "autocut.package.updated",
+  "board-stage-labels.updated",
   "project.created",
   "workflow.updated",
 ] as const;
@@ -512,6 +514,7 @@ interface LocalRealtimeSyncProps {
   setCommentsRevision: Dispatch<SetStateAction<number>>;
   setAttachmentsRevision: Dispatch<SetStateAction<number>>;
   setAutoCutPackagesRevision: Dispatch<SetStateAction<number>>;
+  setBoardStageLabels: Dispatch<SetStateAction<import("./types").BoardStageLabels | null>>;
 }
 
 function LocalRealtimeSync({
@@ -524,6 +527,7 @@ function LocalRealtimeSync({
   setCommentsRevision,
   setAttachmentsRevision,
   setAutoCutPackagesRevision,
+  setBoardStageLabels,
 }: LocalRealtimeSyncProps) {
   useEffect(() => {
     const source = new EventSource(resolveTaskboardUrl("/api/events"));
@@ -561,6 +565,10 @@ function LocalRealtimeSync({
       }
       if (event.type === "autocut.package.updated") {
         setAutoCutPackagesRevision((current) => current + 1);
+        return;
+      }
+      if (event.type === "board-stage-labels.updated") {
+        void getBoardStageLabels().then(setBoardStageLabels).catch(() => {});
         return;
       }
       if (event.type.startsWith("task.")) {
@@ -614,6 +622,7 @@ function LocalRealtimeSync({
     selectedProjectId,
     setAttachmentsRevision,
     setAutoCutPackagesRevision,
+    setBoardStageLabels,
     setCommentsRevision,
     setConnection,
   ]);
@@ -627,11 +636,12 @@ export function App() {
   const embedded = host === "codex" || host === "workbuddy";
   const undoShortcut = navigator.userAgent.includes("Macintosh") ? "⌘Z" : "Ctrl+Z";
   const [theme, setTheme] = useState<Theme>(getInitialTheme);
+  const [boardStageLabels, setBoardStageLabels] = useState<import("./types").BoardStageLabels | null>(null);
   const [hostContext, setHostContext] = useState<HostContext | null>(null);
   const language = resolveTaskboardLanguage(
     hostContext?.language ?? query.get("lang") ?? navigator.language,
   );
-  const { locale, text } = getTaskboardI18n(language);
+  const { locale, text, statusLabel } = getTaskboardI18n(language, boardStageLabels);
   const [embeddedFrameChallenge, setEmbeddedFrameChallengeState] = useState("");
   const [developmentScan, setDevelopmentScan] = useState<DevelopmentScan>({ workspacePath: null, contexts: [] });
   const [developmentScanLoading, setDevelopmentScanLoading] = useState(false);
@@ -1476,11 +1486,13 @@ export function App() {
   const loadProjectList = useCallback(async (signal?: AbortSignal) => {
     setLoadError(null);
     try {
-      const [nextProjects, metadata, workspaces] = await Promise.all([
+      const [nextProjects, metadata, workspaces, stageLabels] = await Promise.all([
         listProjects(signal),
         getTaskboardMetadata(signal),
         listDeviceWorkspaces(signal),
+        getBoardStageLabels(signal),
       ]);
+      setBoardStageLabels(stageLabels);
       setTaskboardMetadata((current) => (
         current
         && current.mode === metadata.mode
@@ -2073,8 +2085,8 @@ export function App() {
       const message = task.status === status
         ? text(`${task.identifier} 排序已调整。`, `${task.identifier} was reordered.`)
         : text(
-          `${task.identifier} 已移至${taskStatusLabel(language, status)}。`,
-          `${task.identifier} was moved to ${taskStatusLabel(language, status)}.`,
+          `${task.identifier} 已移至${statusLabel(status)}。`,
+          `${task.identifier} was moved to ${statusLabel(status)}.`,
         );
       pushUndo(message, async () => {
         const candidate = tasksRef.current.find((current) => current.id === moved.id);
@@ -2560,7 +2572,7 @@ export function App() {
     : undefined;
 
   return (
-    <TaskboardLanguageProvider language={language}>
+    <TaskboardLanguageProvider language={language} stageLabels={boardStageLabels}>
       <div className={`app-shell${embedded ? " embedded" : ""}`} style={appShellStyle}>
       {taskboardMetadata && taskboardMetadata.mode !== "cloud" && (
         <LocalRealtimeSync
@@ -2573,6 +2585,7 @@ export function App() {
           setCommentsRevision={setCommentsRevision}
           setAttachmentsRevision={setAttachmentsRevision}
           setAutoCutPackagesRevision={setAutoCutPackagesRevision}
+          setBoardStageLabels={setBoardStageLabels}
         />
       )}
       {!embedded && (
@@ -2947,10 +2960,17 @@ export function App() {
         )}
 
         {boardView === "autocut_packages" ? (
-          <FeishuPackageManager
-            refreshKey={autoCutPackagesRevision}
-            onError={(message) => setActionError(message)}
-          />
+          <div className="autocut-package-view">
+            <FeishuPackageManager
+              refreshKey={autoCutPackagesRevision}
+              onError={(message) => setActionError(message)}
+            />
+            <BoardStageSettings
+              value={boardStageLabels}
+              onUpdated={setBoardStageLabels}
+              onError={(message) => setActionError(message)}
+            />
+          </div>
         ) : detailTask && selectedProject ? (
           <TaskDetail
             key={detailTask.id}

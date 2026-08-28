@@ -2901,6 +2901,22 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, result.status, result.body);
         }
       }
+      if (pathname === "/api/local/board-stage-labels") {
+        assertNoQuery(url.searchParams, "board stage labels");
+        if (request.method === "GET") {
+          return sendJson(response, 200, database.getBoardStageLabels());
+        }
+        if (request.method === "PATCH") {
+          const body = await readJson(request);
+          assertPlainObject(body);
+          assertAllowedKeys(body, new Set(["expectedVersion", "version", "labels"]));
+          const expectedVersion = body.expectedVersion ?? body.version;
+          const saved = database.saveBoardStageLabels(expectedVersion, body.labels);
+          events.emit("board-stage-labels.updated", {});
+          return sendJson(response, 200, saved);
+        }
+        return methodNotAllowed(response, ["GET", "PATCH"]);
+      }
       const isMachineCapabilityRoute = pathname === "/api/meta"
         || pathname === "/api/device-workspaces"
         || pathname === "/api/workflow-capabilities"

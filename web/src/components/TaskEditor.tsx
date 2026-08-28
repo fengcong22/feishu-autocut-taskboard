@@ -3,7 +3,6 @@ import type { FormEvent, KeyboardEvent } from "react";
 import { ApiError } from "../api";
 import {
   taskPriorityLabel,
-  taskStatusLabel,
   useTaskboardI18n,
   type TaskboardLanguage,
 } from "../i18n";
@@ -138,7 +137,7 @@ export function TaskEditor({
   onCancel,
   onSave,
 }: TaskEditorProps) {
-  const { language, locale, text } = useTaskboardI18n();
+  const { language, locale, text, statusLabel } = useTaskboardI18n();
   const dialogRef = useRef<HTMLDialogElement>(null);
   const backdropPointerRef = useRef({ down: false, up: false });
   const titleRef = useRef<HTMLTextAreaElement>(null);
@@ -421,7 +420,7 @@ export function TaskEditor({
               value={status}
               options={TASK_STATUSES.filter((value) => value !== "queued").map((value) => ({
                 value,
-                label: taskStatusLabel(language, value),
+                label: statusLabel(value),
                 icon: <StatusIcon status={value} />,
                 className: `status-icon-${STATUS_DETAILS[value].tone}`,
               }))}

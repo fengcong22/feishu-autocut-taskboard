@@ -498,7 +498,7 @@ export function WorkflowBoard({
   revision,
   onWorkflowsChange,
 }: WorkflowBoardProps) {
-  const { text } = useTaskboardI18n();
+  const { text, statusLabel } = useTaskboardI18n();
   const [initialWorkspace] = useState(
     () => parseWorkflowWorkspace(readLegacyWorkflowWorkspace(projectId)) ?? createInitialWorkflowWorkspace(),
   );
@@ -977,13 +977,14 @@ export function WorkflowBoard({
         draggable: Boolean(node.parentId),
         data: {
           ...node.data,
-          displayTitle: workflowNodeDisplayTitle(node.data, text),
-          displayDescription: workflowNodeDisplayDescription(node.data, text),
+          displayTitle: workflowNodeDisplayTitle(node.data, text, statusLabel),
+          displayDescription: workflowNodeDisplayDescription(node.data, text, statusLabel),
           meta: capabilityNodeMeta(
             node.data,
             workflowCapabilities,
             workflowCapabilitiesFailed,
             text,
+            statusLabel,
           ),
           configured: workflowNodeConfigured(
             node.data,
@@ -1042,6 +1043,7 @@ export function WorkflowBoard({
     planDragPreview,
     rootStepIds,
     settlingNodeId,
+    statusLabel,
     text,
     workflowCapabilities,
     workflowCapabilitiesFailed,

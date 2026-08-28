@@ -153,11 +153,11 @@ test("Git 状态 is a distinct current-project trigger without fake execution in
   );
   assert.match(
     board,
-    /displayTitle: workflowNodeDisplayTitle\(node\.data, text\)[\s\S]*?configured: workflowNodeConfigured\(/,
+    /displayTitle: workflowNodeDisplayTitle\(node\.data, text(?:, statusLabel)?\)[\s\S]*?configured: workflowNodeConfigured\(/,
   );
   assert.match(
     catalog,
-    /export function workflowNodeDisplayTitle\(data: WorkflowNodeData, text: WorkflowText\)[\s\S]*?const displayTitle = workflowNodeBaseDisplayTitle\(data, text\);[\s\S]*?return displayTitle;[\s\S]*?export function workflowNodeConfigured[\s\S]*?return true;/,
+    /export function workflowNodeDisplayTitle\([\s\S]*?data: WorkflowNodeData,[\s\S]*?text: WorkflowText,[\s\S]*?statusLabel\?: \(status: TaskStatus\) => string,[\s\S]*?const displayTitle = workflowNodeBaseDisplayTitle\(data, text\);[\s\S]*?return displayTitle;[\s\S]*?export function workflowNodeConfigured[\s\S]*?return true;/,
   );
   assert.match(
     board,

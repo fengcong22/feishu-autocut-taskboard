@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import type { DragEvent } from "react";
 import type { ActorIdentity, Task, TaskDraft, TaskStatus } from "../types";
-import { taskStatusLabel, useTaskboardI18n } from "../i18n";
+import { useTaskboardI18n } from "../i18n";
 import type { TaskCardPresentation, TaskConversationItem } from "../taskConversations";
 import { TaskCard } from "./TaskCard";
 import {
@@ -118,9 +118,9 @@ export function BoardColumn({
   onDrop,
   onOpenConversation,
 }: BoardColumnProps) {
-  const { language, text } = useTaskboardI18n();
+  const { text, statusLabel } = useTaskboardI18n();
   const details = STATUS_DETAILS[status];
-  const label = taskStatusLabel(language, status);
+  const label = statusLabel(status);
   const [dropBeforeTaskId, setDropBeforeTaskId] = useState<string | null | undefined>();
   const taskIndexes = new Map(tasks.map((task, index) => [task.id, index]));
   const remainingTasks = tasks.filter((task) => task.id !== draggedTaskId);

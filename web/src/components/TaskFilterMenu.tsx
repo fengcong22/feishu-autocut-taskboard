@@ -12,7 +12,6 @@ import { createPortal } from "react-dom";
 import { labelDisplayName, labelPresentation } from "../labels";
 import {
   taskPriorityLabel,
-  taskStatusLabel,
   useTaskboardI18n,
   type TaskboardLanguage,
 } from "../i18n";
@@ -69,7 +68,7 @@ function joinSummary(values: string[], noun: string, language: TaskboardLanguage
 }
 
 export function TaskFilterMenu({ tasks, search, labels, filters, onChange }: TaskFilterMenuProps) {
-  const { language, text } = useTaskboardI18n();
+  const { language, text, statusLabel } = useTaskboardI18n();
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const submenuRef = useRef<HTMLDivElement>(null);
@@ -143,14 +142,14 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange }: Tas
 
   const statusOptions = useMemo<FilterOption[]>(() => TASK_STATUSES.map((status) => ({
     id: `status-${status}`,
-    label: taskStatusLabel(language, status),
+    label: statusLabel(status),
     category: text("状态", "Status"),
     keywords: status,
     count: countFor("statuses", (task) => task.status === status),
     selected: filters.statuses.includes(status),
     icon: <span className={`filter-status-icon status-${status}`}><LinearStatusIcon status={status} /></span>,
     toggle: () => toggleStatus(status),
-  })), [filters, language, search, tasks, text]);
+  })), [filters, language, search, statusLabel, tasks, text]);
 
   const priorityOptions = useMemo<FilterOption[]>(() => TASK_PRIORITIES.map((priority) => ({
     id: `priority-${priority}`,
@@ -186,7 +185,7 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange }: Tas
       keywords: "status workflow",
       icon: <LinearStatusIcon status="todo" />,
       summary: joinSummary(
-        filters.statuses.map((status) => taskStatusLabel(language, status)),
+        filters.statuses.map((status) => statusLabel(status)),
         text("状态", "statuses"),
         language,
       ),

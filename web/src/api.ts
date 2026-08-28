@@ -9,6 +9,7 @@ import type {
   Attachment,
   ArtifactUpload,
   ArtifactUploadListItem,
+  BoardStageLabels,
   Comment,
   DevelopmentScan,
   HostContext,
@@ -400,6 +401,20 @@ export async function updateTask(task: Task, draft: TaskDraft, threadId?: string
     body: JSON.stringify({ version: task.version, ...draft, ...(threadId ? { threadId } : {}) }),
   });
   return data.task;
+}
+
+export async function getBoardStageLabels(signal?: AbortSignal): Promise<BoardStageLabels> {
+  return request<BoardStageLabels>("/api/local/board-stage-labels", { signal });
+}
+
+export async function saveBoardStageLabels(
+  expectedVersion: number,
+  labels: BoardStageLabels["labels"],
+): Promise<BoardStageLabels> {
+  return request<BoardStageLabels>("/api/local/board-stage-labels", {
+    method: "PATCH",
+    body: JSON.stringify({ expectedVersion, labels }),
+  });
 }
 
 export async function listFeishuWorkflowCatalog(signal?: AbortSignal): Promise<FeishuBaseCatalog[]> {

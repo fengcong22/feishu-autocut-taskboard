@@ -10,7 +10,7 @@ import mcpLogo from "@lobehub/icons-static-svg/icons/mcp.svg";
 import midjourneyLogo from "@lobehub/icons-static-svg/icons/midjourney.svg";
 import vercelLogo from "@lobehub/icons-static-svg/icons/vercel.svg";
 import xLogo from "../assets/x-logo-black.png";
-import type { WorkflowCapabilities } from "../types";
+import type { TaskStatus, WorkflowCapabilities } from "../types";
 import type { WorkflowNodeData } from "./WorkflowNode";
 import { workflowText, type WorkflowText } from "./workflowI18n";
 export { WORKFLOW_TRIGGER_KINDS, isWorkflowTriggerKind } from "../../../shared/workflow-control-flow.mjs";
@@ -774,12 +774,13 @@ export function capabilityNodeMeta(
   capabilities: WorkflowCapabilities | null,
   failed: boolean,
   text: WorkflowText,
+  statusLabel?: (status: TaskStatus) => string,
 ): string {
   if (data.kind === "issue-create") {
-    const status = workflowOptionLabel(text, ISSUE_STATUSES, data.createIssueStatus ?? "todo");
+    const status = workflowStatusOptionLabel(text, statusLabel, data.createIssueStatus ?? "todo");
     const priority = workflowOptionLabel(text, ISSUE_PRIORITIES, data.createIssuePriority ?? "none");
     return text(
-      `初始状态 · ${optionLabel(ISSUE_STATUSES, data.createIssueStatus ?? "todo")} · 优先级 ${optionLabel(ISSUE_PRIORITIES, data.createIssuePriority ?? "none")}`,
+      `初始状态 · ${status} · 优先级 ${optionLabel(ISSUE_PRIORITIES, data.createIssuePriority ?? "none")}`,
       `Initial status · ${status} · Priority ${priority}`,
     );
   }
@@ -834,6 +835,18 @@ function workflowOptionLabel(
   return workflowText(text, optionLabel(options, value));
 }
 
+function workflowStatusOptionLabel(
+  text: WorkflowText,
+  statusLabel: ((status: TaskStatus) => string) | undefined,
+  value: string | undefined,
+): string {
+  const option = ISSUE_STATUSES.find((candidate) => candidate.value === value);
+  if (!option) return "";
+  return statusLabel
+    ? statusLabel(option.value as TaskStatus)
+    : workflowText(text, option.label);
+}
+
 function isWorkflowNodeDefaultText(
   data: WorkflowNodeData,
   field: "title" | "description",
@@ -875,13 +888,20 @@ function workflowNodeBaseDisplayTitle(data: WorkflowNodeData, text: WorkflowText
 export function workflowNodeDisplayDescription(
   data: WorkflowNodeData,
   text: WorkflowText,
+  statusLabel?: (status: TaskStatus) => string,
 ): string {
   if (data.kind === "issue-trigger") {
     const statusValue = data.triggerStatus ?? "todo";
-    const systemDescription = "状态变为「" + optionLabel(ISSUE_STATUSES, statusValue) + "」时触发";
-    if (data.description === systemDescription) {
-      const status = workflowOptionLabel(text, ISSUE_STATUSES, statusValue);
-      return text(systemDescription, "Trigger when status changes to ‘" + status + "’");
+    const staticSystemDescription = "状态变为「" + optionLabel(ISSUE_STATUSES, statusValue) + "」时触发";
+    const configuredSystemDescription = "状态变为「"
+      + workflowStatusOptionLabel(text, statusLabel, statusValue)
+      + "」时触发";
+    if (data.description === staticSystemDescription || data.description === configuredSystemDescription) {
+      const status = workflowStatusOptionLabel(text, statusLabel, statusValue);
+      return text(
+        configuredSystemDescription,
+        "Trigger when status changes to ‘" + status + "’",
+      );
     }
   }
   return isWorkflowNodeDefaultText(data, "description", data.description)
@@ -907,7 +927,11 @@ function twitterPostSummary(value: string): string {
   return normalized.length > 36 ? `${normalized.slice(0, 36)}…` : normalized;
 }
 
-export function workflowNodeDisplayTitle(data: WorkflowNodeData, text: WorkflowText): string {
+export function workflowNodeDisplayTitle(
+  data: WorkflowNodeData,
+  text: WorkflowText,
+  statusLabel?: (status: TaskStatus) => string,
+): string {
   const displayTitle = workflowNodeBaseDisplayTitle(data, text);
   if (data.kind === "issue-create") {
     const issueTitle = data.createIssueTitle?.trim();
@@ -930,7 +954,7 @@ export function workflowNodeDisplayTitle(data: WorkflowNodeData, text: WorkflowT
     ) ?? field.defaultOperator;
     const value = data.conditionValue || field.defaultValue;
     const valueLabel = field.value === "issue-status"
-      ? workflowOptionLabel(text, ISSUE_STATUSES, value)
+      ? workflowStatusOptionLabel(text, statusLabel, value)
       : field.value === "issue-priority"
         ? workflowOptionLabel(text, ISSUE_PRIORITIES, value)
         : value;
@@ -959,15 +983,15 @@ export function workflowNodeDisplayTitle(data: WorkflowNodeData, text: WorkflowT
     ], text);
   }
   if (data.kind === "issue-trigger") {
-    const status = workflowOptionLabel(text, ISSUE_STATUSES, data.triggerStatus ?? "todo");
+    const status = workflowStatusOptionLabel(text, statusLabel, data.triggerStatus ?? "todo");
     return formatActionTitle(displayTitle, [text(`进入${status}`, `Moved to ${status}`)], text);
   }
   if (data.kind === "issue-update") {
     const actions = [
       data.changeStatus
         ? text(
-            `状态 → ${optionLabel(ISSUE_STATUSES, data.targetStatus ?? "in_review")}`,
-            `Status → ${workflowOptionLabel(text, ISSUE_STATUSES, data.targetStatus ?? "in_review")}`,
+            `状态 → ${workflowStatusOptionLabel(text, statusLabel, data.targetStatus ?? "in_review")}`,
+            `Status → ${workflowStatusOptionLabel(text, statusLabel, data.targetStatus ?? "in_review")}`,
           )
         : "",
       data.addComment ? text("添加评论", "Add comment") : "",

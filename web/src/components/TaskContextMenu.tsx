@@ -16,7 +16,7 @@ import {
   type TaskStatus,
 } from "../types";
 import { labelPresentation } from "../labels";
-import { taskPriorityLabel, taskStatusLabel, useTaskboardI18n } from "../i18n";
+import { taskPriorityLabel, useTaskboardI18n } from "../i18n";
 import { STATUS_DETAILS } from "./BoardColumn";
 import { LinearIcon, LinearPriorityIcon, LinearStatusIcon } from "./LinearIcon";
 
@@ -107,7 +107,7 @@ export function TaskContextMenu({
   onOpenInThread,
   onArchive,
 }: TaskContextMenuProps) {
-  const { language, text } = useTaskboardI18n();
+  const { language, text, statusLabel } = useTaskboardI18n();
   const menuRef = useRef<HTMLDivElement>(null);
   const submenuTimerRef = useRef<number | null>(null);
   const [submenu, setSubmenu] = useState<SubmenuName | null>(null);
@@ -277,7 +277,7 @@ export function TaskContextMenu({
               {TASK_STATUSES.filter((status) => status !== "queued").map((status, index) => (
                 <MenuItem
                   key={status}
-                  label={taskStatusLabel(language, status)}
+                  label={statusLabel(status)}
                   icon={<LinearStatusIcon status={status} className={`status-icon-${STATUS_DETAILS[status].tone}`} />}
                   shortcut={String(index + 1)}
                   checked={task.status === status}

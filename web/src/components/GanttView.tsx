@@ -11,8 +11,6 @@ type GanttZoom = "day" | "week" | "month";
 
 interface GanttGroupDefinition {
   id: string;
-  chineseLabel: string;
-  englishLabel: string;
   statuses: Task["status"][];
   defaultOpen: boolean;
 }
@@ -43,13 +41,22 @@ interface GanttViewProps {
 let pendingDetailViewport: { projectId: string; x: number; y: number } | null = null;
 
 const GANTT_GROUPS: GanttGroupDefinition[] = [
-  { id: "in-progress", chineseLabel: "处理中", englishLabel: "In progress", statuses: ["in_progress"], defaultOpen: true },
-  { id: "in-review", chineseLabel: "等你确认", englishLabel: "In review", statuses: ["in_review"], defaultOpen: true },
-  { id: "blocked", chineseLabel: "遇到阻碍", englishLabel: "Blocked", statuses: ["blocked"], defaultOpen: true },
-  { id: "todo", chineseLabel: "待处理", englishLabel: "To do", statuses: ["backlog", "todo"], defaultOpen: true },
-  { id: "done", chineseLabel: "已完成", englishLabel: "Completed", statuses: ["done"], defaultOpen: false },
-  { id: "canceled", chineseLabel: "已取消", englishLabel: "Canceled", statuses: ["canceled"], defaultOpen: false },
+  { id: "in-progress", statuses: ["in_progress"], defaultOpen: true },
+  { id: "in-review", statuses: ["in_review"], defaultOpen: true },
+  { id: "blocked", statuses: ["blocked"], defaultOpen: true },
+  { id: "todo", statuses: ["backlog", "todo"], defaultOpen: true },
+  { id: "done", statuses: ["done"], defaultOpen: false },
+  { id: "canceled", statuses: ["canceled"], defaultOpen: false },
 ];
+
+function ganttGroupLabel(
+  group: GanttGroupDefinition,
+  statusLabel: (status: Task["status"]) => string,
+) {
+  // Backlog and todo share one timeline group; use the user-facing todo label.
+  const status = group.statuses.includes("todo") ? "todo" : group.statuses[0];
+  return statusLabel(status);
+}
 
 function localDate(value: string) {
   return new Date(`${value}T00:00:00`);
@@ -106,8 +113,8 @@ function dateCellClass(date: Date) {
 }
 
 export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCompleted, todayRequest, onOpenTask, onUpdate }: GanttViewProps) {
-  const { language, locale, text } = useTaskboardI18n();
-  const i18nRef = useRef({ language, locale, text });
+  const { language, locale, text, statusLabel } = useTaskboardI18n();
+  const i18nRef = useRef({ language, locale, text, statusLabel });
   const containerRef = useRef<HTMLDivElement>(null);
   const ganttRef = useRef<GanttStatic | null>(null);
   const [gridCollapsed, setGridCollapsed] = useState(false);
@@ -122,7 +129,7 @@ export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCo
   tasksRef.current = tasks;
   onOpenTaskRef.current = onOpenTask;
   onUpdateRef.current = onUpdate;
-  i18nRef.current = { language, locale, text };
+  i18nRef.current = { language, locale, text, statusLabel };
 
   const visibleTasks = useMemo(
     () => hideCompleted ? tasks.filter((task) => task.status !== "done" && task.status !== "canceled") : tasks,
@@ -348,7 +355,7 @@ export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCo
       if (!instance.isTaskExists(id)) continue;
       const task = instance.getTask(id) as TaskboardGanttTask & { $open?: boolean };
       const open = task.$open;
-      const label = i18nRef.current.text(group.chineseLabel, group.englishLabel);
+      const label = ganttGroupLabel(group, i18nRef.current.statusLabel);
       task.text = label;
       task.taskboardTitle = label;
       task.$open = open;
@@ -361,7 +368,7 @@ export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCo
     instance.config.show_grid = showGrid;
     instance.config.grid_width = gridWidth;
     instance.scrollTo(scroll.x, scroll.y);
-  }, [language, locale, text]);
+  }, [language, locale, statusLabel, text]);
 
   useEffect(() => {
     const instance = ganttRef.current;
@@ -378,7 +385,7 @@ export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCo
 
     for (const group of GANTT_GROUPS) {
       const groupId = `gantt-group-${group.id}`;
-      const groupLabel = i18nRef.current.text(group.chineseLabel, group.englishLabel);
+      const groupLabel = ganttGroupLabel(group, i18nRef.current.statusLabel);
       const groupTasks = visibleTasks
         .filter((task) => group.statuses.includes(task.status))
         .sort((left, right) => Number(Boolean(right.startDate && right.dueDate)) - Number(Boolean(left.startDate && left.dueDate)));
