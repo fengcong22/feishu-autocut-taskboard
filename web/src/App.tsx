@@ -601,6 +601,7 @@ function LocalRealtimeSync({
     source.onopen = () => {
       setConnection("live");
       scheduleRefresh({ projects: true, tasks: Boolean(selectedProjectId) });
+      void getBoardStageLabels().then(setBoardStageLabels).catch(() => {});
       if (selectedProjectId) void refreshWorkflowOptions(selectedProjectId);
       if (detailTaskId) {
         setCommentsRevision((current) => current + 1);
@@ -1714,6 +1715,7 @@ export function App() {
       },
       onInvalidate: () => {
         void refreshProjectList();
+        void getBoardStageLabels().then(setBoardStageLabels).catch(() => {});
         const projectId = selectedProjectIdRef.current;
         if (projectId) {
           void refreshTasks(projectId, { quiet: true });

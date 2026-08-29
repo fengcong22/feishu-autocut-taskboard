@@ -116,3 +116,15 @@ test("workflow status controls use the same configurable stage labels", async ()
   assert.match(catalog, /statusLabel\(.*Status/);
   assert.match(board, /workflowNodeDisplayTitle\(node\.data, text, statusLabel\)/);
 });
+
+test("realtime recovery refreshes global stage labels after missed updates", async () => {
+  const app = await readFile(new URL("../web/src/App.tsx", import.meta.url), "utf8");
+  assert.match(
+    app,
+    /source\.onopen = \(\) => \{[\s\S]*?getBoardStageLabels\(\)\.then\(setBoardStageLabels\)/,
+  );
+  assert.match(
+    app,
+    /onInvalidate: \(\) => \{[\s\S]*?getBoardStageLabels\(\)\.then\(setBoardStageLabels\)/,
+  );
+});
