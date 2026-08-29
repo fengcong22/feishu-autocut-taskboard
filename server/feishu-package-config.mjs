@@ -3,7 +3,7 @@ import path from "node:path";
 
 const REGISTRY_VERSION = 1;
 const STATES = new Set(["draft", "enabled", "disabled"]);
-const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
+const RESERVED_PACKAGE_ALIASES = new Set(["__proto__", "constructor", "prototype"]);
 const registryMutationQueues = new Map();
 
 export class PackageConfigError extends Error {
@@ -57,7 +57,8 @@ function optionalPath(value, name) {
 
 function packageAlias(value, name = "package alias") {
   const result = requireText(value, name);
-  if (!ID_PATTERN.test(result)) {
+  if (RESERVED_PACKAGE_ALIASES.has(result)
+    || /^[./\\]/u.test(result) || /[\s\u0000-\u001f\u007f"'`:$<>|]/u.test(result)) {
     throw new PackageConfigError("PACKAGE_INVALID", `${name} is invalid`, undefined, 400);
   }
   return result;
@@ -86,7 +87,7 @@ function assertDraftFields(value) {
   }
 }
 
-function normalizeRecord(aliasKey, raw, { now = nowIso, legacy = false } = {}) {
+function normalizeRecord(aliasKey, raw, { now = nowIso, legacy = false, requireState = false } = {}) {
   const entry = plainObject(raw, `packages.${aliasKey}`);
   const alias = packageAlias(entry.alias ?? aliasKey);
   const name = requireText(entry.name ?? entry.projectName ?? alias, `packages.${alias}.name`);
@@ -103,6 +104,9 @@ function normalizeRecord(aliasKey, raw, { now = nowIso, legacy = false } = {}) {
     ? null : requireText(entry.reasoningEffort, `packages.${alias}.reasoningEffort`);
   const prompt = entry.prompt === undefined || entry.prompt === null || entry.prompt === ""
     ? null : requireText(entry.prompt, `packages.${alias}.prompt`);
+  if (requireState && entry.state === undefined) {
+    throw new PackageConfigError("PACKAGE_INVALID", `packages.${alias}.state is required`, undefined, 400);
+  }
   const state = entry.state === undefined ? (legacy ? "enabled" : "draft") : entry.state;
   if (!STATES.has(state)) {
     throw new PackageConfigError("PACKAGE_INVALID", `packages.${alias}.state is invalid`, undefined, 400);
@@ -136,13 +140,28 @@ function normalizeRecord(aliasKey, raw, { now = nowIso, legacy = false } = {}) {
 export function normalizeFeishuPackages(value, { now = nowIso } = {}) {
   const root = plainObject(value, "Feishu package configuration");
   const wrapped = root.packages !== undefined;
+  const versioned = root.version !== undefined;
+  if (versioned && (!Number.isSafeInteger(root.version) || root.version !== REGISTRY_VERSION)) {
+    throw new PackageConfigError(
+      "PACKAGE_REGISTRY_UNSUPPORTED",
+      "Package registry version is unsupported",
+      undefined,
+      503,
+    );
+  }
   const source = wrapped ? plainObject(root.packages, "packages") : root;
   const packages = {};
+  const projectIds = new Set();
   for (const [key, raw] of Object.entries(source)) {
-    if (wrapped && ["version", "host", "port", "taskboardUrl", "stateFile", "tables"].includes(key)) continue;
-    const record = normalizeRecord(key, raw, { now, legacy: !wrapped || raw?.state === undefined });
-    if (packages[record.alias]) {
+    const record = normalizeRecord(key, raw, { now, legacy: !versioned, requireState: versioned });
+    if (Object.hasOwn(packages, record.alias)) {
       throw new PackageConfigError("PACKAGE_ALIAS_EXISTS", `duplicate package alias: ${record.alias}`, undefined, 409);
+    }
+    if (record.state === "enabled") {
+      if (projectIds.has(record.projectId)) {
+        throw new PackageConfigError("PACKAGE_INVALID", `duplicate package projectId: ${record.projectId}`, undefined, 400);
+      }
+      projectIds.add(record.projectId);
     }
     packages[record.alias] = record;
   }
@@ -266,7 +285,11 @@ export function createFeishuPackageStore({
   async function current(alias) {
     const catalog = await readCatalog();
     const normalizedAlias = packageAlias(alias);
-    return { catalog, alias: normalizedAlias, record: catalog[normalizedAlias] ?? null };
+    return {
+      catalog,
+      alias: normalizedAlias,
+      record: Object.hasOwn(catalog, normalizedAlias) ? catalog[normalizedAlias] : null,
+    };
   }
 
   function assertRevision(record, expectedRevision) {
@@ -301,7 +324,8 @@ export function createFeishuPackageStore({
     return enqueueMutation(async () => {
       assertDraftFields(changes);
       const catalog = await readCatalog();
-    const existing = catalog[originalAlias ?? aliasFromChanges] ?? null;
+    const lookupAlias = originalAlias ?? aliasFromChanges;
+    const existing = Object.hasOwn(catalog, lookupAlias) ? catalog[lookupAlias] : null;
     if (existing && !originalAlias && expectedRevision === undefined && changes.expectedRevision === undefined) {
       throw new PackageConfigError("PACKAGE_ALIAS_EXISTS", `Package alias '${aliasFromChanges}' already exists`);
     }
@@ -311,11 +335,15 @@ export function createFeishuPackageStore({
       if (refs.length > 0) throw new PackageConfigError("PACKAGE_ALIAS_IMMUTABLE", `Package '${originalAlias}' alias is in use`);
       throw new PackageConfigError("PACKAGE_ALIAS_IMMUTABLE", `Package '${originalAlias}' alias cannot be changed after enabling`);
     }
-    if (!existing && catalog[aliasFromChanges]) throw new PackageConfigError("PACKAGE_ALIAS_EXISTS", `Package alias '${aliasFromChanges}' already exists`);
+    if (!existing && Object.hasOwn(catalog, aliasFromChanges)) {
+      throw new PackageConfigError("PACKAGE_ALIAS_EXISTS", `Package alias '${aliasFromChanges}' already exists`);
+    }
     const base = existing ?? { alias: aliasFromChanges, name: aliasFromChanges, projectId: aliasFromChanges, state: "draft" };
     const record = normalizeRecord(aliasFromChanges, { ...base, ...changes, alias: aliasFromChanges }, { now, legacy: false });
     if (existing && originalAlias && aliasFromChanges !== originalAlias) delete catalog[originalAlias];
-    if (existing && record.alias !== existing.alias && catalog[record.alias]) throw new PackageConfigError("PACKAGE_ALIAS_EXISTS", `Package alias '${record.alias}' already exists`);
+    if (existing && record.alias !== existing.alias && Object.hasOwn(catalog, record.alias)) {
+      throw new PackageConfigError("PACKAGE_ALIAS_EXISTS", `Package alias '${record.alias}' already exists`);
+    }
     record.revision = (existing?.revision ?? 0) + 1;
     record.updatedAt = now();
     catalog[record.alias] = record;

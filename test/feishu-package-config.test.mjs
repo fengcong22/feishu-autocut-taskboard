@@ -6,6 +6,7 @@ import { test } from "node:test";
 
 import {
   createFeishuPackageStore,
+  normalizeFeishuPackages,
   PackageConfigError,
 } from "../server/feishu-package-config.mjs";
 
@@ -66,6 +67,70 @@ test("managed Auto-Cut package store supports draft, enable, snapshot and CAS", 
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("package aliases support controlled Chinese subject names", async () => {
+  const store = createFeishuPackageStore({ packages: {} });
+  const record = await store.saveDraft({
+    alias: "Auto-cut-小学语文",
+    name: "小学语文 Auto-Cut",
+    projectId: "auto-cut-primary-school-chinese",
+  });
+  assert.equal(record.alias, "Auto-cut-小学语文");
+  assert.equal((await store.get("Auto-cut-小学语文")).state, "draft");
+});
+
+test("preserves valid aliases that overlap object properties or registry metadata names", async () => {
+  const store = createFeishuPackageStore({ packages: {} });
+  for (const [index, alias] of ["toString", "host", "version", "tables"].entries()) {
+    const record = await store.saveDraft({
+      alias,
+      name: `Package ${alias}`,
+      projectId: `auto-cut-${index}`,
+    });
+    assert.equal(record.alias, alias);
+    assert.equal((await store.get(alias)).alias, alias);
+  }
+  assert.deepEqual(
+    (await store.list()).map((entry) => entry.alias),
+    ["toString", "host", "version", "tables"],
+  );
+});
+
+test("requires an explicit state for versioned registry entries", () => {
+  assert.throws(
+    () => normalizeFeishuPackages({ version: 1, packages: {
+      "Auto-cut-missing-state": {
+        projectId: "auto-cut-missing-state",
+        workspacePath: null,
+        prompt: null,
+      },
+    } }),
+    /state is required/,
+  );
+});
+
+test("rejects unsupported versions and duplicate enabled project ids", () => {
+  assert.throws(
+    () => normalizeFeishuPackages({ version: 999, packages: {} }),
+    (error) => error.code === "PACKAGE_REGISTRY_UNSUPPORTED",
+  );
+  assert.throws(
+    () => normalizeFeishuPackages({ version: 1, packages: {
+      "Auto-cut-one": { projectId: "shared", state: "enabled" },
+      "Auto-cut-two": { projectId: "shared", state: "enabled" },
+    } }),
+    /duplicate package projectId/,
+  );
+});
+
+test("rejects reserved package aliases", () => {
+  assert.throws(
+    () => normalizeFeishuPackages({ version: 1, packages: {
+      ["__proto__"]: { alias: "__proto__", projectId: "prototype", state: "draft" },
+    } }),
+    /alias is invalid/,
+  );
 });
 
 test("remove reports Base/table/task references and aliases remain unique", async () => {
