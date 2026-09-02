@@ -3253,10 +3253,15 @@ export function createTaskboardServer(options = {}) {
 
       if (pathname === "/api/projects") {
         if (request.method === "GET") {
-          if ([...url.searchParams.keys()].length > 0) {
-            throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/projects does not accept query parameters");
+          const unknown = [...new Set([...url.searchParams.keys()].filter((key) => key !== "includeArchived"))];
+          if (unknown.length > 0 || url.searchParams.getAll("includeArchived").length > 1) {
+            throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", `Unknown query parameter: ${unknown[0] ?? "includeArchived"}`);
           }
-          const projects = database.listProjects().map((project) => ({
+          const includeArchivedValue = url.searchParams.get("includeArchived");
+          if (includeArchivedValue !== null && !["true", "false"].includes(includeArchivedValue)) {
+            throw new ApiError(400, "INVALID_QUERY_PARAMETER", "'includeArchived' must be true or false");
+          }
+          const projects = database.listProjects({ includeArchived: includeArchivedValue === "true" }).map((project) => ({
             ...project,
             workspacePath: project.id === DEFAULT_PROJECT_ID
               ? null
@@ -3289,6 +3294,21 @@ export function createTaskboardServer(options = {}) {
           return sendEmpty(response, 204);
         }
         return methodNotAllowed(response, ["DELETE"]);
+      }
+
+      const projectArchiveRoute = pathname.match(/^\/api\/projects\/([^/]+)\/archive$/);
+      if (projectArchiveRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/projects/:id/archive");
+        const projectId = decodeRouteSegment(projectArchiveRoute[1], "Project id");
+        validateProjectId(projectId);
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set(["archived"]));
+        if (typeof body.archived !== "boolean") throw new ApiError(400, "INVALID_FIELD", "'archived' must be a boolean");
+        const project = database.setProjectArchived(projectId, body.archived);
+        events.emit("project.updated", { project });
+        return sendJson(response, 200, { project });
       }
 
       const workflowWorkspaceRoute = pathname.match(/^\/api\/projects\/([^/]+)\/workflow-workspace$/);

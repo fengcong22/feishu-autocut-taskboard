@@ -104,6 +104,27 @@ test("the Basic username becomes the trusted actor while the shared password gra
   assert.match(agentTask.body.task.creatorName, /Bob/);
 });
 
+test("cloud project archive hides history and blocks only new intake", async () => {
+  const created = await createProject("temp-cloud-history");
+  assert.equal(created.response.status, 201);
+  const archived = await cloud.request("/api/projects/temp-cloud-history/archive", {
+    method: "POST", actorName: alice, json: { archived: true },
+  });
+  assert.equal(archived.response.status, 200);
+  assert.notEqual(archived.body.project.archivedAt, null);
+  const active = await cloud.request("/api/projects", { actorName: alice });
+  assert.equal(active.body.projects.some((project) => project.id === "temp-cloud-history"), false);
+  const history = await cloud.request("/api/projects?includeArchived=true", { actorName: alice });
+  assert.equal(history.body.projects.some((project) => project.id === "temp-cloud-history"), true);
+  const blocked = await createTask("temp-cloud-history", "Blocked intake");
+  assert.equal(blocked.response.status, 409);
+  assert.equal(blocked.body.error.code, "PROJECT_ARCHIVED");
+  const restored = await cloud.request("/api/projects/temp-cloud-history/archive", {
+    method: "POST", actorName: alice, json: { archived: false },
+  });
+  assert.equal(restored.body.project.archivedAt, null);
+});
+
 test("projects, tasks, comments, relations, and workflows preserve the current API contract", async () => {
   const parent = await createTask("alpha", "Parent");
   const child = await createTask("alpha", "Child");

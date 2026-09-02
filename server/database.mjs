@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -484,6 +484,9 @@ function projectFromRow(row) {
     name: row.name,
     workspacePath: row.workspace_path,
     issueCount: Number(row.issue_count ?? 0),
+    archivedIssueCount: Number(row.archived_issue_count ?? 0),
+    archivedAt: row.archived_at ?? null,
+    source: row.source ?? "local",
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -559,6 +562,10 @@ function aiChatEventFromRow(row) {
 function projectPrefix(projectId) {
   const prefix = projectId.toUpperCase().replace(/[^A-Z0-9]+/g, "");
   return (prefix || "TASK").slice(0, 12);
+}
+
+function feishuSubjectProjectId(subjectKey) {
+  return `feishu-${createHash("sha256").update(String(subjectKey), "utf8").digest("hex").slice(0, 16)}`;
 }
 
 export class TaskboardDatabase {
@@ -886,6 +893,12 @@ export class TaskboardDatabase {
     if (!projectColumns.some((column) => column.name === "workspace_path")) {
       this.database.exec("ALTER TABLE projects ADD COLUMN workspace_path TEXT");
     }
+    if (!projectColumns.some((column) => column.name === "archived_at")) {
+      this.database.exec("ALTER TABLE projects ADD COLUMN archived_at TEXT");
+    }
+    if (!projectColumns.some((column) => column.name === "source")) {
+      this.database.exec("ALTER TABLE projects ADD COLUMN source TEXT NOT NULL DEFAULT 'local' CHECK (source IN ('global', 'local', 'feishu'))");
+    }
 
     const taskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
     const hasThreadId = taskColumns.some((column) => column.name === "thread_id");
@@ -1138,6 +1151,12 @@ export class TaskboardDatabase {
       SET name = '全局', workspace_path = NULL, updated_at = ?
       WHERE id = 'local' AND (name != '全局' OR workspace_path IS NOT NULL)
     `).run(timestamp);
+    this.database.prepare("UPDATE projects SET source = 'global' WHERE id = 'local'").run();
+    this.database.prepare(`
+      UPDATE projects
+      SET source = 'feishu'
+      WHERE id IN (SELECT project_id FROM feishu_subjects WHERE project_id IS NOT NULL)
+    `).run();
     this.database.prepare(`
       INSERT INTO taskboard_settings (key, value_json, version, updated_at)
       VALUES (?, ?, 1, ?)
@@ -1248,7 +1267,8 @@ export class TaskboardDatabase {
     }
   }
 
-  listProjects() {
+  listProjects(options = {}) {
+    const includeArchived = options?.includeArchived === true;
     return this.database.prepare(`
       SELECT
         projects.id,
@@ -1256,18 +1276,22 @@ export class TaskboardDatabase {
         projects.workspace_path,
         projects.created_at,
         projects.updated_at,
-        COUNT(tasks.id) AS issue_count
+        projects.archived_at,
+        projects.source,
+        COUNT(tasks.id) FILTER (WHERE tasks.archived_at IS NULL) AS issue_count,
+        COUNT(tasks.id) FILTER (WHERE tasks.archived_at IS NOT NULL) AS archived_issue_count
       FROM projects
-      LEFT JOIN tasks
-        ON tasks.project_id = projects.id
-        AND tasks.archived_at IS NULL
+      LEFT JOIN tasks ON tasks.project_id = projects.id
+      ${includeArchived ? "" : "WHERE projects.archived_at IS NULL"}
       GROUP BY
         projects.id,
         projects.name,
         projects.workspace_path,
+        projects.archived_at,
+        projects.source,
         projects.created_at,
         projects.updated_at
-      ORDER BY projects.created_at, projects.id
+      ORDER BY CASE WHEN projects.archived_at IS NULL THEN 0 ELSE 1 END, projects.created_at, projects.id
     `).all().map(projectFromRow);
   }
 
@@ -1275,8 +1299,8 @@ export class TaskboardDatabase {
     const timestamp = now();
     try {
       this.database.prepare(`
-        INSERT INTO projects (id, name, workspace_path, next_task_number, created_at, updated_at)
-        VALUES (?, ?, ?, 1, ?, ?)
+        INSERT INTO projects (id, name, workspace_path, source, next_task_number, created_at, updated_at)
+        VALUES (?, ?, ?, 'local', 1, ?, ?)
       `).run(input.id, input.name, input.workspacePath, timestamp, timestamp);
     } catch (error) {
       if (String(error.message).includes("UNIQUE constraint failed")) {
@@ -1287,26 +1311,95 @@ export class TaskboardDatabase {
     return this.getProject(input.id);
   }
 
+  setProjectArchived(id, archived) {
+    if (typeof archived !== "boolean") throw new ApiError(400, "INVALID_FIELD", "'archived' must be a boolean");
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.database.prepare("SELECT id, source FROM projects WHERE id = ?").get(id);
+      if (!row) throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${id}' does not exist`);
+      if (row.source !== "local") {
+        throw new ApiError(409, "PROJECT_ARCHIVE_FORBIDDEN", "Source-managed projects cannot be archived manually");
+      }
+      this.database.prepare("UPDATE projects SET archived_at = ?, updated_at = ? WHERE id = ?")
+        .run(archived ? now() : null, now(), id);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+    return this.getProject(id);
+  }
+
+  syncSourceProjectArchived(id, archived, source = "feishu", transaction = null) {
+    if (source !== "feishu") throw new ApiError(400, "INVALID_PROJECT_SOURCE", "Only Feishu source projects may be synchronized");
+    const execute = () => {
+      const row = this.database.prepare("SELECT id, source FROM projects WHERE id = ?").get(id);
+      if (!row) throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${id}' does not exist`);
+      if (row.source !== "feishu") throw new ApiError(409, "PROJECT_SOURCE_MISMATCH", "Project source does not match Feishu");
+      this.database.prepare("UPDATE projects SET archived_at = ?, updated_at = ? WHERE id = ?").run(archived ? now() : null, now(), id);
+      return this.getProject(id);
+    };
+    if (transaction && typeof transaction.prepare === "function") return execute();
+    if (typeof transaction === "function") return transaction(execute);
+    this.database.exec("BEGIN IMMEDIATE");
+    try { const result = execute(); this.database.exec("COMMIT"); return result; } catch (error) { try { this.database.exec("ROLLBACK"); } catch {} throw error; }
+  }
+
+  freezeSourceWorkflowState(subjectKey, transaction = null) {
+    const execute = () => {
+      const subject = this.database.prepare("SELECT subject_key, project_id FROM feishu_subjects WHERE subject_key = ?").get(subjectKey);
+      if (!subject?.project_id) throw new ApiError(404, "FEISHU_SUBJECT_NOT_FOUND", `Feishu subject '${subjectKey}' does not exist`);
+      if (subject.project_id !== feishuSubjectProjectId(subject.subject_key)) {
+        throw new ApiError(409, "PROJECT_SOURCE_MISMATCH", "Feishu subject project identity is invalid");
+      }
+      return this.syncSourceProjectArchived(subject.project_id, true, "feishu", this.database);
+    };
+    if (transaction && typeof transaction.prepare === "function") return execute();
+    if (typeof transaction === "function") return transaction(execute);
+    this.database.exec("BEGIN IMMEDIATE");
+    try { const result = execute(); this.database.exec("COMMIT"); return result; } catch (error) { try { this.database.exec("ROLLBACK"); } catch {} throw error; }
+  }
+
+  getProjectAssociationCounts(id) {
+    const tableExists = (name) => Boolean(this.database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
+    const count = (sql, ...values) => Number(this.database.prepare(sql).get(...values)?.count ?? 0);
+    const result = {
+      tasks: count("SELECT COUNT(*) AS count FROM tasks WHERE project_id = ?", id),
+      comments: 0, taskActivities: 0, attachments: 0, taskArtifacts: 0, artifactUploads: 0,
+      feishuOrigins: 0, packageSnapshots: 0, executions: 0, relations: 0, workflowWorkspaces: 0,
+      projectSummaries: 0, aiChatThreads: 0, feishuSubjects: 0, views: 0, displayOverrides: 0,
+    };
+    const taskCount = (table, condition = "") => tableExists(table) ? count(`SELECT COUNT(*) AS count FROM ${table} JOIN tasks ON tasks.id = ${table}.task_id WHERE tasks.project_id = ? ${condition}`, id) : 0;
+    result.comments = taskCount("comments");
+    result.taskActivities = taskCount("task_activities");
+    result.attachments = taskCount("attachments");
+    result.taskArtifacts = taskCount("task_artifacts");
+    result.artifactUploads = taskCount("artifact_uploads");
+    result.feishuOrigins = taskCount("feishu_task_origins");
+    result.packageSnapshots = taskCount("feishu_task_package_snapshots");
+    result.executions = taskCount("feishu_task_executions");
+    if (tableExists("task_relations")) result.relations = count("SELECT COUNT(*) AS count FROM task_relations JOIN tasks ON tasks.id = task_relations.source_task_id WHERE tasks.project_id = ?", id);
+    if (tableExists("workflow_workspaces")) result.workflowWorkspaces = count("SELECT COUNT(*) AS count FROM workflow_workspaces WHERE project_id = ?", id);
+    if (tableExists("project_summaries")) result.projectSummaries = count("SELECT COUNT(*) AS count FROM project_summaries WHERE project_id = ?", id);
+    if (tableExists("ai_chat_threads")) result.aiChatThreads = count("SELECT COUNT(*) AS count FROM ai_chat_threads WHERE origin_project_id = ?", id);
+    if (tableExists("feishu_subjects")) result.feishuSubjects = count("SELECT COUNT(*) AS count FROM feishu_subjects WHERE project_id = ?", id);
+    result.total = Object.values(result).reduce((sum, value) => sum + value, 0);
+    return result;
+  }
+
   deleteProject(id) {
-    const project = this.getProject(id);
-    if (!project) {
-      throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${id}' does not exist`);
-    }
-    if (!id.startsWith("temp-")) {
-      throw new ApiError(403, "PROJECT_DELETE_FORBIDDEN", "Only manually created projects can be deleted");
-    }
-    const result = this.database.prepare(`
-      DELETE FROM projects
-      WHERE id = ?
-        AND NOT EXISTS (SELECT 1 FROM tasks WHERE project_id = ?)
-    `).run(id, id);
-    if (result.changes !== 1) {
-      const issueCount = Number(this.database.prepare(`
-        SELECT COUNT(*) AS issue_count FROM tasks WHERE project_id = ?
-      `).get(id).issue_count);
-      throw new ApiError(409, "PROJECT_NOT_EMPTY", "Project still contains issues", { issueCount });
-    }
-    return project;
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.database.prepare("SELECT id, source FROM projects WHERE id = ?").get(id);
+      if (!row) throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${id}' does not exist`);
+      if (row.source !== "local" || !id.startsWith("temp-")) throw new ApiError(403, "PROJECT_DELETE_FORBIDDEN", "Only manually created projects can be deleted");
+      const associations = this.getProjectAssociationCounts(id);
+      if (associations.total > 0) throw new ApiError(409, "PROJECT_NOT_EMPTY", "Project still contains associations", { associations });
+      const result = this.database.prepare("DELETE FROM projects WHERE id = ?").run(id);
+      if (result.changes !== 1) throw new ApiError(409, "PROJECT_NOT_EMPTY", "Project still contains associations", { associations });
+      this.database.exec("COMMIT");
+      return projectFromRow({ ...row, name: "", workspace_path: null, created_at: null, updated_at: null });
+    } catch (error) { try { this.database.exec("ROLLBACK"); } catch {} throw error; }
   }
 
   getProject(id) {
@@ -1317,16 +1410,19 @@ export class TaskboardDatabase {
         projects.workspace_path,
         projects.created_at,
         projects.updated_at,
-        COUNT(tasks.id) AS issue_count
+        projects.archived_at,
+        projects.source,
+        COUNT(tasks.id) FILTER (WHERE tasks.archived_at IS NULL) AS issue_count,
+        COUNT(tasks.id) FILTER (WHERE tasks.archived_at IS NOT NULL) AS archived_issue_count
       FROM projects
-      LEFT JOIN tasks
-        ON tasks.project_id = projects.id
-        AND tasks.archived_at IS NULL
+      LEFT JOIN tasks ON tasks.project_id = projects.id
       WHERE projects.id = ?
       GROUP BY
         projects.id,
         projects.name,
         projects.workspace_path,
+        projects.archived_at,
+        projects.source,
         projects.created_at,
         projects.updated_at
     `).get(id);
@@ -1456,6 +1552,9 @@ export class TaskboardDatabase {
       if (!this.database.prepare("SELECT 1 FROM projects WHERE id = ?").get(projectId)) {
         throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
       }
+      if (this.database.prepare("SELECT 1 FROM projects WHERE id = ? AND archived_at IS NOT NULL").get(projectId)) {
+        throw new ApiError(409, "PROJECT_ARCHIVED", `Project '${projectId}' is archived`);
+      }
       const current = this.database.prepare(`
         SELECT version FROM workflow_workspaces WHERE project_id = ?
       `).get(projectId);
@@ -1542,6 +1641,9 @@ export class TaskboardDatabase {
   createAiChatThread(input) {
     const id = input.id ?? randomUUID();
     const timestamp = input.createdAt ?? now();
+    if (this.database.prepare("SELECT 1 FROM projects WHERE id = ? AND archived_at IS NOT NULL").get(input.origin.projectId)) {
+      throw new ApiError(409, "PROJECT_ARCHIVED", `Project '${input.origin.projectId}' is archived`);
+    }
     this.database.prepare(`
       INSERT INTO ai_chat_threads (
         id, title, status,
@@ -1848,6 +1950,7 @@ export class TaskboardDatabase {
         SELECT
           projects.id,
           projects.next_task_number,
+          projects.archived_at,
           (
             SELECT tasks.identifier
             FROM tasks
@@ -1860,6 +1963,9 @@ export class TaskboardDatabase {
       `).get(input.projectId);
       if (!project) {
         throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${input.projectId}' does not exist`);
+      }
+      if (project.archived_at !== null) {
+        throw new ApiError(409, "PROJECT_ARCHIVED", `Project '${input.projectId}' is archived`);
       }
 
       const prefix = project.first_identifier

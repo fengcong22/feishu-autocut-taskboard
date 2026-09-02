@@ -188,6 +188,9 @@ export interface Project {
   name: string;
   workspacePath: string | null;
   issueCount: number;
+  archivedIssueCount: number;
+  archivedAt: string | null;
+  source: "global" | "local" | "feishu";
   createdAt: string;
   updatedAt: string;
 }

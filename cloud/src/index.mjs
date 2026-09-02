@@ -468,6 +468,9 @@ function projectFromRow(row) {
     name: row.name,
     workspacePath: null,
     issueCount: Number(row.issue_count ?? 0),
+    archivedIssueCount: Number(row.archived_issue_count ?? 0),
+    archivedAt: row.archived_at ?? null,
+    source: row.source ?? "local",
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -1193,26 +1196,30 @@ function parseWorkflowWorkspace(value) {
   return { version: 1, tabs, activeWorkflowId, snapshots };
 }
 
-async function listProjects(env) {
+async function listProjects(env, { includeArchived = false } = {}) {
   const rows = await all(env.DB.prepare(`
     SELECT
       projects.id,
       projects.name,
       projects.workspace_path,
+      projects.archived_at,
+      projects.source,
       projects.created_at,
       projects.updated_at,
-      COUNT(tasks.id) AS issue_count
+      COUNT(tasks.id) FILTER (WHERE tasks.archived_at IS NULL) AS issue_count,
+      COUNT(tasks.id) FILTER (WHERE tasks.archived_at IS NOT NULL) AS archived_issue_count
     FROM projects
-    LEFT JOIN tasks
-      ON tasks.project_id = projects.id
-      AND tasks.archived_at IS NULL
+    LEFT JOIN tasks ON tasks.project_id = projects.id
+    ${includeArchived ? "" : "WHERE projects.archived_at IS NULL"}
     GROUP BY
       projects.id,
       projects.name,
       projects.workspace_path,
+      projects.archived_at,
+      projects.source,
       projects.created_at,
       projects.updated_at
-    ORDER BY projects.created_at, projects.id
+    ORDER BY CASE WHEN projects.archived_at IS NULL THEN 0 ELSE 1 END, projects.created_at, projects.id
   `));
   return rows.map(projectFromRow);
 }
@@ -1223,18 +1230,21 @@ async function getProject(env, id) {
       projects.id,
       projects.name,
       projects.workspace_path,
+      projects.archived_at,
+      projects.source,
       projects.created_at,
       projects.updated_at,
-      COUNT(tasks.id) AS issue_count
+      COUNT(tasks.id) FILTER (WHERE tasks.archived_at IS NULL) AS issue_count,
+      COUNT(tasks.id) FILTER (WHERE tasks.archived_at IS NOT NULL) AS archived_issue_count
     FROM projects
-    LEFT JOIN tasks
-      ON tasks.project_id = projects.id
-      AND tasks.archived_at IS NULL
+    LEFT JOIN tasks ON tasks.project_id = projects.id
     WHERE projects.id = ?
     GROUP BY
       projects.id,
       projects.name,
       projects.workspace_path,
+      projects.archived_at,
+      projects.source,
       projects.created_at,
       projects.updated_at
   `).bind(id).first();
@@ -1246,8 +1256,8 @@ async function createProject(env, input) {
   try {
     await env.DB.prepare(`
       INSERT INTO projects (
-        id, name, workspace_path, next_task_number, created_at, updated_at
-      ) VALUES (?, ?, NULL, 1, ?, ?)
+        id, name, workspace_path, source, next_task_number, created_at, updated_at
+      ) VALUES (?, ?, NULL, 'local', 1, ?, ?)
     `).bind(input.id, input.name, timestamp, timestamp).run();
   } catch (error) {
     if (String(error.message).includes("UNIQUE constraint failed")) {
@@ -1263,21 +1273,46 @@ async function deleteProject(env, id) {
   if (!project) {
     throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${id}' does not exist`);
   }
-  if (!id.startsWith("temp-")) {
+  if (project.source !== "local" || !id.startsWith("temp-")) {
     throw new ApiError(403, "PROJECT_DELETE_FORBIDDEN", "Only manually created projects can be deleted");
   }
+  const counts = await cloudProjectAssociationCounts(env, id);
+  if (counts.total > 0) throw new ApiError(409, "PROJECT_NOT_EMPTY", "Project still contains associations", { associations: counts });
   const result = await env.DB.prepare(`
     DELETE FROM projects
     WHERE id = ?
       AND NOT EXISTS (SELECT 1 FROM tasks WHERE project_id = ?)
-  `).bind(id, id).run();
+      AND NOT EXISTS (SELECT 1 FROM workflow_workspaces WHERE project_id = ?)
+  `).bind(id, id, id).run();
   if (!changed(result)) {
     const issueCount = Number(await env.DB.prepare(`
       SELECT COUNT(*) AS issue_count FROM tasks WHERE project_id = ?
     `).bind(id).first("issue_count"));
-    throw new ApiError(409, "PROJECT_NOT_EMPTY", "Project still contains issues", { issueCount });
+    throw new ApiError(409, "PROJECT_NOT_EMPTY", "Project still contains associations", { associations: counts });
   }
   return project;
+}
+
+async function setProjectArchived(env, id, archived) {
+  const project = await getProject(env, id);
+  if (!project) throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${id}' does not exist`);
+  if (project.source !== "local") throw new ApiError(409, "PROJECT_ARCHIVE_FORBIDDEN", "Source-managed projects cannot be archived manually");
+  await env.DB.prepare("UPDATE projects SET archived_at = ?, updated_at = ? WHERE id = ?")
+    .bind(archived ? now() : null, now(), id).run();
+  return getProject(env, id);
+}
+
+async function cloudProjectAssociationCounts(env, id) {
+  const tables = ["tasks", "comments", "task_activities", "attachments", "task_relations", "workflow_workspaces"];
+  const result = { tasks: 0, comments: 0, taskActivities: 0, attachments: 0, relations: 0, workflowWorkspaces: 0 };
+  result.tasks = Number(await env.DB.prepare("SELECT COUNT(*) AS count FROM tasks WHERE project_id = ?").bind(id).first("count"));
+  result.comments = Number(await env.DB.prepare("SELECT COUNT(*) AS count FROM comments JOIN tasks ON tasks.id = comments.task_id WHERE tasks.project_id = ?").bind(id).first("count"));
+  result.taskActivities = Number(await env.DB.prepare("SELECT COUNT(*) AS count FROM task_activities JOIN tasks ON tasks.id = task_activities.task_id WHERE tasks.project_id = ?").bind(id).first("count"));
+  result.attachments = Number(await env.DB.prepare("SELECT COUNT(*) AS count FROM attachments JOIN tasks ON tasks.id = attachments.task_id WHERE tasks.project_id = ?").bind(id).first("count"));
+  result.relations = Number(await env.DB.prepare("SELECT COUNT(*) AS count FROM task_relations JOIN tasks ON tasks.id = task_relations.source_task_id WHERE tasks.project_id = ?").bind(id).first("count"));
+  result.workflowWorkspaces = Number(await env.DB.prepare("SELECT COUNT(*) AS count FROM workflow_workspaces WHERE project_id = ?").bind(id).first("count"));
+  result.total = Object.values(result).reduce((sum, value) => sum + value, 0);
+  return result;
 }
 
 async function listTasks(env, filters) {
@@ -1332,6 +1367,7 @@ async function createTask(env, input, actor) {
   const project = await env.DB.prepare(`
     SELECT
       projects.id,
+      projects.archived_at,
       (
         SELECT tasks.identifier
         FROM tasks
@@ -1344,6 +1380,9 @@ async function createTask(env, input, actor) {
   `).bind(input.projectId).first();
   if (!project) {
     throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${input.projectId}' does not exist`);
+  }
+  if (project.archived_at !== null) {
+    throw new ApiError(409, "PROJECT_ARCHIVED", `Project '${input.projectId}' is archived`);
   }
   const prefix = project.first_identifier
     ? project.first_identifier.replace(/-\d+$/, "")
@@ -2031,7 +2070,8 @@ async function getWorkflow(env, projectId) {
 }
 
 async function saveWorkflow(env, projectId, expectedVersion, workspace) {
-  await requireProject(env, projectId);
+  const project = await requireProject(env, projectId);
+  if (project.archived_at !== null) throw new ApiError(409, "PROJECT_ARCHIVED", `Project '${projectId}' is archived`);
   const current = await env.DB.prepare(`
     SELECT version FROM workflow_workspaces WHERE project_id = ?
   `).bind(projectId).first();
@@ -2405,8 +2445,13 @@ async function routeApi(request, env, actor, url) {
 
   if (pathname === "/api/projects") {
     if (request.method === "GET") {
-      requireNoQuery(url, "GET /api/projects");
-      return json(200, { projects: await listProjects(env) });
+      const unknown = [...new Set([...url.searchParams.keys()].filter((key) => key !== "includeArchived"))];
+      if (unknown.length > 0 || url.searchParams.getAll("includeArchived").length > 1) {
+        throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", `Unknown query parameter: ${unknown[0] ?? "includeArchived"}`);
+      }
+      const value = url.searchParams.get("includeArchived");
+      if (value !== null && !["true", "false"].includes(value)) throw new ApiError(400, "INVALID_QUERY_PARAMETER", "'includeArchived' must be true or false");
+      return json(200, { projects: await listProjects(env, { includeArchived: value === "true" }) });
     }
     if (request.method === "POST") {
       return json(201, {
@@ -2423,6 +2468,18 @@ async function routeApi(request, env, actor, url) {
     if (request.method !== "DELETE") methodNotAllowed(["DELETE"]);
     await deleteProject(env, projectId);
     return empty(204);
+  }
+
+  const projectArchiveMatch = pathname.match(/^\/api\/projects\/([^/]+)\/archive$/);
+  if (projectArchiveMatch) {
+    requireNoQuery(url, "Project archive route");
+    if (request.method !== "POST") methodNotAllowed(["POST"]);
+    const projectId = validateProjectId(decodePathPart(projectArchiveMatch[1], "Project id"));
+    const body = await readJson(request);
+    assertPlainObject(body);
+    assertAllowedKeys(body, new Set(["archived"]));
+    if (typeof body.archived !== "boolean") throw new ApiError(400, "INVALID_FIELD", "'archived' must be a boolean");
+    return json(200, { project: await setProjectArchived(env, projectId, body.archived) });
   }
 
   const workflowMatch = pathname.match(

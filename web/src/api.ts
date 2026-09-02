@@ -116,9 +116,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body;
 }
 
-export async function listProjects(signal?: AbortSignal): Promise<Project[]> {
-  const data = await request<{ projects: Project[] }>("/api/projects", { signal });
+export async function listProjects(options: { includeArchived?: boolean; signal?: AbortSignal } | AbortSignal = {}): Promise<Project[]> {
+  const normalized = options instanceof AbortSignal ? { signal: options } : options;
+  const query = normalized.includeArchived === undefined ? "" : `?includeArchived=${normalized.includeArchived ? "true" : "false"}`;
+  const data = await request<{ projects: Project[] }>(`/api/projects${query}`, { signal: normalized.signal });
   return data.projects;
+}
+
+export async function setProjectArchived(projectId: string, archived: boolean): Promise<Project> {
+  const data = await request<{ project: Project }>(`/api/projects/${encodeURIComponent(projectId)}/archive`, {
+    method: "POST",
+    body: JSON.stringify({ archived }),
+  });
+  return data.project;
 }
 
 export async function getProjectSummary(

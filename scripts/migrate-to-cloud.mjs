@@ -15,7 +15,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const WRANGLER_D1_STATEMENT_MAX_BYTES = 90_000;
 const TABLE_ORDER = [
   "projects",
@@ -256,7 +256,7 @@ function assertCountsMatch(expected, actual) {
 }
 
 function validateBundle(bundle) {
-  if (!bundle || bundle.schemaVersion !== SCHEMA_VERSION) {
+  if (!bundle || ![1, SCHEMA_VERSION].includes(bundle.schemaVersion)) {
     throw new Error(`Unsupported cloud migration schema version '${bundle?.schemaVersion}'`);
   }
   for (const table of TABLE_ORDER) {
@@ -319,6 +319,22 @@ function validateBundle(bundle) {
   }
 }
 
+function normalizeBundle(bundle) {
+  if (!bundle || ![1, SCHEMA_VERSION].includes(bundle.schemaVersion)) return bundle;
+  return {
+    ...bundle,
+    schemaVersion: SCHEMA_VERSION,
+    tables: {
+      ...bundle.tables,
+      projects: (bundle.tables?.projects ?? []).map((project) => ({
+        ...project,
+        archived_at: project.archived_at ?? null,
+        source: project.id === "local" ? "global" : (project.source ?? "local"),
+      })),
+    },
+  };
+}
+
 export async function createCloudMigrationBundle({
   databasePath,
   attachmentsDirectory,
@@ -327,6 +343,8 @@ export async function createCloudMigrationBundle({
   tables.projects = tables.projects.map((project) => ({
     ...project,
     workspace_path: null,
+    archived_at: project.archived_at ?? null,
+    source: project.id === "local" ? "global" : (project.source ?? "local"),
   }));
   tables.tasks = tables.tasks.map((task) => ({
     ...task,
@@ -346,7 +364,7 @@ export async function createCloudMigrationBundle({
 }
 
 const CLOUD_COLUMNS = {
-  projects: ["id", "name", "workspace_path", "next_task_number", "created_at", "updated_at"],
+  projects: ["id", "name", "workspace_path", "source", "archived_at", "next_task_number", "created_at", "updated_at"],
   tasks: [
     "id", "identifier", "project_id", "title", "description", "status", "priority", "labels",
     "sort_order", "thread_id", "creator_type", "creator_id", "creator_name",
@@ -504,6 +522,7 @@ async function verifyR2Attachments(bundle, r2) {
 }
 
 export async function verifyCloudMigrationBundle(bundle, { d1, r2 }) {
+  bundle = normalizeBundle(bundle);
   validateBundle(bundle);
   const counts = await d1.countByProject();
   assertCountsMatch(bundle.counts.byProject, counts);
@@ -515,6 +534,7 @@ export async function verifyCloudMigrationBundle(bundle, { d1, r2 }) {
 }
 
 export async function importCloudMigrationBundle(bundle, { d1, r2 }) {
+  bundle = normalizeBundle(bundle);
   validateBundle(bundle);
 
   const existingCounts = await d1.countByProject();
@@ -657,7 +677,7 @@ export async function readCloudMigrationBundle(inputDirectory) {
     path.join(inputDirectory, "manifest.json"),
     "cloud migration manifest",
   );
-  if (manifest.schemaVersion !== SCHEMA_VERSION) {
+  if (![1, SCHEMA_VERSION].includes(manifest.schemaVersion)) {
     throw new Error(`Unsupported cloud migration schema version '${manifest.schemaVersion}'`);
   }
 
@@ -681,14 +701,13 @@ export async function readCloudMigrationBundle(inputDirectory) {
     attachments.push({ ...entry, body });
   }
   const bundle = {
-    schemaVersion: manifest.schemaVersion,
+    schemaVersion: SCHEMA_VERSION,
     createdAt: manifest.createdAt,
     counts: manifest.counts,
     tables,
     attachments,
   };
-  validateBundle(bundle);
-  return bundle;
+  return normalizeBundle(bundle);
 }
 
 function parseOptions(args, allowed, required) {
