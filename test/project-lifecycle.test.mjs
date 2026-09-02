@@ -137,11 +137,32 @@ test("source project sync rejects a non-deterministic Feishu project identity", 
   }
 });
 
-test("source workflow freeze is a safe no-op before view state tables exist", async () => {
+test("source workflow freeze is a safe no-op before a subject has view state", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-freeze-noop-"));
   const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
   try {
-    assert.equal(database.freezeSourceWorkflowState("base-missing:table"), null);
+    const timestamp = new Date().toISOString();
+    const subjectKey = "base-no-view:table";
+    const projectId = subjectProjectId(subjectKey);
+    database.database.prepare(`INSERT INTO projects
+      (id, name, workspace_path, source, next_task_number, created_at, updated_at)
+      VALUES (?, 'Feishu', NULL, 'feishu', 1, ?, ?)`
+    ).run(projectId, timestamp, timestamp);
+    database.database.prepare(`INSERT INTO feishu_bases
+      (base_token, base_name, created_at, updated_at)
+      VALUES ('base-no-view', 'Base', ?, ?)`
+    ).run(timestamp, timestamp);
+    database.database.prepare(`INSERT INTO feishu_subjects
+      (subject_key, base_token, table_id, table_name, project_id, lifecycle, config_version,
+       config_json, metadata_json, created_at, updated_at)
+      VALUES (?, 'base-no-view', 'table', 'Table', ?, 'enabled', 1,
+       '{}', '{}', ?, ?)`
+    ).run(subjectKey, projectId, timestamp, timestamp);
+
+    assert.equal(database.freezeSourceWorkflowState(subjectKey), null);
+    assert.equal(database.database.prepare(`
+      SELECT 1 FROM feishu_unified_view_sets WHERE subject_key = ?
+    `).get(subjectKey), undefined);
   } finally {
     database.close();
     await rm(directory, { recursive: true, force: true });
@@ -153,13 +174,6 @@ test("source workflow freeze rejects invalid Feishu subject project boundaries",
   const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
   try {
     const timestamp = new Date().toISOString();
-    database.database.exec(`CREATE TABLE feishu_unified_view_sets (
-      subject_key TEXT PRIMARY KEY,
-      active_view_id TEXT NOT NULL,
-      read_only INTEGER NOT NULL,
-      revision INTEGER NOT NULL,
-      updated_at TEXT NOT NULL
-    )`);
     const cases = [
       { subjectKey: "base-wrong:table", projectId: "feishu-wrong", source: "feishu" },
       { subjectKey: "base-local:table", projectId: subjectProjectId("base-local:table"), source: "local" },

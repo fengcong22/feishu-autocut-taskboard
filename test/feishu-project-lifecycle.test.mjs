@@ -55,26 +55,20 @@ function baseWithSubjects(ids) {
   };
 }
 
-function createViewState(database, subjectKey, activeViewId = "custom") {
-  database.database.exec(`CREATE TABLE IF NOT EXISTS feishu_unified_view_sets (
-    subject_key TEXT PRIMARY KEY,
-    active_view_id TEXT NOT NULL,
-    read_only INTEGER NOT NULL,
-    revision INTEGER NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS feishu_unified_views (
-    id TEXT NOT NULL,
-    subject_key TEXT NOT NULL,
-    PRIMARY KEY (id, subject_key)
-  )`);
-  database.database.prepare(`INSERT INTO feishu_unified_view_sets
-    (subject_key, active_view_id, read_only, revision, updated_at)
-    VALUES (?, ?, 0, 1, ?)`)
-    .run(subjectKey, activeViewId, new Date().toISOString());
-  database.database.prepare(`INSERT INTO feishu_unified_views (id, subject_key)
-    VALUES (?, ?)`)
-    .run(activeViewId, subjectKey);
+function createViewState(database, subjectKey) {
+  const initial = database.getUnifiedWorkflowViews(subjectKey);
+  const created = database.createUnifiedWorkflowView({
+    subjectKey,
+    stateRevision: initial.revision,
+    name: "Custom lifecycle view",
+    stageIds: ["todo"],
+  });
+  const customView = created.views.find((view) => !view.isSystem);
+  database.setUnifiedWorkflowViewState(subjectKey, {
+    stateRevision: created.revision,
+    activeViewId: customView.id,
+  });
+  return customView.id;
 }
 
 function viewState(database, subjectKey) {
@@ -131,7 +125,10 @@ test("disable and display-hide do not archive a subject project", async () => {
 test("removing and restoring Base subjects synchronizes project and view lifecycle", async () => {
   const fixture = await createFeishuFixture();
   const catalog = await fixture.store.upsertBasePreview(baseWithSubjects(["table-a", "table-b"]));
-  for (const subject of catalog.subjects) createViewState(fixture.database, subject.subjectKey);
+  const activeViewIds = new Map(catalog.subjects.map((subject) => [
+    subject.subjectKey,
+    createViewState(fixture.database, subject.subjectKey),
+  ]));
 
   await fixture.store.removeBase(catalog.baseToken);
 
@@ -147,7 +144,7 @@ test("removing and restoring Base subjects synchronizes project and view lifecyc
 
   assert.equal(fixture.database.getProject(catalog.subjects[0].projectId).archivedAt, null);
   assert.deepEqual(viewState(fixture.database, catalog.subjects[0].subjectKey), {
-    active_view_id: "custom",
+    active_view_id: activeViewIds.get(catalog.subjects[0].subjectKey),
     read_only: 0,
   });
   assert.notEqual(fixture.database.getProject(catalog.subjects[1].projectId).archivedAt, null);
@@ -167,7 +164,10 @@ test("failed Bridge lifecycle sync leaves Base subjects, projects, and views unc
     },
   });
   const catalog = await fixture.store.upsertBasePreview(baseWithSubjects(["table-a", "table-b"]));
-  for (const subject of catalog.subjects) createViewState(fixture.database, subject.subjectKey);
+  const activeViewIds = new Map(catalog.subjects.map((subject) => [
+    subject.subjectKey,
+    createViewState(fixture.database, subject.subjectKey),
+  ]));
 
   await assert.rejects(() => fixture.store.removeBase(catalog.baseToken), /bridge unavailable/);
   assert.equal(syncCalls, 2);
@@ -177,7 +177,7 @@ test("failed Bridge lifecycle sync leaves Base subjects, projects, and views unc
   for (const subject of catalog.subjects) {
     assert.equal(fixture.database.getProject(subject.projectId).archivedAt, null);
     assert.deepEqual(viewState(fixture.database, subject.subjectKey), {
-      active_view_id: "custom",
+      active_view_id: activeViewIds.get(subject.subjectKey),
       read_only: 0,
     });
   }
@@ -186,7 +186,10 @@ test("failed Bridge lifecycle sync leaves Base subjects, projects, and views unc
 test("Base removal rolls back every subject when a later project freeze fails", async () => {
   const fixture = await createFeishuFixture();
   const catalog = await fixture.store.upsertBasePreview(baseWithSubjects(["table-a", "table-b"]));
-  for (const subject of catalog.subjects) createViewState(fixture.database, subject.subjectKey);
+  const activeViewIds = new Map(catalog.subjects.map((subject) => [
+    subject.subjectKey,
+    createViewState(fixture.database, subject.subjectKey),
+  ]));
   const originalFreeze = fixture.database.freezeSourceWorkflowState.bind(fixture.database);
   fixture.database.freezeSourceWorkflowState = (subjectKey, transaction) => {
     if (subjectKey.endsWith(":table-b")) throw new Error("freeze failed");
@@ -200,7 +203,7 @@ test("Base removal rolls back every subject when a later project freeze fails", 
   for (const subject of catalog.subjects) {
     assert.equal(fixture.database.getProject(subject.projectId).archivedAt, null);
     assert.deepEqual(viewState(fixture.database, subject.subjectKey), {
-      active_view_id: "custom",
+      active_view_id: activeViewIds.get(subject.subjectKey),
       read_only: 0,
     });
   }

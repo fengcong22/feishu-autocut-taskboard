@@ -308,6 +308,55 @@ export interface FeishuWorkflowShareResult {
   dryRun: boolean;
 }
 
+export type UnifiedWorkflowStage =
+  | "todo"
+  | "queued"
+  | "in_progress"
+  | "blocked"
+  | "in_review"
+  | "completed_editing"
+  | "upload_queue"
+  | "uploading"
+  | "uploaded";
+
+export interface UnifiedWorkflowView {
+  id: string;
+  subjectKey: string;
+  name: string;
+  stageIds: UnifiedWorkflowStage[];
+  isSystem: boolean;
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface UnifiedWorkflowViewsState {
+  schemaVersion: 1;
+  subjectKey: string;
+  revision: number;
+  defaultViewId: string;
+  activeViewId: string;
+  views: UnifiedWorkflowView[];
+  readOnly: boolean;
+}
+
+export interface CreateUnifiedWorkflowViewInput {
+  subjectKey: string;
+  name: string;
+  stageIds: UnifiedWorkflowStage[];
+  stateRevision: number;
+}
+
+export interface UpdateUnifiedWorkflowViewInput {
+  subjectKey: string;
+  stateRevision: number;
+  viewRevision?: number;
+  name?: string;
+  stageIds?: UnifiedWorkflowStage[];
+  defaultViewId?: string;
+  activeViewId?: string;
+}
+
 export interface ProjectSummary {
   projectId: string;
   summary: string | null;

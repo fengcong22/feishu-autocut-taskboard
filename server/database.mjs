@@ -9,6 +9,7 @@ import {
   artifactUploadLeaseNeedsRecovery,
   parseArtifactUploadTimestamp,
 } from "./artifact-upload-lease.mjs";
+import { UNIFIED_WORKFLOW_STAGES } from "../shared/unified-workflow-stages.mjs";
 
 export class ApiError extends Error {
   constructor(status, code, message, details) {
@@ -57,6 +58,77 @@ const DEFAULT_BOARD_STAGE_LABELS = {
     canceled: "Canceled",
   },
 };
+
+const SYSTEM_UNIFIED_WORKFLOW_VIEW_ID = "all";
+const SYSTEM_UNIFIED_WORKFLOW_VIEW_NAME = "全部流程";
+const UNIFIED_WORKFLOW_STAGE_IDS = new Set(UNIFIED_WORKFLOW_STAGES);
+
+function normalizeUnifiedWorkflowSubjectKey(value) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new ApiError(400, "INVALID_FIELD", "subjectKey must be a non-empty string");
+  }
+  return value.trim();
+}
+
+function normalizeUnifiedWorkflowRevision(value, name) {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new ApiError(400, "INVALID_FIELD", `${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function normalizeUnifiedWorkflowViewName(value) {
+  if (typeof value !== "string") {
+    throw new ApiError(400, "INVALID_FIELD", "name must be a string");
+  }
+  const name = value.trim();
+  if (name === "" || [...name].length > 64) {
+    throw new ApiError(400, "INVALID_FIELD", "name must contain between 1 and 64 characters");
+  }
+  return name;
+}
+
+function normalizeUnifiedWorkflowStageIds(value) {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new ApiError(400, "INVALID_FIELD", "stageIds must contain at least one stage");
+  }
+  const seen = new Set();
+  for (const stageId of value) {
+    if (typeof stageId !== "string" || !UNIFIED_WORKFLOW_STAGE_IDS.has(stageId)) {
+      throw new ApiError(400, "INVALID_FIELD", `Unknown unified workflow stage '${String(stageId)}'`);
+    }
+    if (seen.has(stageId)) {
+      throw new ApiError(400, "INVALID_FIELD", `stageIds contains duplicate stage '${stageId}'`);
+    }
+    seen.add(stageId);
+  }
+  return [...value];
+}
+
+function unifiedWorkflowViewFromRow(row) {
+  if (
+    typeof row.id !== "string"
+    || row.id.trim() === ""
+    || row.id !== row.id.trim()
+    || typeof row.subject_key !== "string"
+    || !Number.isSafeInteger(row.revision)
+    || row.revision < 1
+    || typeof row.created_at !== "string"
+    || typeof row.updated_at !== "string"
+  ) {
+    throw new TypeError("Invalid persisted unified workflow view");
+  }
+  return {
+    id: row.id,
+    subjectKey: row.subject_key,
+    name: normalizeUnifiedWorkflowViewName(row.name),
+    stageIds: normalizeUnifiedWorkflowStageIds(JSON.parse(row.stage_ids_json)),
+    isSystem: Boolean(row.is_system),
+    revision: row.revision,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
 
 function normalizeBoardStageLabels(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -867,6 +939,47 @@ export class TaskboardDatabase {
         PRIMARY KEY(subject_key, version)
       );
 
+      CREATE TABLE IF NOT EXISTS feishu_unified_view_sets (
+        subject_key TEXT PRIMARY KEY REFERENCES feishu_subjects(subject_key) ON DELETE CASCADE,
+        schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+        default_view_id TEXT NOT NULL DEFAULT 'all',
+        active_view_id TEXT NOT NULL DEFAULT 'all',
+        frozen_active_view_id TEXT,
+        revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+        read_only INTEGER NOT NULL DEFAULT 0 CHECK (read_only IN (0, 1)),
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS feishu_unified_views (
+        id TEXT NOT NULL,
+        subject_key TEXT NOT NULL REFERENCES feishu_subjects(subject_key) ON DELETE CASCADE,
+        name TEXT NOT NULL DEFAULT '',
+        stage_ids_json TEXT NOT NULL DEFAULT '[]',
+        is_system INTEGER NOT NULL DEFAULT 0 CHECK (is_system IN (0, 1)),
+        revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+        created_at TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY(subject_key, id),
+        UNIQUE(subject_key, name)
+      );
+
+      CREATE INDEX IF NOT EXISTS feishu_unified_views_subject_created
+        ON feishu_unified_views(subject_key, is_system DESC, created_at, id);
+
+      CREATE TABLE IF NOT EXISTS feishu_unified_view_quarantine (
+        subject_key TEXT NOT NULL REFERENCES feishu_subjects(subject_key) ON DELETE CASCADE,
+        view_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        stage_ids_json TEXT NOT NULL,
+        is_system INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        quarantined_at TEXT NOT NULL,
+        PRIMARY KEY(subject_key, view_id)
+      );
+
     `);
 
     const feishuBaseColumns = this.database.prepare("PRAGMA table_info(feishu_bases)").all();
@@ -876,6 +989,10 @@ export class TaskboardDatabase {
     const feishuSubjectColumns = this.database.prepare("PRAGMA table_info(feishu_subjects)").all();
     if (!feishuSubjectColumns.some((column) => column.name === "removed_at")) {
       this.database.exec("ALTER TABLE feishu_subjects ADD COLUMN removed_at TEXT");
+    }
+    const feishuUnifiedViewSetColumns = this.database.prepare("PRAGMA table_info(feishu_unified_view_sets)").all();
+    if (!feishuUnifiedViewSetColumns.some((column) => column.name === "frozen_active_view_id")) {
+      this.database.exec("ALTER TABLE feishu_unified_view_sets ADD COLUMN frozen_active_view_id TEXT");
     }
 
     const artifactUploadColumns = this.database.prepare("PRAGMA table_info(artifact_uploads)").all();
@@ -1374,8 +1491,9 @@ export class TaskboardDatabase {
       const result = this.database.prepare(`
         UPDATE feishu_unified_view_sets
         SET frozen_active_view_id = CASE WHEN read_only = 0 THEN active_view_id ELSE frozen_active_view_id END,
-            active_view_id = 'all', read_only = 1, updated_at = ?
-        WHERE subject_key = ?
+            active_view_id = 'all', read_only = 1,
+            revision = revision + 1, updated_at = ?
+        WHERE subject_key = ? AND (read_only = 0 OR active_view_id <> 'all')
       `).run(now(), subjectKey);
       return result.changes === 0 ? null : this.database.prepare(`
         SELECT subject_key, active_view_id, read_only, revision, updated_at
@@ -1407,22 +1525,27 @@ export class TaskboardDatabase {
       const viewSetColumns = this.database.prepare("PRAGMA table_info(feishu_unified_view_sets)").all();
       const hasFrozenActiveViewId = viewSetColumns.some((column) => column.name === "frozen_active_view_id");
       const viewSet = this.database.prepare(`
-        SELECT active_view_id${hasFrozenActiveViewId ? ", frozen_active_view_id" : ""}
+        SELECT active_view_id, read_only${hasFrozenActiveViewId ? ", frozen_active_view_id" : ""}
         FROM feishu_unified_view_sets WHERE subject_key = ?
       `).get(subjectKey);
-      const hasViews = this.database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'feishu_unified_views'").get();
-      const frozenActiveViewId = hasFrozenActiveViewId ? viewSet?.frozen_active_view_id : null;
-      const restoredActiveViewId = frozenActiveViewId && hasViews && this.database.prepare(`
-        SELECT 1 FROM feishu_unified_views WHERE subject_key = ? AND id = ?
-      `).get(subjectKey, frozenActiveViewId)
+      if (!viewSet || !Boolean(viewSet.read_only)) return null;
+      this.#ensureUnifiedWorkflowViewsLocked(subjectKey);
+      const repairedViewSet = this.#getUnifiedWorkflowViewSet(subjectKey);
+      const validViewIds = new Set(
+        this.#getUnifiedWorkflowViewsLocked(subjectKey).views.map((view) => view.id),
+      );
+      const frozenActiveViewId = hasFrozenActiveViewId
+        ? repairedViewSet?.frozen_active_view_id
+        : null;
+      const restoredActiveViewId = validViewIds.has(frozenActiveViewId)
         ? frozenActiveViewId
-        : "all";
+        : SYSTEM_UNIFIED_WORKFLOW_VIEW_ID;
       const result = this.database.prepare(`
         UPDATE feishu_unified_view_sets
         SET active_view_id = ?, read_only = 0,
             ${hasFrozenActiveViewId ? "frozen_active_view_id = NULL," : ""}
-            updated_at = ?
-        WHERE subject_key = ?
+            revision = revision + 1, updated_at = ?
+        WHERE subject_key = ? AND read_only = 1
       `).run(restoredActiveViewId, now(), subjectKey);
       return result.changes === 0 ? null : this.database.prepare(`
         SELECT subject_key, active_view_id, read_only, revision, updated_at
@@ -1433,6 +1556,523 @@ export class TaskboardDatabase {
     if (typeof transaction === "function") return transaction(execute);
     this.database.exec("BEGIN IMMEDIATE");
     try { const result = execute(); this.database.exec("COMMIT"); return result; } catch (error) { try { this.database.exec("ROLLBACK"); } catch {} throw error; }
+  }
+
+  #getUnifiedWorkflowSubject(subjectKey) {
+    const key = normalizeUnifiedWorkflowSubjectKey(subjectKey);
+    const subject = this.database.prepare(`
+      SELECT subject_key, removed_at
+      FROM feishu_subjects
+      WHERE subject_key = ?
+    `).get(key);
+    if (!subject) {
+      throw new ApiError(404, "FEISHU_SUBJECT_NOT_FOUND", `Feishu subject '${key}' does not exist`);
+    }
+    return subject;
+  }
+
+  #quarantineUnifiedWorkflowViewLocked(row, reason, timestamp) {
+    this.database.prepare(`
+      INSERT INTO feishu_unified_view_quarantine (
+        subject_key, view_id, name, stage_ids_json, is_system,
+        revision, created_at, updated_at, reason, quarantined_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(subject_key, view_id) DO UPDATE SET
+        name = excluded.name,
+        stage_ids_json = excluded.stage_ids_json,
+        is_system = excluded.is_system,
+        revision = excluded.revision,
+        created_at = excluded.created_at,
+        updated_at = excluded.updated_at,
+        reason = excluded.reason,
+        quarantined_at = excluded.quarantined_at
+    `).run(
+      row.subject_key,
+      row.id,
+      row.name,
+      row.stage_ids_json,
+      row.is_system,
+      row.revision,
+      row.created_at,
+      row.updated_at,
+      reason,
+      timestamp,
+    );
+    return this.database.prepare(`
+      DELETE FROM feishu_unified_views
+      WHERE subject_key = ? AND id = ? AND id <> ?
+    `).run(row.subject_key, row.id, SYSTEM_UNIFIED_WORKFLOW_VIEW_ID).changes === 1;
+  }
+
+  #ensureUnifiedWorkflowViewsLocked(subjectKey, { bumpSystemRepairRevision = false } = {}) {
+    const subject = this.#getUnifiedWorkflowSubject(subjectKey);
+    const timestamp = now();
+    const readOnly = subject.removed_at === null ? 0 : 1;
+    const insertedViewSet = this.database.prepare(`
+      INSERT INTO feishu_unified_view_sets (
+        subject_key, schema_version, default_view_id, active_view_id,
+        frozen_active_view_id, revision, read_only, updated_at
+      ) VALUES (?, 1, 'all', 'all', NULL, 1, ?, ?)
+      ON CONFLICT(subject_key) DO NOTHING
+    `).run(subject.subject_key, readOnly, timestamp);
+    let repaired = false;
+    if (readOnly) {
+      const frozen = this.database.prepare(`
+        UPDATE feishu_unified_view_sets
+        SET frozen_active_view_id = CASE
+              WHEN read_only = 0 THEN active_view_id
+              ELSE frozen_active_view_id
+            END,
+            active_view_id = 'all',
+            read_only = 1,
+            updated_at = ?
+        WHERE subject_key = ? AND (read_only = 0 OR active_view_id <> 'all')
+      `).run(timestamp, subject.subject_key);
+      repaired ||= frozen.changes === 1;
+    }
+    const customRows = this.database.prepare(`
+      SELECT id, subject_key, name, stage_ids_json, is_system,
+             revision, created_at, updated_at
+      FROM feishu_unified_views
+      WHERE subject_key = ? AND id <> ?
+      ORDER BY created_at, id
+    `).all(subject.subject_key, SYSTEM_UNIFIED_WORKFLOW_VIEW_ID);
+    const names = new Set([SYSTEM_UNIFIED_WORKFLOW_VIEW_NAME]);
+    const acceptedRows = [];
+    const rejectedRows = [];
+    for (const row of customRows) {
+      let view = null;
+      let reason = null;
+      try {
+        view = unifiedWorkflowViewFromRow(row);
+      } catch {
+        reason = "invalid_definition";
+      }
+      if (!reason && view.isSystem) reason = "unexpected_system_flag";
+      if (!reason && view.name === SYSTEM_UNIFIED_WORKFLOW_VIEW_NAME) reason = "reserved_name";
+      if (!reason && names.has(view.name)) reason = "duplicate_name";
+      if (reason) {
+        rejectedRows.push({ row, reason });
+      } else {
+        names.add(view.name);
+        acceptedRows.push({ row, view });
+      }
+    }
+    for (const { row, reason } of rejectedRows) {
+      const quarantined = this.#quarantineUnifiedWorkflowViewLocked(row, reason, timestamp);
+      repaired = quarantined || repaired;
+    }
+    const systemStageIdsJson = JSON.stringify(UNIFIED_WORKFLOW_STAGES);
+    const writtenSystemView = this.database.prepare(`
+      INSERT INTO feishu_unified_views (
+        id, subject_key, name, stage_ids_json, is_system,
+        revision, created_at, updated_at
+      ) VALUES ('all', ?, ?, ?, 1, 1, ?, ?)
+      ON CONFLICT(subject_key, id) DO UPDATE SET
+        name = excluded.name,
+        stage_ids_json = excluded.stage_ids_json,
+        is_system = 1,
+        revision = feishu_unified_views.revision + 1,
+        updated_at = excluded.updated_at
+      WHERE feishu_unified_views.name <> excluded.name
+         OR feishu_unified_views.stage_ids_json <> excluded.stage_ids_json
+         OR feishu_unified_views.is_system <> 1
+    `).run(
+      subject.subject_key,
+      SYSTEM_UNIFIED_WORKFLOW_VIEW_NAME,
+      systemStageIdsJson,
+      timestamp,
+      timestamp,
+    );
+    repaired ||= writtenSystemView.changes === 1;
+    for (const { row, view } of acceptedRows) {
+      if (row.name === view.name) continue;
+      const canonicalized = this.database.prepare(`
+        UPDATE feishu_unified_views
+        SET name = ?, revision = revision + 1, updated_at = ?
+        WHERE subject_key = ? AND id = ? AND revision = ?
+      `).run(view.name, timestamp, row.subject_key, row.id, row.revision);
+      repaired ||= canonicalized.changes === 1;
+    }
+    const normalized = this.#getUnifiedWorkflowViewsLocked(subject.subject_key);
+    const validViewIds = new Set(normalized.views.map((view) => view.id));
+    const viewSet = this.#getUnifiedWorkflowViewSet(subject.subject_key);
+    const nextDefaultViewId = validViewIds.has(viewSet.default_view_id)
+      ? viewSet.default_view_id
+      : SYSTEM_UNIFIED_WORKFLOW_VIEW_ID;
+    const nextActiveViewId = Boolean(viewSet.read_only)
+      ? SYSTEM_UNIFIED_WORKFLOW_VIEW_ID
+      : validViewIds.has(viewSet.active_view_id)
+        ? viewSet.active_view_id
+        : SYSTEM_UNIFIED_WORKFLOW_VIEW_ID;
+    const nextFrozenActiveViewId = Boolean(viewSet.read_only)
+      && validViewIds.has(viewSet.frozen_active_view_id)
+      ? viewSet.frozen_active_view_id
+      : null;
+    if (
+      viewSet.default_view_id !== nextDefaultViewId
+      || viewSet.active_view_id !== nextActiveViewId
+      || viewSet.frozen_active_view_id !== nextFrozenActiveViewId
+    ) {
+      this.database.prepare(`
+        UPDATE feishu_unified_view_sets
+        SET default_view_id = ?, active_view_id = ?, frozen_active_view_id = ?, updated_at = ?
+        WHERE subject_key = ?
+      `).run(
+        nextDefaultViewId,
+        nextActiveViewId,
+        nextFrozenActiveViewId,
+        timestamp,
+        subject.subject_key,
+      );
+      repaired = true;
+    }
+    if (
+      bumpSystemRepairRevision
+      && insertedViewSet.changes === 0
+      && repaired
+    ) {
+      this.database.prepare(`
+        UPDATE feishu_unified_view_sets
+        SET revision = revision + 1, updated_at = ?
+        WHERE subject_key = ?
+      `).run(timestamp, subject.subject_key);
+    }
+    return subject;
+  }
+
+  #getUnifiedWorkflowViewsLocked(subjectKey) {
+    const key = normalizeUnifiedWorkflowSubjectKey(subjectKey);
+    const viewSet = this.database.prepare(`
+      SELECT subject_key, schema_version, default_view_id, active_view_id,
+             revision, read_only
+      FROM feishu_unified_view_sets
+      WHERE subject_key = ?
+    `).get(key);
+    if (!viewSet) {
+      throw new ApiError(500, "UNIFIED_VIEW_STATE_MISSING", "Unified workflow view state was not initialized");
+    }
+    const rows = this.database.prepare(`
+      SELECT id, subject_key, name, stage_ids_json, is_system,
+             revision, created_at, updated_at
+      FROM feishu_unified_views
+      WHERE subject_key = ?
+      ORDER BY is_system DESC, created_at, id
+    `).all(key);
+    let systemView = null;
+    const customViews = [];
+    const names = new Set([SYSTEM_UNIFIED_WORKFLOW_VIEW_NAME]);
+    for (const row of rows) {
+      let view;
+      try {
+        view = unifiedWorkflowViewFromRow(row);
+      } catch {
+        continue;
+      }
+      if (view.id === SYSTEM_UNIFIED_WORKFLOW_VIEW_ID) {
+        if (view.isSystem) systemView = view;
+        continue;
+      }
+      if (view.isSystem || names.has(view.name)) continue;
+      names.add(view.name);
+      customViews.push(view);
+    }
+    const views = systemView ? [systemView, ...customViews] : [];
+    const viewIds = new Set(views.map((view) => view.id));
+    return {
+      schemaVersion: viewSet.schema_version,
+      subjectKey: viewSet.subject_key,
+      revision: viewSet.revision,
+      defaultViewId: viewIds.has(viewSet.default_view_id)
+        ? viewSet.default_view_id
+        : SYSTEM_UNIFIED_WORKFLOW_VIEW_ID,
+      activeViewId: viewIds.has(viewSet.active_view_id)
+        ? viewSet.active_view_id
+        : SYSTEM_UNIFIED_WORKFLOW_VIEW_ID,
+      views,
+      readOnly: Boolean(viewSet.read_only),
+    };
+  }
+
+  #assertUnifiedWorkflowWritable(subject, viewSet) {
+    if (subject.removed_at !== null || Boolean(viewSet.read_only)) {
+      throw new ApiError(409, "SUBJECT_REMOVED", "Removed Feishu subjects are read-only");
+    }
+  }
+
+  #assertUnifiedWorkflowRevision(expectedVersion, actualVersion) {
+    if (expectedVersion !== actualVersion) {
+      throw new ApiError(409, "VERSION_CONFLICT", "Workflow views were changed by another client", {
+        expectedVersion,
+        actualVersion,
+      });
+    }
+  }
+
+  #getUnifiedWorkflowViewSet(subjectKey) {
+    return this.database.prepare(`
+      SELECT subject_key, default_view_id, active_view_id, frozen_active_view_id,
+             revision, read_only
+      FROM feishu_unified_view_sets
+      WHERE subject_key = ?
+    `).get(subjectKey);
+  }
+
+  #getUnifiedWorkflowView(subjectKey, viewId) {
+    if (typeof viewId !== "string" || viewId.trim() === "") {
+      throw new ApiError(400, "INVALID_FIELD", "viewId must be a non-empty string");
+    }
+    const view = this.database.prepare(`
+      SELECT id, subject_key, name, stage_ids_json, is_system,
+             revision, created_at, updated_at
+      FROM feishu_unified_views
+      WHERE subject_key = ? AND id = ?
+    `).get(subjectKey, viewId.trim());
+    if (!view) {
+      throw new ApiError(404, "VIEW_NOT_FOUND", `Workflow view '${viewId.trim()}' does not exist`);
+    }
+    return view;
+  }
+
+  #assertUnifiedWorkflowViewNameAvailable(subjectKey, name, excludedViewId = null) {
+    const duplicate = this.database.prepare(`
+      SELECT id FROM feishu_unified_views
+      WHERE subject_key = ? AND name = ? AND (? IS NULL OR id <> ?)
+    `).get(subjectKey, name, excludedViewId, excludedViewId);
+    if (duplicate) {
+      throw new ApiError(409, "VIEW_NAME_EXISTS", `Workflow view name '${name}' already exists`);
+    }
+  }
+
+  #assertUnifiedWorkflowPointer(subjectKey, viewId, fieldName) {
+    if (typeof viewId !== "string" || viewId.trim() === "") {
+      throw new ApiError(400, "INVALID_FIELD", `${fieldName} must be a non-empty string`);
+    }
+    const normalized = viewId.trim();
+    const exists = this.database.prepare(`
+      SELECT 1 FROM feishu_unified_views WHERE subject_key = ? AND id = ?
+    `).get(subjectKey, normalized);
+    if (!exists) {
+      throw new ApiError(400, "INVALID_FIELD", `${fieldName} must identify a view in the same subject`);
+    }
+    return normalized;
+  }
+
+  ensureUnifiedWorkflowViews(subjectKey) {
+    const key = normalizeUnifiedWorkflowSubjectKey(subjectKey);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.#ensureUnifiedWorkflowViewsLocked(key, { bumpSystemRepairRevision: true });
+      const state = this.#getUnifiedWorkflowViewsLocked(key);
+      this.database.exec("COMMIT");
+      return state;
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
+  getUnifiedWorkflowViews(subjectKey) {
+    return this.ensureUnifiedWorkflowViews(subjectKey);
+  }
+
+  createUnifiedWorkflowView(input) {
+    const subjectKey = normalizeUnifiedWorkflowSubjectKey(input?.subjectKey);
+    const stateRevision = normalizeUnifiedWorkflowRevision(input?.stateRevision, "stateRevision");
+    const name = normalizeUnifiedWorkflowViewName(input?.name);
+    const stageIds = normalizeUnifiedWorkflowStageIds(input?.stageIds);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const subject = this.#ensureUnifiedWorkflowViewsLocked(subjectKey);
+      const viewSet = this.#getUnifiedWorkflowViewSet(subjectKey);
+      this.#assertUnifiedWorkflowWritable(subject, viewSet);
+      this.#assertUnifiedWorkflowRevision(stateRevision, viewSet.revision);
+      this.#assertUnifiedWorkflowViewNameAvailable(subjectKey, name);
+      const timestamp = now();
+      const viewId = randomUUID();
+      this.database.prepare(`
+        INSERT INTO feishu_unified_views (
+          id, subject_key, name, stage_ids_json, is_system,
+          revision, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 0, 1, ?, ?)
+      `).run(viewId, subjectKey, name, JSON.stringify(stageIds), timestamp, timestamp);
+      const updated = this.database.prepare(`
+        UPDATE feishu_unified_view_sets
+        SET revision = revision + 1, updated_at = ?
+        WHERE subject_key = ? AND revision = ?
+      `).run(timestamp, subjectKey, stateRevision);
+      if (updated.changes !== 1) {
+        const actualVersion = this.#getUnifiedWorkflowViewSet(subjectKey)?.revision ?? 0;
+        this.#assertUnifiedWorkflowRevision(stateRevision, actualVersion);
+      }
+      const state = this.#getUnifiedWorkflowViewsLocked(subjectKey);
+      this.database.exec("COMMIT");
+      return state;
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
+  updateUnifiedWorkflowView(viewId, input) {
+    const subjectKey = normalizeUnifiedWorkflowSubjectKey(input?.subjectKey);
+    const stateRevision = normalizeUnifiedWorkflowRevision(input?.stateRevision, "stateRevision");
+    const hasName = Object.hasOwn(input ?? {}, "name");
+    const hasStageIds = Object.hasOwn(input ?? {}, "stageIds");
+    const hasDefaultViewId = Object.hasOwn(input ?? {}, "defaultViewId");
+    const hasActiveViewId = Object.hasOwn(input ?? {}, "activeViewId");
+    if (!hasName && !hasStageIds && !hasDefaultViewId && !hasActiveViewId) {
+      throw new ApiError(400, "INVALID_FIELD", "At least one workflow view field must be updated");
+    }
+    const name = hasName ? normalizeUnifiedWorkflowViewName(input.name) : null;
+    const stageIds = hasStageIds ? normalizeUnifiedWorkflowStageIds(input.stageIds) : null;
+    const updatesView = hasName || hasStageIds;
+    const viewRevision = updatesView
+      ? normalizeUnifiedWorkflowRevision(input?.viewRevision, "viewRevision")
+      : null;
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const subject = this.#ensureUnifiedWorkflowViewsLocked(subjectKey);
+      const viewSet = this.#getUnifiedWorkflowViewSet(subjectKey);
+      this.#assertUnifiedWorkflowWritable(subject, viewSet);
+      this.#assertUnifiedWorkflowRevision(stateRevision, viewSet.revision);
+      const view = this.#getUnifiedWorkflowView(subjectKey, viewId);
+      if (updatesView && Boolean(view.is_system)) {
+        throw new ApiError(409, "SYSTEM_VIEW_PROTECTED", "The all-stages system view cannot be changed");
+      }
+      if (updatesView) {
+        this.#assertUnifiedWorkflowRevision(viewRevision, view.revision);
+        const nextName = hasName ? name : view.name;
+        const nextStageIds = hasStageIds ? stageIds : JSON.parse(view.stage_ids_json);
+        this.#assertUnifiedWorkflowViewNameAvailable(subjectKey, nextName, view.id);
+        const timestamp = now();
+        const updatedView = this.database.prepare(`
+          UPDATE feishu_unified_views
+          SET name = ?, stage_ids_json = ?, revision = revision + 1, updated_at = ?
+          WHERE subject_key = ? AND id = ? AND revision = ? AND is_system = 0
+        `).run(
+          nextName,
+          JSON.stringify(nextStageIds),
+          timestamp,
+          subjectKey,
+          view.id,
+          viewRevision,
+        );
+        if (updatedView.changes !== 1) {
+          const actualVersion = this.#getUnifiedWorkflowView(subjectKey, view.id).revision;
+          this.#assertUnifiedWorkflowRevision(viewRevision, actualVersion);
+        }
+      }
+      const defaultViewId = hasDefaultViewId
+        ? this.#assertUnifiedWorkflowPointer(subjectKey, input.defaultViewId, "defaultViewId")
+        : viewSet.default_view_id;
+      const activeViewId = hasActiveViewId
+        ? this.#assertUnifiedWorkflowPointer(subjectKey, input.activeViewId, "activeViewId")
+        : viewSet.active_view_id;
+      const timestamp = now();
+      const updatedSet = this.database.prepare(`
+        UPDATE feishu_unified_view_sets
+        SET default_view_id = ?, active_view_id = ?,
+            revision = revision + 1, updated_at = ?
+        WHERE subject_key = ? AND revision = ? AND read_only = 0
+      `).run(defaultViewId, activeViewId, timestamp, subjectKey, stateRevision);
+      if (updatedSet.changes !== 1) {
+        const actualVersion = this.#getUnifiedWorkflowViewSet(subjectKey)?.revision ?? 0;
+        this.#assertUnifiedWorkflowRevision(stateRevision, actualVersion);
+        throw new ApiError(409, "SUBJECT_REMOVED", "Removed Feishu subjects are read-only");
+      }
+      const state = this.#getUnifiedWorkflowViewsLocked(subjectKey);
+      this.database.exec("COMMIT");
+      return state;
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
+  deleteUnifiedWorkflowView(viewId, input) {
+    const subjectKey = normalizeUnifiedWorkflowSubjectKey(input?.subjectKey);
+    const stateRevision = normalizeUnifiedWorkflowRevision(input?.stateRevision, "stateRevision");
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const subject = this.#ensureUnifiedWorkflowViewsLocked(subjectKey);
+      const viewSet = this.#getUnifiedWorkflowViewSet(subjectKey);
+      this.#assertUnifiedWorkflowWritable(subject, viewSet);
+      this.#assertUnifiedWorkflowRevision(stateRevision, viewSet.revision);
+      const view = this.#getUnifiedWorkflowView(subjectKey, viewId);
+      if (Boolean(view.is_system)) {
+        throw new ApiError(409, "SYSTEM_VIEW_PROTECTED", "The all-stages system view cannot be deleted");
+      }
+      const removed = this.database.prepare(`
+        DELETE FROM feishu_unified_views
+        WHERE subject_key = ? AND id = ? AND is_system = 0
+      `).run(subjectKey, view.id);
+      if (removed.changes !== 1) {
+        throw new ApiError(404, "VIEW_NOT_FOUND", `Workflow view '${view.id}' does not exist`);
+      }
+      const timestamp = now();
+      const updatedSet = this.database.prepare(`
+        UPDATE feishu_unified_view_sets
+        SET default_view_id = CASE WHEN default_view_id = ? THEN 'all' ELSE default_view_id END,
+            active_view_id = CASE WHEN active_view_id = ? THEN 'all' ELSE active_view_id END,
+            frozen_active_view_id = CASE WHEN frozen_active_view_id = ? THEN NULL ELSE frozen_active_view_id END,
+            revision = revision + 1,
+            updated_at = ?
+        WHERE subject_key = ? AND revision = ? AND read_only = 0
+      `).run(view.id, view.id, view.id, timestamp, subjectKey, stateRevision);
+      if (updatedSet.changes !== 1) {
+        const actualVersion = this.#getUnifiedWorkflowViewSet(subjectKey)?.revision ?? 0;
+        this.#assertUnifiedWorkflowRevision(stateRevision, actualVersion);
+        throw new ApiError(409, "SUBJECT_REMOVED", "Removed Feishu subjects are read-only");
+      }
+      const state = this.#getUnifiedWorkflowViewsLocked(subjectKey);
+      this.database.exec("COMMIT");
+      return state;
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
+  setUnifiedWorkflowViewState(subjectKeyValue, input) {
+    const subjectKey = normalizeUnifiedWorkflowSubjectKey(subjectKeyValue);
+    const stateRevision = normalizeUnifiedWorkflowRevision(input?.stateRevision, "stateRevision");
+    const hasDefaultViewId = Object.hasOwn(input ?? {}, "defaultViewId");
+    const hasActiveViewId = Object.hasOwn(input ?? {}, "activeViewId");
+    if (!hasDefaultViewId && !hasActiveViewId) {
+      throw new ApiError(400, "INVALID_FIELD", "defaultViewId or activeViewId is required");
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const subject = this.#ensureUnifiedWorkflowViewsLocked(subjectKey);
+      const viewSet = this.#getUnifiedWorkflowViewSet(subjectKey);
+      this.#assertUnifiedWorkflowWritable(subject, viewSet);
+      this.#assertUnifiedWorkflowRevision(stateRevision, viewSet.revision);
+      const defaultViewId = hasDefaultViewId
+        ? this.#assertUnifiedWorkflowPointer(subjectKey, input.defaultViewId, "defaultViewId")
+        : viewSet.default_view_id;
+      const activeViewId = hasActiveViewId
+        ? this.#assertUnifiedWorkflowPointer(subjectKey, input.activeViewId, "activeViewId")
+        : viewSet.active_view_id;
+      const timestamp = now();
+      const updated = this.database.prepare(`
+        UPDATE feishu_unified_view_sets
+        SET default_view_id = ?, active_view_id = ?,
+            revision = revision + 1, updated_at = ?
+        WHERE subject_key = ? AND revision = ? AND read_only = 0
+      `).run(defaultViewId, activeViewId, timestamp, subjectKey, stateRevision);
+      if (updated.changes !== 1) {
+        const actualVersion = this.#getUnifiedWorkflowViewSet(subjectKey)?.revision ?? 0;
+        this.#assertUnifiedWorkflowRevision(stateRevision, actualVersion);
+        throw new ApiError(409, "SUBJECT_REMOVED", "Removed Feishu subjects are read-only");
+      }
+      const state = this.#getUnifiedWorkflowViewsLocked(subjectKey);
+      this.database.exec("COMMIT");
+      return state;
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
   }
 
   getProjectAssociationCounts(id) {

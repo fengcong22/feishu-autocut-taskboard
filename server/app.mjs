@@ -1923,6 +1923,7 @@ export function createTaskboardServer(options = {}) {
     return { diagnostics: normalizeBridgeShareDiagnostics(payload.diagnostics, configuration) };
   }
   const feishuWorkflowApi = createFeishuWorkflowApi({
+    database,
     store: createFeishuWorkflowStore({
       database,
       packageAliases: async () => (typeof feishuPackages.list === "function"
@@ -2871,6 +2872,7 @@ export function createTaskboardServer(options = {}) {
           method: request.method,
           pathname,
           body: request.method === "GET" ? null : await readJson(request),
+          query: url.searchParams,
         });
         if (result) return sendJson(response, result.status, result.body);
       }

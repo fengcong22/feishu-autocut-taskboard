@@ -31,6 +31,9 @@ import type {
   AutoCutPackageDraft,
   FeishuPackage,
   FeishuPackageSummary,
+  CreateUnifiedWorkflowViewInput,
+  UnifiedWorkflowViewsState,
+  UpdateUnifiedWorkflowViewInput,
 } from "./types";
 
 const DEFAULT_USER_ACTOR: ActorIdentity = {
@@ -552,6 +555,50 @@ export async function importFeishuWorkflowShare(
     method: "POST",
     body: JSON.stringify({ configuration, dryRun }),
   });
+}
+
+export async function getUnifiedWorkflowViews(
+  subjectKey: string,
+  signal?: AbortSignal,
+): Promise<UnifiedWorkflowViewsState> {
+  const data = await request<{ state: UnifiedWorkflowViewsState }>(
+    `/api/local/feishu/workflow/views?subjectKey=${encodeURIComponent(subjectKey)}`,
+    { signal },
+  );
+  return data.state;
+}
+
+export async function createUnifiedWorkflowView(
+  input: CreateUnifiedWorkflowViewInput,
+): Promise<UnifiedWorkflowViewsState> {
+  const data = await request<{ state: UnifiedWorkflowViewsState }>(
+    "/api/local/feishu/workflow/views",
+    { method: "POST", body: JSON.stringify(input) },
+  );
+  return data.state;
+}
+
+export async function updateUnifiedWorkflowView(
+  viewId: string,
+  input: UpdateUnifiedWorkflowViewInput,
+): Promise<UnifiedWorkflowViewsState> {
+  const data = await request<{ state: UnifiedWorkflowViewsState }>(
+    `/api/local/feishu/workflow/views/${encodeURIComponent(viewId)}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+  return data.state;
+}
+
+export async function deleteUnifiedWorkflowView(
+  viewId: string,
+  subjectKey: string,
+  stateRevision: number,
+): Promise<UnifiedWorkflowViewsState> {
+  const data = await request<{ state: UnifiedWorkflowViewsState }>(
+    `/api/local/feishu/workflow/views/${encodeURIComponent(viewId)}`,
+    { method: "DELETE", body: JSON.stringify({ subjectKey, stateRevision }) },
+  );
+  return data.state;
 }
 
 export async function startTaskWithCodex(task: Task): Promise<{

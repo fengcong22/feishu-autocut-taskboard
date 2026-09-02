@@ -1,20 +1,6 @@
-/**
- * The ordered stages used by the unified Feishu workflow board.
- *
- * `blocked` is kept in the shared stage registry even though the board may
- * hide that column when there are no blocked tasks.
- */
-export const UNIFIED_WORKFLOW_STAGES = [
-  "todo",
-  "queued",
-  "in_progress",
-  "in_review",
-  "completed_editing",
-  "upload_queue",
-  "uploading",
-  "uploaded",
-  "blocked",
-];
+import { UNIFIED_WORKFLOW_STAGES } from "../../shared/unified-workflow-stages.mjs";
+
+export { UNIFIED_WORKFLOW_STAGES };
 
 const ACTIVE_TASK_STAGES = new Set([
   "todo",
