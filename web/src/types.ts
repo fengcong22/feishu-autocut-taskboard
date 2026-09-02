@@ -319,6 +319,17 @@ export type UnifiedWorkflowStage =
   | "uploading"
   | "uploaded";
 
+export interface StageDisplayOverride {
+  subjectKey: string;
+  stageId: UnifiedWorkflowStage;
+  zhName: string | null;
+  enName: string | null;
+  zhDescription: string | null;
+  enDescription: string | null;
+  revision: number;
+  updatedAt: string;
+}
+
 export interface UnifiedWorkflowView {
   id: string;
   subjectKey: string;

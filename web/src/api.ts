@@ -32,6 +32,8 @@ import type {
   FeishuPackage,
   FeishuPackageSummary,
   CreateUnifiedWorkflowViewInput,
+  StageDisplayOverride,
+  UnifiedWorkflowStage,
   UnifiedWorkflowViewsState,
   UpdateUnifiedWorkflowViewInput,
 } from "./types";
@@ -566,6 +568,38 @@ export async function getUnifiedWorkflowViews(
     { signal },
   );
   return data.state;
+}
+
+export async function getUnifiedWorkflowStageDisplays(
+  subjectKey: string,
+  signal?: AbortSignal,
+): Promise<StageDisplayOverride[]> {
+  const data = await request<{ overrides: StageDisplayOverride[] }>(
+    `/api/local/feishu/workflow/stage-displays?subjectKey=${encodeURIComponent(subjectKey)}`,
+    { signal },
+  );
+  return data.overrides;
+}
+
+export async function saveUnifiedWorkflowStageDisplay(
+  subjectKey: string,
+  stageId: UnifiedWorkflowStage,
+  input: {
+    revision: number;
+    zhName?: string | null;
+    enName?: string | null;
+    zhDescription?: string | null;
+    enDescription?: string | null;
+  },
+): Promise<StageDisplayOverride[]> {
+  const data = await request<{ overrides: StageDisplayOverride[] }>(
+    `/api/local/feishu/workflow/stage-displays/${encodeURIComponent(stageId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ subjectKey, ...input }),
+    },
+  );
+  return data.overrides;
 }
 
 export async function createUnifiedWorkflowView(

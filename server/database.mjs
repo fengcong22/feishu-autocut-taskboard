@@ -105,6 +105,51 @@ function normalizeUnifiedWorkflowStageIds(value) {
   return [...value];
 }
 
+const UNIFIED_WORKFLOW_STAGE_DISPLAY_FIELDS = Object.freeze([
+  "zhName",
+  "enName",
+  "zhDescription",
+  "enDescription",
+]);
+
+function normalizeUnifiedWorkflowStageDisplayText(value, fieldName, maxLength) {
+  if (value === null) return null;
+  if (typeof value !== "string") {
+    throw new ApiError(400, "INVALID_FIELD", `${fieldName} must be a string or null`);
+  }
+  if (/[\u0000-\u001f\u007f-\u009f\p{Cf}<>]/u.test(value)) {
+    throw new ApiError(400, "INVALID_FIELD", `${fieldName} must be plain text without markup or control characters`);
+  }
+  const normalized = value.trim();
+  if ([...normalized].length > maxLength) {
+    throw new ApiError(400, "INVALID_FIELD", `${fieldName} must contain at most ${maxLength} characters`);
+  }
+  return normalized;
+}
+
+function unifiedWorkflowStageDisplayFromRow(row) {
+  if (
+    typeof row.subject_key !== "string"
+    || typeof row.stage_id !== "string"
+    || !UNIFIED_WORKFLOW_STAGE_IDS.has(row.stage_id)
+    || !Number.isSafeInteger(row.revision)
+    || row.revision < 1
+    || typeof row.updated_at !== "string"
+  ) {
+    throw new TypeError("Invalid persisted unified workflow stage display");
+  }
+  return {
+    subjectKey: row.subject_key,
+    stageId: row.stage_id,
+    zhName: row.zh_name,
+    enName: row.en_name,
+    zhDescription: row.zh_description,
+    enDescription: row.en_description,
+    revision: row.revision,
+    updatedAt: row.updated_at,
+  };
+}
+
 function unifiedWorkflowViewFromRow(row) {
   if (
     typeof row.id !== "string"
@@ -978,6 +1023,18 @@ export class TaskboardDatabase {
         reason TEXT NOT NULL,
         quarantined_at TEXT NOT NULL,
         PRIMARY KEY(subject_key, view_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS feishu_unified_stage_display_overrides (
+        subject_key TEXT NOT NULL REFERENCES feishu_subjects(subject_key) ON DELETE CASCADE,
+        stage_id TEXT NOT NULL,
+        zh_name TEXT,
+        en_name TEXT,
+        zh_description TEXT,
+        en_description TEXT,
+        revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(subject_key, stage_id)
       );
 
     `);
@@ -2069,6 +2126,133 @@ export class TaskboardDatabase {
       const state = this.#getUnifiedWorkflowViewsLocked(subjectKey);
       this.database.exec("COMMIT");
       return state;
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
+  #ensureUnifiedWorkflowStageDisplayRowsLocked(subjectKey) {
+    const subject = this.#getUnifiedWorkflowSubject(subjectKey);
+    const timestamp = now();
+    const insert = this.database.prepare(`
+      INSERT INTO feishu_unified_stage_display_overrides (
+        subject_key, stage_id, zh_name, en_name,
+        zh_description, en_description, revision, updated_at
+      ) VALUES (?, ?, NULL, NULL, NULL, NULL, 1, ?)
+      ON CONFLICT(subject_key, stage_id) DO NOTHING
+    `);
+    for (const stageId of UNIFIED_WORKFLOW_STAGES) {
+      insert.run(subject.subject_key, stageId, timestamp);
+    }
+    return subject;
+  }
+
+  #getUnifiedWorkflowStageDisplayOverridesLocked(subjectKey) {
+    const rows = this.database.prepare(`
+      SELECT subject_key, stage_id, zh_name, en_name,
+             zh_description, en_description, revision, updated_at
+      FROM feishu_unified_stage_display_overrides
+      WHERE subject_key = ?
+    `).all(subjectKey);
+    const byStage = new Map(rows.map((row) => [row.stage_id, row]));
+    return UNIFIED_WORKFLOW_STAGES.map((stageId) => {
+      const row = byStage.get(stageId);
+      if (!row) throw new Error(`Missing unified workflow stage display '${stageId}'`);
+      return unifiedWorkflowStageDisplayFromRow(row);
+    });
+  }
+
+  getStageDisplayOverrides(subjectKeyValue) {
+    const subjectKey = normalizeUnifiedWorkflowSubjectKey(subjectKeyValue);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.#ensureUnifiedWorkflowStageDisplayRowsLocked(subjectKey);
+      const overrides = this.#getUnifiedWorkflowStageDisplayOverridesLocked(subjectKey);
+      this.database.exec("COMMIT");
+      return overrides;
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
+  saveStageDisplayOverride(subjectKeyValue, stageId, expectedRevision, patch) {
+    const subjectKey = normalizeUnifiedWorkflowSubjectKey(subjectKeyValue);
+    if (typeof stageId !== "string" || !UNIFIED_WORKFLOW_STAGE_IDS.has(stageId)) {
+      throw new ApiError(400, "INVALID_FIELD", `Unknown unified workflow stage '${String(stageId)}'`);
+    }
+    const revision = normalizeUnifiedWorkflowRevision(expectedRevision, "revision");
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new ApiError(400, "INVALID_BODY", "Stage display patch body must be an object");
+    }
+    const unknown = Object.keys(patch).find((key) => !UNIFIED_WORKFLOW_STAGE_DISPLAY_FIELDS.includes(key));
+    if (unknown) throw new ApiError(400, "UNKNOWN_FIELD", `Unknown stage display field '${unknown}'`);
+    const normalized = {};
+    for (const field of UNIFIED_WORKFLOW_STAGE_DISPLAY_FIELDS) {
+      if (!Object.hasOwn(patch, field)) continue;
+      const maxLength = field.endsWith("Description") ? 120 : 32;
+      normalized[field] = normalizeUnifiedWorkflowStageDisplayText(patch[field], field, maxLength);
+    }
+
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const subject = this.#ensureUnifiedWorkflowStageDisplayRowsLocked(subjectKey);
+      if (subject.removed_at !== null) {
+        throw new ApiError(409, "SUBJECT_REMOVED", "Removed Feishu subjects are read-only");
+      }
+      const current = this.database.prepare(`
+        SELECT subject_key, stage_id, zh_name, en_name,
+               zh_description, en_description, revision, updated_at
+        FROM feishu_unified_stage_display_overrides
+        WHERE subject_key = ? AND stage_id = ?
+      `).get(subject.subject_key, stageId);
+      if (!current) {
+        throw new ApiError(404, "FEISHU_STAGE_DISPLAY_NOT_FOUND", `Stage display '${stageId}' does not exist`);
+      }
+      if (current.revision !== revision) {
+        throw new ApiError(409, "VERSION_CONFLICT", "Stage display was changed by another client", {
+          expectedVersion: revision,
+          actualVersion: current.revision,
+        });
+      }
+      const next = {
+        zhName: Object.hasOwn(normalized, "zhName") ? normalized.zhName : current.zh_name,
+        enName: Object.hasOwn(normalized, "enName") ? normalized.enName : current.en_name,
+        zhDescription: Object.hasOwn(normalized, "zhDescription")
+          ? normalized.zhDescription : current.zh_description,
+        enDescription: Object.hasOwn(normalized, "enDescription")
+          ? normalized.enDescription : current.en_description,
+      };
+      const timestamp = now();
+      const updated = this.database.prepare(`
+        UPDATE feishu_unified_stage_display_overrides
+        SET zh_name = ?, en_name = ?, zh_description = ?, en_description = ?,
+            revision = revision + 1, updated_at = ?
+        WHERE subject_key = ? AND stage_id = ? AND revision = ?
+      `).run(
+        next.zhName,
+        next.enName,
+        next.zhDescription,
+        next.enDescription,
+        timestamp,
+        subject.subject_key,
+        stageId,
+        revision,
+      );
+      if (updated.changes !== 1) {
+        const actual = this.database.prepare(`
+          SELECT revision FROM feishu_unified_stage_display_overrides
+          WHERE subject_key = ? AND stage_id = ?
+        `).get(subject.subject_key, stageId)?.revision ?? 0;
+        throw new ApiError(409, "VERSION_CONFLICT", "Stage display was changed by another client", {
+          expectedVersion: revision,
+          actualVersion: actual,
+        });
+      }
+      const overrides = this.#getUnifiedWorkflowStageDisplayOverridesLocked(subject.subject_key);
+      this.database.exec("COMMIT");
+      return overrides;
     } catch (error) {
       try { this.database.exec("ROLLBACK"); } catch {}
       throw error;

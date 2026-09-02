@@ -30,3 +30,18 @@ test("panel source filters hidden subjects while retaining draft and enabled lab
   assert.match(panel, /enabled/);
   assert.match(panel, /subjects\.filter/);
 });
+
+test("subject workflow settings keep stage display editing separate from global labels", async () => {
+  const settings = await source("web/src/components/UnifiedWorkflowStageSettings.tsx");
+  const api = await source("web/src/api.ts");
+  const types = await source("web/src/types.ts");
+  assert.match(settings, /UnifiedWorkflowStageSettings/);
+  assert.match(settings, /subjectKey/);
+  assert.match(settings, /onChange/);
+  assert.match(settings, /onError/);
+  assert.match(settings, /Save|保存/);
+  assert.match(settings, /Reset|重置/);
+  assert.match(api, /getUnifiedWorkflowStageDisplays/);
+  assert.match(api, /saveUnifiedWorkflowStageDisplay/);
+  assert.match(types, /interface StageDisplayOverride/);
+});

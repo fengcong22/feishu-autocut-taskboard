@@ -64,9 +64,59 @@ function viewSubjectKeyFromQuery(query) {
   return values[0];
 }
 
+function stageDisplaySubjectKeyFromQuery(query) {
+  for (const key of query.keys()) {
+    if (key !== "subjectKey") {
+      throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", `Stage display GET does not accept query parameter '${key}'`);
+    }
+  }
+  const values = query.getAll("subjectKey");
+  if (values.length !== 1 || values[0].trim() === "") {
+    throw new ApiError(400, "INVALID_QUERY_PARAMETER", "Exactly one subjectKey query parameter is required");
+  }
+  return values[0];
+}
+
 export function createFeishuWorkflowApi({ database, store, previewBase = null, inspectShareImport = null }) {
   return {
     async handle({ method, pathname, body, query = new URLSearchParams() }) {
+      if (pathname === "/api/local/feishu/workflow/stage-displays") {
+        if (method !== "GET") throw new ApiError(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+        const subjectKey = stageDisplaySubjectKeyFromQuery(query);
+        return {
+          status: 200,
+          body: { overrides: database.getStageDisplayOverrides(subjectKey) },
+        };
+      }
+      const stageDisplayMatch = pathname.match(/^\/api\/local\/feishu\/workflow\/stage-displays\/([^/]+)$/);
+      if (stageDisplayMatch) {
+        if (method !== "PATCH") throw new ApiError(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+        assertNoQuery(query, "Stage display mutations");
+        let stageId;
+        try {
+          stageId = decodeURIComponent(stageDisplayMatch[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Stage id contains invalid encoding");
+        }
+        requireObjectBody(body, "Stage display update");
+        assertBodyKeys(body, new Set([
+          "subjectKey", "revision", "zhName", "enName", "zhDescription", "enDescription",
+        ]), "stage display update");
+        const subjectKey = requireSubjectKey(body);
+        if (!Number.isSafeInteger(body.revision) || body.revision < 1) {
+          throw new ApiError(400, "INVALID_FIELD", "revision must be a positive integer");
+        }
+        const patch = {};
+        for (const field of ["zhName", "enName", "zhDescription", "enDescription"]) {
+          if (Object.hasOwn(body, field)) patch[field] = body[field];
+        }
+        return {
+          status: 200,
+          body: {
+            overrides: database.saveStageDisplayOverride(subjectKey, stageId, body.revision, patch),
+          },
+        };
+      }
       if (pathname === "/api/local/feishu/workflow/views") {
         if (method === "GET") {
           const subjectKey = viewSubjectKeyFromQuery(query);
