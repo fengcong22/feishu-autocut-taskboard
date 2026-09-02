@@ -2,12 +2,16 @@ import {
   disableFeishuSubject,
   enableFeishuSubject,
   listFeishuWorkflowCatalog,
+  removeFeishuBase,
+  removeFeishuSubject,
   saveFeishuSubjectDraft,
+  setFeishuSubjectDisplayEnabled,
   upsertFeishuBasePreview,
 } from "./api";
 import type { FeishuBaseCatalog, FeishuSubjectConfig } from "./types";
 
 export { listFeishuWorkflowCatalog };
+export { removeFeishuBase, removeFeishuSubject };
 
 export function selectedFeishuSubject(
   catalog: FeishuBaseCatalog[],
@@ -37,4 +41,11 @@ export async function setFeishuSubjectEnabled(subject: FeishuSubjectConfig): Pro
 
 export async function setFeishuSubjectDisabled(subject: FeishuSubjectConfig): Promise<FeishuSubjectConfig> {
   return disableFeishuSubject(subject.subjectKey, subject.configVersion);
+}
+
+export async function setFeishuSubjectDisplay(
+  subject: FeishuSubjectConfig,
+  displayEnabled: boolean,
+): Promise<FeishuSubjectConfig> {
+  return setFeishuSubjectDisplayEnabled(subject.subjectKey, displayEnabled);
 }

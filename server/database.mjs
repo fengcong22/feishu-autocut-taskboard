@@ -1337,10 +1337,12 @@ export class TaskboardDatabase {
       if (!row) throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${id}' does not exist`);
       if (row.source !== "feishu") throw new ApiError(409, "PROJECT_SOURCE_MISMATCH", "Project source does not match Feishu");
       const subject = this.database.prepare("SELECT subject_key, project_id FROM feishu_subjects WHERE project_id = ?").get(id);
-      if (!subject || subject.project_id !== feishuSubjectProjectId(subject.subject_key)) {
+      if (!subject || subject.project_id !== id || id !== feishuSubjectProjectId(subject.subject_key)) {
         throw new ApiError(409, "PROJECT_SOURCE_MISMATCH", "Feishu subject project identity is invalid");
       }
-      this.database.prepare("UPDATE projects SET archived_at = ?, updated_at = ? WHERE id = ?").run(archived ? now() : null, now(), id);
+      const timestamp = now();
+      this.database.prepare("UPDATE projects SET archived_at = ?, updated_at = ? WHERE id = ?")
+        .run(archived ? timestamp : null, timestamp, id);
       return this.getProject(id);
     };
     if (transaction && typeof transaction.prepare === "function") return execute();
@@ -1365,11 +1367,63 @@ export class TaskboardDatabase {
       if (subject.source !== "feishu" || subject.project_id !== feishuSubjectProjectId(subject.subject_key)) {
         throw new ApiError(409, "PROJECT_SOURCE_MISMATCH", "Feishu subject project identity is invalid");
       }
+      const viewSetColumns = this.database.prepare("PRAGMA table_info(feishu_unified_view_sets)").all();
+      if (!viewSetColumns.some((column) => column.name === "frozen_active_view_id")) {
+        this.database.exec("ALTER TABLE feishu_unified_view_sets ADD COLUMN frozen_active_view_id TEXT");
+      }
       const result = this.database.prepare(`
         UPDATE feishu_unified_view_sets
-        SET active_view_id = 'all', read_only = 1, updated_at = ?
+        SET frozen_active_view_id = CASE WHEN read_only = 0 THEN active_view_id ELSE frozen_active_view_id END,
+            active_view_id = 'all', read_only = 1, updated_at = ?
         WHERE subject_key = ?
       `).run(now(), subjectKey);
+      return result.changes === 0 ? null : this.database.prepare(`
+        SELECT subject_key, active_view_id, read_only, revision, updated_at
+        FROM feishu_unified_view_sets WHERE subject_key = ?
+      `).get(subjectKey);
+    };
+    if (transaction && typeof transaction.prepare === "function") return execute();
+    if (typeof transaction === "function") return transaction(execute);
+    this.database.exec("BEGIN IMMEDIATE");
+    try { const result = execute(); this.database.exec("COMMIT"); return result; } catch (error) { try { this.database.exec("ROLLBACK"); } catch {} throw error; }
+  }
+
+  restoreSourceWorkflowState(subjectKey, transaction = null) {
+    const execute = () => {
+      const hasViewSets = this.database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'feishu_unified_view_sets'").get();
+      if (!hasViewSets) return null;
+      const subject = this.database.prepare(`
+        SELECT feishu_subjects.subject_key, feishu_subjects.project_id, projects.source
+        FROM feishu_subjects
+        LEFT JOIN projects ON projects.id = feishu_subjects.project_id
+        WHERE feishu_subjects.subject_key = ?
+      `).get(subjectKey);
+      if (!subject) {
+        throw new ApiError(404, "FEISHU_SUBJECT_NOT_FOUND", `Feishu subject '${subjectKey}' does not exist`);
+      }
+      if (subject.source !== "feishu" || subject.project_id !== feishuSubjectProjectId(subject.subject_key)) {
+        throw new ApiError(409, "PROJECT_SOURCE_MISMATCH", "Feishu subject project identity is invalid");
+      }
+      const viewSetColumns = this.database.prepare("PRAGMA table_info(feishu_unified_view_sets)").all();
+      const hasFrozenActiveViewId = viewSetColumns.some((column) => column.name === "frozen_active_view_id");
+      const viewSet = this.database.prepare(`
+        SELECT active_view_id${hasFrozenActiveViewId ? ", frozen_active_view_id" : ""}
+        FROM feishu_unified_view_sets WHERE subject_key = ?
+      `).get(subjectKey);
+      const hasViews = this.database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'feishu_unified_views'").get();
+      const frozenActiveViewId = hasFrozenActiveViewId ? viewSet?.frozen_active_view_id : null;
+      const restoredActiveViewId = frozenActiveViewId && hasViews && this.database.prepare(`
+        SELECT 1 FROM feishu_unified_views WHERE subject_key = ? AND id = ?
+      `).get(subjectKey, frozenActiveViewId)
+        ? frozenActiveViewId
+        : "all";
+      const result = this.database.prepare(`
+        UPDATE feishu_unified_view_sets
+        SET active_view_id = ?, read_only = 0,
+            ${hasFrozenActiveViewId ? "frozen_active_view_id = NULL," : ""}
+            updated_at = ?
+        WHERE subject_key = ?
+      `).run(restoredActiveViewId, now(), subjectKey);
       return result.changes === 0 ? null : this.database.prepare(`
         SELECT subject_key, active_view_id, read_only, revision, updated_at
         FROM feishu_unified_view_sets WHERE subject_key = ?

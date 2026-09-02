@@ -623,9 +623,10 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
             db.prepare(`INSERT INTO projects
               (id, name, workspace_path, source, archived_at, next_task_number, created_at, updated_at)
               VALUES (?, ?, NULL, 'feishu', NULL, 1, ?, ?)
-              ON CONFLICT(id) DO UPDATE SET name=excluded.name, source='feishu', archived_at=NULL,
-                updated_at=excluded.updated_at`)
+              ON CONFLICT(id) DO UPDATE SET name=excluded.name, source='feishu', updated_at=excluded.updated_at`)
               .run(next.projectId, next.tableName, timestamp, timestamp);
+            database.syncSourceProjectArchived(next.projectId, false, "feishu", db);
+            database.restoreSourceWorkflowState(next.subjectKey, db);
             saveVersion({ subject_key: next.subjectKey }, next, next.configVersion, timestamp);
           }
         }
@@ -687,8 +688,10 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
               db.prepare("UPDATE feishu_subjects SET removed_at = NULL, updated_at = ? WHERE subject_key = ?")
                 .run(timestamp, key);
             }
-            db.prepare("UPDATE projects SET name = ?, source = 'feishu', archived_at = NULL, updated_at = ? WHERE id = ?")
+            db.prepare("UPDATE projects SET name = ?, source = 'feishu', updated_at = ? WHERE id = ?")
               .run(tableName, timestamp, subjectProjectId(key));
+            database.syncSourceProjectArchived(subjectProjectId(key), false, "feishu", db);
+            database.restoreSourceWorkflowState(key, db);
           } else {
             const initial = validate({
               subjectKey: key,
@@ -713,9 +716,10 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
             db.prepare(`INSERT INTO projects
               (id, name, workspace_path, source, archived_at, next_task_number, created_at, updated_at)
               VALUES (?, ?, NULL, 'feishu', NULL, 1, ?, ?)
-              ON CONFLICT(id) DO UPDATE SET name = excluded.name, source = 'feishu', archived_at = NULL,
-                updated_at = excluded.updated_at`)
+              ON CONFLICT(id) DO UPDATE SET name = excluded.name, source = 'feishu', updated_at = excluded.updated_at`)
               .run(subjectProjectId(key), tableName, timestamp, timestamp);
+            database.syncSourceProjectArchived(subjectProjectId(key), false, "feishu", db);
+            database.restoreSourceWorkflowState(key, db);
             saveVersion({ subject_key: key }, initial, 1, timestamp);
           }
         }
@@ -780,10 +784,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     async removeSubject(subjectKey) {
       const key = parseSubjectKey(subjectKey).subjectKey;
       const current = getSubject(key);
-      if (current.lifecycle !== "disabled") {
-        await transition(key, current.config_version, "disabled");
-      }
-      removeSubjectRows([getSubject(key)]);
+      await removeSubjectRows([current]);
       return this.listCatalog();
     },
     async removeBase(baseTokenValue) {
@@ -791,21 +792,23 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
       const base = db.prepare("SELECT * FROM feishu_bases WHERE base_token = ? AND removed_at IS NULL").get(baseToken);
       if (!base) throw new ApiError(404, "BASE_NOT_FOUND", `Base '${baseToken}' does not exist`);
       const subjects = db.prepare("SELECT * FROM feishu_subjects WHERE base_token = ? AND removed_at IS NULL ORDER BY subject_key").all(baseToken);
-      for (const subject of subjects) {
-        if (subject.lifecycle !== "disabled") {
-          await transition(subject.subject_key, subject.config_version, "disabled");
-        }
-      }
       const timestamp = now();
       db.exec("BEGIN IMMEDIATE");
       try {
         const lockedSubjects = db.prepare("SELECT * FROM feishu_subjects WHERE base_token = ? AND removed_at IS NULL ORDER BY subject_key").all(baseToken);
-        if (lockedSubjects.some((subject) => subject.lifecycle !== "disabled")) {
+        if (lockedSubjects.length !== subjects.length
+          || lockedSubjects.some((subject, index) => (
+            subject.subject_key !== subjects[index]?.subject_key
+            || subject.config_version !== subjects[index]?.config_version
+          ))) {
           throw new ApiError(409, "VERSION_CONFLICT", "A subject changed while the Base was being removed");
         }
-        removeSubjectRows(lockedSubjects, timestamp, false);
-        db.prepare("UPDATE feishu_bases SET removed_at = ?, updated_at = ? WHERE base_token = ? AND removed_at IS NULL")
+        await removeSubjectRows(lockedSubjects, timestamp, false);
+        const removed = db.prepare("UPDATE feishu_bases SET removed_at = ?, updated_at = ? WHERE base_token = ? AND removed_at IS NULL")
           .run(timestamp, timestamp, baseToken);
+        if (removed.changes !== 1) {
+          throw new ApiError(409, "VERSION_CONFLICT", "The Base changed while it was being removed");
+        }
         db.exec("COMMIT");
       } catch (error) {
         db.exec("ROLLBACK");
@@ -817,22 +820,57 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     async disableSubject(subjectKey, expectedVersion) { return transition(subjectKey, expectedVersion, "disabled"); },
   };
 
-  function removeSubjectRows(subjects, timestamp = now(), manageTransaction = true) {
+  async function removeSubjectRows(subjects, timestamp = now(), manageTransaction = true) {
     if (manageTransaction) db.exec("BEGIN IMMEDIATE");
     try {
       for (const subject of subjects) {
-        const locked = getSubject(subject.subject_key);
-        if (locked.config_version !== subject.config_version || locked.lifecycle !== "disabled") {
+        let locked = getSubject(subject.subject_key);
+        if (locked.config_version !== subject.config_version) {
           throw new ApiError(409, "VERSION_CONFLICT", "Subject changed while it was being removed", {
             expectedVersion: subject.config_version,
             actualVersion: locked.config_version,
           });
         }
+        if (locked.lifecycle !== "disabled") {
+          const expectedVersion = locked.config_version;
+          const disabled = validate({
+            ...rowSubject(locked),
+            subjectKey: locked.subject_key,
+            baseToken: locked.base_token,
+            tableId: locked.table_id,
+            projectId: locked.project_id,
+            lifecycle: "disabled",
+            configVersion: expectedVersion + 1,
+          });
+          if (typeof syncSubject === "function") {
+            await syncSubject(disabled, { lifecycle: "disabled", expectedVersion });
+          }
+          const transitioned = db.prepare(`UPDATE feishu_subjects
+            SET lifecycle='disabled', config_version=?, config_json=?, updated_at=?
+            WHERE subject_key=? AND config_version=? AND removed_at IS NULL`)
+            .run(disabled.configVersion, JSON.stringify(disabled), timestamp, locked.subject_key, expectedVersion);
+          if (transitioned.changes !== 1) {
+            throw new ApiError(409, "VERSION_CONFLICT", "Subject changed while it was being removed", {
+              expectedVersion,
+              actualVersion: getSubject(locked.subject_key).config_version,
+            });
+          }
+          saveVersion({ subject_key: locked.subject_key }, disabled, disabled.configVersion, timestamp);
+          locked = getSubject(locked.subject_key);
+        }
         const next = { ...rowSubject(locked), displayEnabled: false, updatedAt: timestamp };
-        db.prepare(`UPDATE feishu_subjects
+        const removed = db.prepare(`UPDATE feishu_subjects
           SET display_enabled=0, config_json=?, removed_at=?, updated_at=?
           WHERE subject_key=? AND config_version=? AND lifecycle='disabled' AND removed_at IS NULL`)
           .run(JSON.stringify(next), timestamp, timestamp, locked.subject_key, locked.config_version);
+        if (removed.changes !== 1) {
+          throw new ApiError(409, "VERSION_CONFLICT", "Subject changed while it was being removed", {
+            expectedVersion: locked.config_version,
+            actualVersion: locked.config_version,
+          });
+        }
+        database.syncSourceProjectArchived(locked.project_id, true, "feishu", db);
+        database.freezeSourceWorkflowState(locked.subject_key, db);
       }
       if (manageTransaction) db.exec("COMMIT");
     } catch (error) {

@@ -10,6 +10,19 @@ const detailSource = await readFile(new URL("../web/src/components/TaskDetail.ts
 const labelPickerSource = await readFile(new URL("../web/src/components/LabelPicker.tsx", import.meta.url), "utf8");
 const pendingAttachmentsSource = await readFile(new URL("../web/src/components/PendingAttachments.tsx", import.meta.url), "utf8");
 const labelsSource = await readFile(new URL("../web/src/labels.ts", import.meta.url), "utf8");
+const feishuNavigatorSource = await readFile(new URL("../web/src/components/FeishuBaseNavigator.tsx", import.meta.url), "utf8");
+const addFeishuLifecycleSource = appSource.slice(
+  appSource.indexOf("const addFeishuBaseAndRefreshProjects"),
+  appSource.indexOf("const updateFeishuSubject"),
+);
+const applyFeishuRemovalSource = appSource.slice(
+  appSource.indexOf("const applyRemovedFeishuCatalog"),
+  appSource.indexOf("const runFeishuRemoval"),
+);
+const runFeishuRemovalSource = appSource.slice(
+  appSource.indexOf("const runFeishuRemoval"),
+  appSource.indexOf("useEffect(() => {", appSource.indexOf("const runFeishuRemoval")),
+);
 
 test("the project switcher merges live Codex projects with persisted Taskboard projects", () => {
   assert.match(appSource, /hostContext\?\.projects \?\? \[\]/);
@@ -25,8 +38,8 @@ test("each device stores an independent workspace path for every project", () =>
   assert.match(appSource, /const DEVICE_WORKSPACE_PATHS_KEY = "taskboard\.deviceWorkspacePaths\.v1"/);
   assert.match(appSource, /function readDeviceWorkspacePaths\(\)/);
   assert.match(appSource, /rememberDeviceWorkspacePath/);
-  assert.match(appSource, /const \[nextProjects, metadata, workspaces\] = await Promise\.all\(\[/);
-  assert.match(appSource, /listDeviceWorkspaces\(signal\)/);
+  assert.match(appSource, /const \[nextProjects, metadata, workspaces(?:, stageLabels)?\] = await Promise\.all\(\[/);
+  assert.match(appSource, /listDeviceWorkspaces\(requestSignal\)/);
   assert.match(appSource, /const selectedDeviceWorkspacePath = selectedProjectId === GLOBAL_PROJECT_ID[\s\S]*?: deviceWorkspacePaths\[selectedProjectId\]/);
   assert.match(appSource, /listDevelopmentContexts\([\s\S]*?selectedDeviceWorkspacePath,[\s\S]*?\)/);
   assert.match(apiSource, /query\.set\("workspacePath", workspacePath\)/);
@@ -38,10 +51,41 @@ test("project selection starts from the route or recent projects and updates the
   assert.match(appSource, /const initialProjectId = query\.get\("project"\) \?\? recentProjectIds\[0\] \?\? GLOBAL_PROJECT_ID/);
   assert.match(appSource, /const rememberProjectOpen = useCallback/);
   assert.match(appSource, /taskboardStorage\.setItem\(RECENT_PROJECT_IDS_KEY, JSON\.stringify\(next\)\)/);
-  assert.match(appSource, /function changeProject\(projectId: string\)/);
+  assert.match(appSource, /function changeProject\(projectId: string, preferredView\?: BoardView\)/);
   assert.match(appSource, /setSelectedProjectId\(projectId\)/);
   assert.match(appSource, /const url = buildIssueUrl\(window\.location\.href, projectId, null\)/);
   assert.match(appSource, /window\.history\.replaceState\(null, "", url\)/);
+});
+
+test("Feishu removal selects the next subject and rejects late project responses", () => {
+  assert.match(appSource, /const projectRequestGenerationRef = useRef\(0\)/);
+  assert.match(appSource, /const projectRequestAbortControllerRef = useRef<AbortController \| null>\(null\)/);
+  assert.match(appSource, /const feishuCatalogRequestGenerationRef = useRef\(0\)/);
+  assert.match(appSource, /const feishuCatalogAbortControllerRef = useRef<AbortController \| null>\(null\)/);
+  assert.match(appSource, /requestGeneration !== projectRequestGenerationRef\.current/);
+  assert.match(appSource, /selectedProjectIdRef\.current !== projectId/);
+  assert.match(appSource, /selectedFeishuSubjectKeyRef\.current !== subjectKey/);
+  assert.match(appSource, /catalogGeneration !== feishuCatalogRequestGenerationRef\.current/);
+  assert.match(appSource, /clearRemovedFeishuSelectionState/);
+  assert.match(appSource, /sameBaseSubjects\[Math\.min\(removedSubjectIndex, sameBaseSubjects\.length - 1\)\]/);
+  assert.match(applyFeishuRemovalSource, /const fallbackActiveProject =[\s\S]*?const fallbackActiveSubject =[\s\S]*?const fallbackProjectId = sameBaseFallback\?\.projectId\s*\?\? fallbackActiveProject\?\.id\s*\?\? GLOBAL_PROJECT_ID/);
+  assert.match(applyFeishuRemovalSource, /const fallbackSubject = sameBaseFallback\s*\?\? fallbackActiveSubject\s*\?\? null/);
+  assert.match(runFeishuRemovalSource, /const previousProjects = projectsRef\.current/);
+  assert.match(applyFeishuRemovalSource, /const previousActiveProjects = previousProjects\.filter/);
+  assert.match(appSource, /rememberProjectOpen\(fallbackProjectId\)/);
+  assert.match(appSource, /buildIssueUrl\(window\.location\.href, fallbackProjectId, null\)/);
+  assert.match(feishuNavigatorSource, /从 Taskboard 移除/);
+  assert.match(feishuNavigatorSource, /飞书数据不会被删除/);
+});
+
+test("stale Feishu add failures are discarded before they reach the navigator", () => {
+  assert.match(addFeishuLifecycleSource, /try \{\s*const next = await addFeishuBaseFromUrl\(url\)/);
+  assert.match(addFeishuLifecycleSource, /catch \(error\) \{[\s\S]*?selectedProjectIdRef\.current !== projectId[\s\S]*?selectedFeishuSubjectKeyRef\.current !== subjectKey[\s\S]*?return;[\s\S]*?throw error/);
+});
+
+test("successful Feishu removal does not report a later refresh failure as a removal error", () => {
+  assert.match(runFeishuRemovalSource, /let nextCatalog:[^;]+;\s*try \{\s*nextCatalog = await operation\(\);\s*\} catch \(error\) \{[\s\S]*?throw error;\s*\}\s*try \{/);
+  assert.match(runFeishuRemovalSource, /try \{\s*const nextProjects = await listProjects\(projectController\.signal\);[\s\S]*?\} catch \{[\s\S]*?listFeishuWorkflowCatalog\(catalogController\.signal\)[\s\S]*?\}\s*\}\s*\}, \[applyRemovedFeishuCatalog/);
 });
 
 test("the selected project exposes the current board surfaces", () => {

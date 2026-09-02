@@ -728,6 +728,10 @@ export function App() {
   const [automationError, setAutomationError] = useState<string | null>(null);
   const [announcement, setAnnouncementValue] = useState("");
   const [undoNotice, setUndoNotice] = useState<UndoNotice | null>(null);
+  const projectRequestGenerationRef = useRef(0);
+  const projectRequestAbortControllerRef = useRef<AbortController | null>(null);
+  const feishuCatalogRequestGenerationRef = useRef(0);
+  const feishuCatalogAbortControllerRef = useRef<AbortController | null>(null);
   const tasksRequestRef = useRef(0);
   const tasksRef = useRef<Task[]>([]);
   const undoSequenceRef = useRef(0);
@@ -739,6 +743,26 @@ export function App() {
   const pendingDetailSourceScrollRef = useRef<DetailSourceScroll | null>(null);
   const selectedProjectIdRef = useRef(selectedProjectId);
   selectedProjectIdRef.current = selectedProjectId;
+  const selectedFeishuSubjectKeyRef = useRef(selectedFeishuSubjectKey);
+  selectedFeishuSubjectKeyRef.current = selectedFeishuSubjectKey;
+  const projectsRef = useRef(projects);
+  projectsRef.current = projects;
+  const feishuCatalogRef = useRef(feishuCatalog);
+  feishuCatalogRef.current = feishuCatalog;
+
+  const beginProjectRequestContext = useCallback((projectId: string, subjectKey: string | null) => {
+    projectRequestAbortControllerRef.current?.abort();
+    const controller = new AbortController();
+    projectRequestAbortControllerRef.current = controller;
+    selectedProjectIdRef.current = projectId;
+    selectedFeishuSubjectKeyRef.current = subjectKey;
+    return { controller, generation: ++projectRequestGenerationRef.current };
+  }, []);
+
+  useEffect(() => {
+    const { controller } = beginProjectRequestContext(selectedProjectId, selectedFeishuSubjectKey);
+    return () => controller.abort();
+  }, [beginProjectRequestContext, selectedFeishuSubjectKey, selectedProjectId]);
 
   const revisionPollingInterval = getRevisionPollingInterval(taskboardMetadata);
   const textRef = useRef(text);
@@ -1282,13 +1306,18 @@ export function App() {
       }
       setDetailTaskIdentifier(routeIssueIdentifier);
       if (routeProjectId === selectedProjectId) return;
+      const routeSubject = feishuCatalogRef.current
+        .flatMap((base) => base.subjects)
+        .find((subject) => subject.projectId === routeProjectId);
+      beginProjectRequestContext(routeProjectId, routeSubject?.subjectKey ?? null);
       setBoardView(readProjectBoardView(routeProjectId));
       setSelectedProjectId(routeProjectId);
+      setSelectedFeishuSubjectKey(routeSubject?.subjectKey ?? null);
     }
 
     window.addEventListener("popstate", syncRouteFromLocation);
     return () => window.removeEventListener("popstate", syncRouteFromLocation);
-  }, [boardView, selectedProjectId]);
+  }, [beginProjectRequestContext, boardView, selectedProjectId]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -1485,14 +1514,21 @@ export function App() {
   }, [detailTaskId, embedded, embeddedFrameChallenge, selectedProjectId]);
 
   const loadProjectList = useCallback(async (signal?: AbortSignal) => {
+    const requestGeneration = projectRequestGenerationRef.current;
+    const projectId = selectedProjectIdRef.current;
+    const subjectKey = selectedFeishuSubjectKeyRef.current;
+    const requestSignal = signal ?? projectRequestAbortControllerRef.current?.signal;
     setLoadError(null);
     try {
       const [nextProjects, metadata, workspaces, stageLabels] = await Promise.all([
-        listProjects(signal),
-        getTaskboardMetadata(signal),
-        listDeviceWorkspaces(signal),
-        getBoardStageLabels(signal),
+        listProjects(requestSignal),
+        getTaskboardMetadata(requestSignal),
+        listDeviceWorkspaces(requestSignal),
+        getBoardStageLabels(requestSignal),
       ]);
+      if (requestGeneration !== projectRequestGenerationRef.current
+        || selectedProjectIdRef.current !== projectId
+        || selectedFeishuSubjectKeyRef.current !== subjectKey) return;
       setBoardStageLabels(stageLabels);
       setTaskboardMetadata((current) => (
         current
@@ -1514,30 +1550,53 @@ export function App() {
         return next;
       });
       setProjects(nextProjects);
-      setSelectedProjectId((current) => {
-        const fromQuery = new URLSearchParams(window.location.search).get("project");
-        if (fromQuery && nextProjects.some((project) => project.id === fromQuery)) return fromQuery;
-        if (current && nextProjects.some((project) => project.id === current)) return current;
-        return nextProjects.find((project) => project.id === GLOBAL_PROJECT_ID)?.id
-          ?? nextProjects[0]?.id
-          ?? GLOBAL_PROJECT_ID;
-      });
+      const fromQuery = new URLSearchParams(window.location.search).get("project");
+      const nextProjectId = fromQuery && nextProjects.some((project) => project.id === fromQuery)
+        ? fromQuery
+        : nextProjects.some((project) => project.id === projectId)
+          ? projectId
+          : nextProjects.find((project) => project.id === GLOBAL_PROJECT_ID)?.id
+            ?? nextProjects[0]?.id
+            ?? GLOBAL_PROJECT_ID;
+      if (nextProjectId !== projectId) {
+        const nextSubject = feishuCatalogRef.current
+          .flatMap((base) => base.subjects)
+          .find((subject) => subject.projectId === nextProjectId);
+        beginProjectRequestContext(nextProjectId, nextSubject?.subjectKey ?? null);
+        setSelectedProjectId(nextProjectId);
+        setSelectedFeishuSubjectKey(nextSubject?.subjectKey ?? null);
+      }
     } catch (error) {
-      if ((error as Error).name !== "AbortError") setLoadError(errorMessage(error));
+      if ((error as Error).name !== "AbortError"
+        && requestGeneration === projectRequestGenerationRef.current
+        && selectedProjectIdRef.current === projectId
+        && selectedFeishuSubjectKeyRef.current === subjectKey) {
+        setLoadError(errorMessage(error));
+      }
     }
-  }, []);
+  }, [beginProjectRequestContext]);
 
   useEffect(() => {
-    const controller = new AbortController();
-    void loadProjectList(controller.signal);
-    return () => controller.abort();
-  }, [loadProjectList]);
+    void loadProjectList(projectRequestAbortControllerRef.current?.signal);
+  }, [loadProjectList, selectedFeishuSubjectKey, selectedProjectId]);
 
   const refreshProjectList = useCallback(async () => {
+    const requestGeneration = projectRequestGenerationRef.current;
+    const projectId = selectedProjectIdRef.current;
+    const subjectKey = selectedFeishuSubjectKeyRef.current;
     try {
-      setProjects(await listProjects());
+      const nextProjects = await listProjects(projectRequestAbortControllerRef.current?.signal);
+      if (requestGeneration !== projectRequestGenerationRef.current
+        || selectedProjectIdRef.current !== projectId
+        || selectedFeishuSubjectKeyRef.current !== subjectKey) return;
+      setProjects(nextProjects);
     } catch (error) {
-      setLoadError(errorMessage(error));
+      if ((error as Error).name !== "AbortError"
+        && requestGeneration === projectRequestGenerationRef.current
+        && selectedProjectIdRef.current === projectId
+        && selectedFeishuSubjectKeyRef.current === subjectKey) {
+        setLoadError(errorMessage(error));
+      }
     }
   }, []);
 
@@ -1546,23 +1605,37 @@ export function App() {
     options: { quiet?: boolean; signal?: AbortSignal } = {},
   ) => {
     const requestId = ++tasksRequestRef.current;
+    const requestGeneration = projectRequestGenerationRef.current;
+    const subjectKey = selectedFeishuSubjectKeyRef.current;
+    const requestSignal = options.signal ?? projectRequestAbortControllerRef.current?.signal;
     if (!options.quiet) setTasksLoading(true);
     setLoadError(null);
     try {
       const [nextTasks, nextArchivedTasks] = await Promise.all([
-        listTasks(projectId, options.signal),
-        listArchivedTasks(projectId, options.signal),
+        listTasks(projectId, requestSignal),
+        listArchivedTasks(projectId, requestSignal),
       ]);
-      if (requestId !== tasksRequestRef.current) return;
+      if (requestId !== tasksRequestRef.current
+        || requestGeneration !== projectRequestGenerationRef.current
+        || selectedProjectIdRef.current !== projectId
+        || selectedFeishuSubjectKeyRef.current !== subjectKey) return;
       setTasks(sortTasks(nextTasks));
       setArchivedTasks(sortTasks(nextArchivedTasks));
       setHasLoadedTasks(true);
     } catch (error) {
-      if ((error as Error).name !== "AbortError" && requestId === tasksRequestRef.current) {
+      if ((error as Error).name !== "AbortError"
+        && requestId === tasksRequestRef.current
+        && requestGeneration === projectRequestGenerationRef.current
+        && selectedProjectIdRef.current === projectId
+        && selectedFeishuSubjectKeyRef.current === subjectKey) {
         setLoadError(errorMessage(error));
       }
     } finally {
-      if (!options.quiet && requestId === tasksRequestRef.current) setTasksLoading(false);
+      if (!options.quiet
+        && requestId === tasksRequestRef.current
+        && requestGeneration === projectRequestGenerationRef.current
+        && selectedProjectIdRef.current === projectId
+        && selectedFeishuSubjectKeyRef.current === subjectKey) setTasksLoading(false);
     }
   }, []);
 
@@ -1574,10 +1647,8 @@ export function App() {
       return;
     }
     setHasLoadedTasks(false);
-    const controller = new AbortController();
-    void refreshTasks(selectedProjectId, { signal: controller.signal });
-    return () => controller.abort();
-  }, [refreshTasks, selectedProjectId]);
+    void refreshTasks(selectedProjectId, { signal: projectRequestAbortControllerRef.current?.signal });
+  }, [refreshTasks, selectedFeishuSubjectKey, selectedProjectId]);
 
   const refreshWorkflowOptions = useCallback(async (projectId: string, signal?: AbortSignal) => {
     const record = await getWorkflowWorkspace<unknown>(projectId, signal);
@@ -1600,10 +1671,18 @@ export function App() {
   }, [refreshWorkflowOptions, selectedProjectId]);
 
   useEffect(() => {
+    feishuCatalogAbortControllerRef.current?.abort();
     const controller = new AbortController();
+    feishuCatalogAbortControllerRef.current = controller;
+    const catalogGeneration = ++feishuCatalogRequestGenerationRef.current;
+    const projectId = selectedProjectIdRef.current;
+    const subjectKey = selectedFeishuSubjectKeyRef.current;
     void listFeishuWorkflowCatalog(controller.signal)
       .then((catalog) => {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted
+          || catalogGeneration !== feishuCatalogRequestGenerationRef.current
+          || selectedProjectIdRef.current !== projectId
+          || selectedFeishuSubjectKeyRef.current !== subjectKey) return;
         setFeishuCatalog(catalog);
         setFeishuConfigurationBaseToken((current) => current && catalog.some((base) => base.baseToken === current)
           ? current
@@ -1616,16 +1695,42 @@ export function App() {
       })
       .catch(() => { /* Feishu is optional; ordinary projects remain unaffected. */ });
     return () => controller.abort();
-  }, [selectedProjectId]);
+  }, [selectedFeishuSubjectKey, selectedProjectId]);
 
-  const addFeishuBaseAndRefreshProjects = useCallback(async (url: string) => {
-    const next = await addFeishuBaseFromUrl(url);
-    // A Base preview creates one Taskboard project per discovered subject.
-    // Refresh before the panel selects a subject so the project context and
-    // task route are valid immediately, without requiring a full reload.
-    await refreshProjectList();
-    return next;
-  }, [refreshProjectList]);
+  const addFeishuBaseAndRefreshProjects = useCallback(async (
+    url: string,
+  ): Promise<import("./types").FeishuBaseCatalog | void> => {
+    const projectId = selectedProjectIdRef.current;
+    const subjectKey = selectedFeishuSubjectKeyRef.current;
+    const { controller: projectController, generation: requestGeneration } = beginProjectRequestContext(projectId, subjectKey);
+    feishuCatalogAbortControllerRef.current?.abort();
+    const catalogController = new AbortController();
+    feishuCatalogAbortControllerRef.current = catalogController;
+    const catalogGeneration = ++feishuCatalogRequestGenerationRef.current;
+    try {
+      const next = await addFeishuBaseFromUrl(url);
+      const [nextProjects, nextCatalog] = await Promise.all([
+        listProjects(projectController.signal),
+        listFeishuWorkflowCatalog(catalogController.signal),
+      ]);
+      if (requestGeneration !== projectRequestGenerationRef.current
+        || catalogGeneration !== feishuCatalogRequestGenerationRef.current
+        || selectedProjectIdRef.current !== projectId
+        || selectedFeishuSubjectKeyRef.current !== subjectKey) {
+        return;
+      }
+      setProjects(nextProjects);
+      setFeishuCatalog(nextCatalog);
+      return nextCatalog.find((base) => base.baseToken === next.baseToken) ?? next;
+    } catch (error) {
+      if ((error as Error).name === "AbortError"
+        || requestGeneration !== projectRequestGenerationRef.current
+        || catalogGeneration !== feishuCatalogRequestGenerationRef.current
+        || selectedProjectIdRef.current !== projectId
+        || selectedFeishuSubjectKeyRef.current !== subjectKey) return;
+      throw error;
+    }
+  }, [beginProjectRequestContext]);
 
   const updateFeishuSubject = useCallback((subject: import("./types").FeishuSubjectConfig) => {
     setFeishuCatalog((catalog) => catalog.map((base) => ({
@@ -1634,29 +1739,187 @@ export function App() {
     })));
   }, []);
 
-  const applyRemovedFeishuCatalog = useCallback((catalog: import("./types").FeishuBaseCatalog[]) => {
-    setFeishuCatalog(catalog);
-    setSelectedFeishuSubjectKey((current) => current && catalog
-      .some((base) => base.subjects.some((subject) => subject.subjectKey === current)) ? current : null);
-    setFeishuConfigurationBaseToken((current) => current && catalog.some((base) => base.baseToken === current)
-      ? current
-      : catalog[0]?.baseToken ?? null);
+  const clearRemovedFeishuSelectionState = useCallback(() => {
+    tasksRequestRef.current += 1;
+    setDetailTaskIdentifier(null);
+    setEditor(null);
+    setNewTaskDraft(null);
+    setContextMenu(null);
+    setProjectContextMenu(null);
+    setProjectMenuOpen(false);
+    setDraggedTaskId(null);
+    setDraggedTaskHeight(0);
+    setDropTarget(null);
+    setMovingTaskId(null);
+    setSettlingTaskId(null);
+    tasksRef.current = [];
+    setTasks([]);
+    setArchivedTasks([]);
+    setHasLoadedTasks(false);
+    setTasksLoading(false);
+    setLoadError(null);
+    setActionError(null);
+    setOpeningThreadTaskId(null);
+    setStartingCodexTaskId(null);
+    pendingDetailSourceScrollRef.current = null;
+    if (issueListRef.current) issueListRef.current.scrollTop = 0;
+    for (const scrollContainer of Object.values(boardColumnScrollRefs.current)) {
+      if (scrollContainer) scrollContainer.scrollTop = 0;
+    }
+    boardColumnScrollRefs.current = {};
+    undoStackRef.current = [];
+    setUndoNotice(null);
+    setSearch("");
+    setFilters(EMPTY_TASK_FILTERS);
   }, []);
+
+  const applyRemovedFeishuCatalog = useCallback((
+    nextCatalog: import("./types").FeishuBaseCatalog[],
+    nextProjects: Project[],
+    previousCatalog: import("./types").FeishuBaseCatalog[],
+    previousProjects: Project[],
+    projectId: string,
+    subjectKey: string | null,
+    requestGeneration: number,
+    catalogGeneration: number,
+  ) => {
+    if (requestGeneration !== projectRequestGenerationRef.current
+      || catalogGeneration !== feishuCatalogRequestGenerationRef.current
+      || selectedProjectIdRef.current !== projectId
+      || selectedFeishuSubjectKeyRef.current !== subjectKey) return;
+    setFeishuCatalog(nextCatalog);
+    setProjects(nextProjects);
+    const subjectStillActive = subjectKey !== null && nextCatalog.some((base) => (
+      base.subjects.some((subject) => subject.subjectKey === subjectKey)
+    ));
+    const projectStillActive = nextProjects.some((project) => project.id === projectId);
+    if ((subjectKey === null || subjectStillActive) && projectStillActive) {
+      setFeishuConfigurationBaseToken((current) => current && nextCatalog.some((base) => base.baseToken === current)
+        ? current
+        : nextCatalog[0]?.baseToken ?? null);
+      return;
+    }
+
+    clearRemovedFeishuSelectionState();
+    const previousBase = previousCatalog.find((base) => (
+      base.subjects.some((subject) => subject.subjectKey === subjectKey)
+    ));
+    const previousVisibleSubjects = previousBase?.subjects.filter((subject) => subject.displayEnabled) ?? [];
+    const removedSubjectIndex = previousVisibleSubjects.findIndex((subject) => subject.subjectKey === subjectKey);
+    const sameBaseSubjects = nextCatalog.find((base) => base.baseToken === previousBase?.baseToken)
+      ?.subjects.filter((subject) => subject.displayEnabled) ?? [];
+    const sameBaseFallback = removedSubjectIndex >= 0 && sameBaseSubjects.length > 0
+      ? sameBaseSubjects[Math.min(removedSubjectIndex, sameBaseSubjects.length - 1)]
+      : sameBaseSubjects[0];
+    const previousActiveProjects = previousProjects.filter((project) => project.id !== GLOBAL_PROJECT_ID);
+    const removedProjectIndex = previousActiveProjects.findIndex((project) => project.id === projectId);
+    const remainingActiveProjects = nextProjects.filter((project) => project.id !== GLOBAL_PROJECT_ID);
+    const fallbackActiveProject = removedProjectIndex >= 0 && remainingActiveProjects.length > 0
+      ? remainingActiveProjects[Math.min(removedProjectIndex, remainingActiveProjects.length - 1)]
+      : remainingActiveProjects[0];
+    const fallbackActiveSubject = fallbackActiveProject
+      ? nextCatalog.flatMap((base) => base.subjects).find((subject) => (
+        subject.displayEnabled && subject.projectId === fallbackActiveProject.id
+      ))
+      : null;
+    const fallbackSubject = sameBaseFallback
+      ?? fallbackActiveSubject
+      ?? null;
+    const fallbackProjectId = sameBaseFallback?.projectId
+      ?? fallbackActiveProject?.id
+      ?? GLOBAL_PROJECT_ID;
+    const fallbackBaseToken = fallbackSubject
+      ? nextCatalog.find((base) => base.subjects.some((subject) => subject.subjectKey === fallbackSubject.subjectKey))?.baseToken
+      : null;
+    beginProjectRequestContext(fallbackProjectId, fallbackSubject?.subjectKey ?? null);
+    setSelectedProjectId(fallbackProjectId);
+    setSelectedFeishuSubjectKey(fallbackSubject?.subjectKey ?? null);
+    setFeishuConfigurationBaseToken(fallbackBaseToken ?? nextCatalog[0]?.baseToken ?? null);
+    const fallbackView = fallbackSubject ? "issues" : readProjectBoardView(fallbackProjectId);
+    setBoardView(fallbackView);
+    if (fallbackSubject) taskboardStorage.setItem(`${PROJECT_VIEW_KEY_PREFIX}${fallbackProjectId}`, fallbackView);
+    rememberProjectOpen(fallbackProjectId);
+    const url = buildIssueUrl(window.location.href, fallbackProjectId, null);
+    window.history.replaceState(null, "", url);
+  }, [beginProjectRequestContext, clearRemovedFeishuSelectionState, rememberProjectOpen]);
 
   const runFeishuRemoval = useCallback(async (
     operation: () => Promise<import("./types").FeishuBaseCatalog[]>,
   ) => {
+    const previousCatalog = feishuCatalogRef.current;
+    const previousProjects = projectsRef.current;
+    const projectId = selectedProjectIdRef.current;
+    const subjectKey = selectedFeishuSubjectKeyRef.current;
+    const { controller: projectController, generation: requestGeneration } = beginProjectRequestContext(projectId, subjectKey);
+    feishuCatalogAbortControllerRef.current?.abort();
+    const catalogController = new AbortController();
+    feishuCatalogAbortControllerRef.current = catalogController;
+    const catalogGeneration = ++feishuCatalogRequestGenerationRef.current;
+    let nextCatalog: import("./types").FeishuBaseCatalog[];
     try {
-      applyRemovedFeishuCatalog(await operation());
+      nextCatalog = await operation();
     } catch (error) {
+      if (requestGeneration !== projectRequestGenerationRef.current
+        || catalogGeneration !== feishuCatalogRequestGenerationRef.current
+        || selectedProjectIdRef.current !== projectId
+        || selectedFeishuSubjectKeyRef.current !== subjectKey) return;
       try {
-        applyRemovedFeishuCatalog(await listFeishuWorkflowCatalog());
+        const [recoveredCatalog, nextProjects] = await Promise.all([
+          listFeishuWorkflowCatalog(catalogController.signal),
+          listProjects(projectController.signal),
+        ]);
+        applyRemovedFeishuCatalog(
+          recoveredCatalog,
+          nextProjects,
+          previousCatalog,
+          previousProjects,
+          projectId,
+          subjectKey,
+          requestGeneration,
+          catalogGeneration,
+        );
       } catch {
-        // Preserve the original removal error; the regular catalog poll will retry later.
+        // Preserve the removal error; the regular catalog poll will retry later.
       }
       throw error;
     }
-  }, [applyRemovedFeishuCatalog]);
+    try {
+      const nextProjects = await listProjects(projectController.signal);
+      applyRemovedFeishuCatalog(
+        nextCatalog,
+        nextProjects,
+        previousCatalog,
+        previousProjects,
+        projectId,
+        subjectKey,
+        requestGeneration,
+        catalogGeneration,
+      );
+    } catch {
+      if (requestGeneration !== projectRequestGenerationRef.current
+        || catalogGeneration !== feishuCatalogRequestGenerationRef.current
+        || selectedProjectIdRef.current !== projectId
+        || selectedFeishuSubjectKeyRef.current !== subjectKey) return;
+      try {
+        const [recoveredCatalog, nextProjects] = await Promise.all([
+          listFeishuWorkflowCatalog(catalogController.signal),
+          listProjects(projectController.signal),
+        ]);
+        applyRemovedFeishuCatalog(
+          recoveredCatalog,
+          nextProjects,
+          previousCatalog,
+          previousProjects,
+          projectId,
+          subjectKey,
+          requestGeneration,
+          catalogGeneration,
+        );
+      } catch {
+        // Removal already committed; the regular catalog poll will retry later.
+      }
+    }
+  }, [applyRemovedFeishuCatalog, beginProjectRequestContext]);
 
   useEffect(() => {
     if (!selectedProjectId) {
@@ -2430,6 +2693,8 @@ export function App() {
   }
 
   function changeProject(projectId: string, preferredView?: BoardView) {
+    const subject = feishuCatalog.flatMap((base) => base.subjects).find((candidate) => candidate.projectId === projectId);
+    beginProjectRequestContext(projectId, subject?.subjectKey ?? null);
     closeContextMenu();
     setProjectContextMenu(null);
     setProjectMenuOpen(false);
@@ -2440,7 +2705,6 @@ export function App() {
     } else {
       setBoardView(readProjectBoardView(projectId));
     }
-    const subject = feishuCatalog.flatMap((base) => base.subjects).find((candidate) => candidate.projectId === projectId);
     setSelectedFeishuSubjectKey(subject?.subjectKey ?? null);
     rememberProjectOpen(projectId);
     setSelectedProjectId(projectId);
@@ -2616,11 +2880,7 @@ export function App() {
             catalog={feishuCatalog}
             selectedSubjectKey={selectedFeishuSubjectKey}
             onAddBase={async (url) => {
-              const next = await addFeishuBaseAndRefreshProjects(url);
-              setFeishuCatalog((current) => [
-                ...current.filter((base) => base.baseToken !== next.baseToken),
-                next,
-              ]);
+              await addFeishuBaseAndRefreshProjects(url);
             }}
             onSelectSubject={(subjectKey) => {
               const subject = feishuCatalog
@@ -3064,14 +3324,18 @@ export function App() {
               configurationBaseToken={feishuConfigurationBaseToken}
               selectedSubjectKey={selectedFeishuSubjectKey}
               onSelectSubject={(subjectKey, openProject = true) => {
+                beginProjectRequestContext(selectedProjectIdRef.current, subjectKey);
                 setSelectedFeishuSubjectKey(subjectKey);
                 const subject = feishuCatalog.flatMap((base) => base.subjects).find((item) => item.subjectKey === subjectKey);
                 if (subject && openProject) changeProject(subject.projectId, "issues");
               }}
               onAddBase={async (url) => {
                 const next = await addFeishuBaseAndRefreshProjects(url);
+                if (!next) return;
+                const nextSubjectKey = next.subjects[0]?.subjectKey ?? null;
+                beginProjectRequestContext(selectedProjectIdRef.current, nextSubjectKey);
                 setFeishuConfigurationBaseToken(next.baseToken);
-                setSelectedFeishuSubjectKey(next.subjects[0]?.subjectKey ?? null);
+                setSelectedFeishuSubjectKey(nextSubjectKey);
                 return next;
               }}
               onCatalogChange={setFeishuCatalog}

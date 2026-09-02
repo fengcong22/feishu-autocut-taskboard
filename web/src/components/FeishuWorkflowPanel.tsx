@@ -7,14 +7,16 @@ import type {
 } from "../types";
 import {
   addFeishuBaseFromUrl,
-  exportFeishuWorkflowShare,
-  importFeishuWorkflowShare,
   saveFeishuWorkflowDraft,
   setFeishuSubjectDisabled,
   setFeishuSubjectDisplay,
   setFeishuSubjectEnabled,
 } from "../feishuWorkflow";
-import { listFeishuPackages } from "../api";
+import {
+  exportFeishuWorkflowShare,
+  importFeishuWorkflowShare,
+  listFeishuPackages,
+} from "../api";
 
 export interface FeishuWorkflowPanelProps {
   catalog: FeishuBaseCatalog[];
@@ -25,7 +27,7 @@ export interface FeishuWorkflowPanelProps {
   onCatalogChange: (catalog: FeishuBaseCatalog[]) => void;
   onSubjectChange: (subject: FeishuSubjectConfig) => void;
   /** Optional orchestration hooks used by hosts that own persistence. */
-  onAddBase?: (url: string) => Promise<FeishuBaseCatalog> | void;
+  onAddBase?: (url: string) => Promise<FeishuBaseCatalog | void> | void;
   onSaveDraft?: (subjectKey: string, patch: unknown) => Promise<FeishuSubjectConfig> | void;
   onEnable?: (subject: FeishuSubjectConfig) => Promise<FeishuSubjectConfig> | void;
   onDisable?: (subject: FeishuSubjectConfig) => Promise<FeishuSubjectConfig> | void;
