@@ -86,7 +86,7 @@ test("project list accepts only includeArchived", async () => {
   assert.equal(result.body.error.code, "UNKNOWN_QUERY_PARAMETER");
 });
 
-test("source workflow freeze archives its validated Feishu project in the caller transaction", async () => {
+test("source project sync archives its validated deterministic Feishu project", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-freeze-"));
   const filename = path.join(directory, "taskboard.sqlite");
   const database = new TaskboardDatabase(filename);
@@ -108,8 +108,8 @@ test("source workflow freeze archives its validated Feishu project in the caller
        '{}', '{}', ?, ?)`
     ).run(projectId, timestamp, timestamp);
     database.database.exec("BEGIN IMMEDIATE");
-    const frozen = database.freezeSourceWorkflowState("base-freeze:table", database.database);
-    assert.notEqual(frozen.archivedAt, null);
+    const archived = database.syncSourceProjectArchived(projectId, true, "feishu", database.database);
+    assert.notEqual(archived.archivedAt, null);
     database.database.exec("COMMIT");
     assert.notEqual(database.getProject(projectId).archivedAt, null);
   } finally {
@@ -118,7 +118,7 @@ test("source workflow freeze archives its validated Feishu project in the caller
   }
 });
 
-test("source workflow freeze rejects a non-deterministic Feishu project identity", async () => {
+test("source project sync rejects a non-deterministic Feishu project identity", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-freeze-mismatch-"));
   const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
   try {
@@ -129,8 +129,94 @@ test("source workflow freeze rejects a non-deterministic Feishu project identity
       (subject_key, base_token, table_id, table_name, project_id, lifecycle, config_version, config_json, metadata_json, created_at, updated_at)
       VALUES ('base-wrong:table', 'base-wrong', 'table', 'Table', 'feishu-wrong', 'enabled', 1, '{}', '{}', ?, ?)`
     ).run(timestamp, timestamp);
-    assert.throws(() => database.freezeSourceWorkflowState("base-wrong:table"), (error) => error.code === "PROJECT_SOURCE_MISMATCH");
+    assert.throws(() => database.syncSourceProjectArchived("feishu-wrong", true, "feishu"), (error) => error.code === "PROJECT_SOURCE_MISMATCH");
     assert.equal(database.getProject("feishu-wrong").archivedAt, null);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("source workflow freeze is a safe no-op before view state tables exist", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-freeze-noop-"));
+  const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+  try {
+    assert.equal(database.freezeSourceWorkflowState("base-missing:table"), null);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("source workflow freeze rejects invalid Feishu subject project boundaries", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-freeze-validation-"));
+  const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+  try {
+    const timestamp = new Date().toISOString();
+    database.database.exec(`CREATE TABLE feishu_unified_view_sets (
+      subject_key TEXT PRIMARY KEY,
+      active_view_id TEXT NOT NULL,
+      read_only INTEGER NOT NULL,
+      revision INTEGER NOT NULL,
+      updated_at TEXT NOT NULL
+    )`);
+    const cases = [
+      { subjectKey: "base-wrong:table", projectId: "feishu-wrong", source: "feishu" },
+      { subjectKey: "base-local:table", projectId: subjectProjectId("base-local:table"), source: "local" },
+    ];
+    for (const entry of cases) {
+      const [baseToken, tableId] = entry.subjectKey.split(":");
+      database.database.prepare(`INSERT INTO projects
+        (id, name, workspace_path, source, next_task_number, created_at, updated_at)
+        VALUES (?, 'Feishu', NULL, ?, 1, ?, ?)`
+      ).run(entry.projectId, entry.source, timestamp, timestamp);
+      database.database.prepare(`INSERT INTO feishu_bases
+        (base_token, base_name, created_at, updated_at) VALUES (?, 'Base', ?, ?)`
+      ).run(baseToken, timestamp, timestamp);
+      database.database.prepare(`INSERT INTO feishu_subjects
+        (subject_key, base_token, table_id, table_name, project_id, lifecycle, config_version,
+         config_json, metadata_json, created_at, updated_at)
+        VALUES (?, ?, ?, 'Table', ?, 'enabled', 1, '{}', '{}', ?, ?)`
+      ).run(entry.subjectKey, baseToken, tableId, entry.projectId, timestamp, timestamp);
+      database.database.prepare(`INSERT INTO feishu_unified_view_sets
+        (subject_key, active_view_id, read_only, revision, updated_at)
+        VALUES (?, 'custom', 0, 1, ?)`
+      ).run(entry.subjectKey, timestamp);
+      assert.throws(
+        () => database.freezeSourceWorkflowState(entry.subjectKey),
+        (error) => error.code === "PROJECT_SOURCE_MISMATCH",
+      );
+      const view = database.database.prepare(`
+        SELECT active_view_id, read_only FROM feishu_unified_view_sets WHERE subject_key = ?
+      `).get(entry.subjectKey);
+      assert.equal(view.active_view_id, "custom");
+      assert.equal(view.read_only, 0);
+    }
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("project association counts include relations on either side without double counting", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-relation-count-"));
+  const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+  try {
+    database.createProject({ id: "temp-left", name: "Left", workspacePath: null });
+    database.createProject({ id: "temp-right", name: "Right", workspacePath: null });
+    const timestamp = new Date().toISOString();
+    database.database.prepare(`INSERT INTO tasks
+      (id, identifier, project_id, title, status, priority, labels, sort_order, version, created_at, updated_at)
+      VALUES (?, ?, ?, 'Task', 'todo', 'none', '[]', 1000, 1, ?, ?)`
+    ).run("left-task", "LEFT-1", "temp-left", timestamp, timestamp);
+    database.database.prepare(`INSERT INTO tasks
+      (id, identifier, project_id, title, status, priority, labels, sort_order, version, created_at, updated_at)
+      VALUES (?, ?, ?, 'Task', 'todo', 'none', '[]', 1000, 1, ?, ?)`
+    ).run("right-task", "RIGHT-1", "temp-right", timestamp, timestamp);
+    database.database.prepare("INSERT INTO task_relations (relation_type, source_task_id, target_task_id, created_at) VALUES ('related', ?, ?, ?)")
+      .run("left-task", "right-task", timestamp);
+    assert.equal(database.getProjectAssociationCounts("temp-left").relations, 1);
+    assert.equal(database.getProjectAssociationCounts("temp-right").relations, 1);
   } finally {
     database.close();
     await rm(directory, { recursive: true, force: true });

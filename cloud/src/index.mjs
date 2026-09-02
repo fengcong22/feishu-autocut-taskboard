@@ -1293,6 +1293,14 @@ async function deleteProject(env, id) {
   return project;
 }
 
+async function requireActiveProject(env, id) {
+  const project = await requireProject(env, id);
+  if (project.archived_at !== null) {
+    throw new ApiError(409, "PROJECT_ARCHIVED", `Project '${id}' is archived`);
+  }
+  return project;
+}
+
 async function setProjectArchived(env, id, archived) {
   const project = await getProject(env, id);
   if (!project) throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${id}' does not exist`);
@@ -1309,7 +1317,17 @@ async function cloudProjectAssociationCounts(env, id) {
   result.comments = Number(await env.DB.prepare("SELECT COUNT(*) AS count FROM comments JOIN tasks ON tasks.id = comments.task_id WHERE tasks.project_id = ?").bind(id).first("count"));
   result.taskActivities = Number(await env.DB.prepare("SELECT COUNT(*) AS count FROM task_activities JOIN tasks ON tasks.id = task_activities.task_id WHERE tasks.project_id = ?").bind(id).first("count"));
   result.attachments = Number(await env.DB.prepare("SELECT COUNT(*) AS count FROM attachments JOIN tasks ON tasks.id = attachments.task_id WHERE tasks.project_id = ?").bind(id).first("count"));
-  result.relations = Number(await env.DB.prepare("SELECT COUNT(*) AS count FROM task_relations JOIN tasks ON tasks.id = task_relations.source_task_id WHERE tasks.project_id = ?").bind(id).first("count"));
+  result.relations = Number(await env.DB.prepare(`
+    SELECT COUNT(*) AS count
+    FROM task_relations
+    WHERE EXISTS (
+      SELECT 1 FROM tasks
+      WHERE tasks.id = task_relations.source_task_id AND tasks.project_id = ?
+    ) OR EXISTS (
+      SELECT 1 FROM tasks
+      WHERE tasks.id = task_relations.target_task_id AND tasks.project_id = ?
+    )
+  `).bind(id, id).first("count"));
   result.workflowWorkspaces = Number(await env.DB.prepare("SELECT COUNT(*) AS count FROM workflow_workspaces WHERE project_id = ?").bind(id).first("count"));
   result.total = Object.values(result).reduce((sum, value) => sum + value, 0);
   return result;
@@ -1426,6 +1444,7 @@ async function createTask(env, input, actor) {
         NULL, 1, ?, ?
       FROM projects
       WHERE projects.id = ?
+        AND projects.archived_at IS NULL
     `).bind(
       id,
       prefix,
@@ -1466,15 +1485,12 @@ async function createTask(env, input, actor) {
           WHERE id = ?
         ),
         updated_at = ?
-      WHERE id = ?
+      WHERE id = ? AND archived_at IS NULL
     `).bind(suffixStart, id, timestamp, input.projectId),
   ]);
   if (!changed(results[0]) || !changed(results[1])) {
-    throw new ApiError(
-      404,
-      "PROJECT_NOT_FOUND",
-      `Project '${input.projectId}' does not exist`,
-    );
+    await requireActiveProject(env, input.projectId);
+    throw new ApiError(409, "WRITE_CONFLICT", "Task intake could not reserve a project identifier");
   }
   return getTask(env, id);
 }
@@ -2070,8 +2086,7 @@ async function getWorkflow(env, projectId) {
 }
 
 async function saveWorkflow(env, projectId, expectedVersion, workspace) {
-  const project = await requireProject(env, projectId);
-  if (project.archived_at !== null) throw new ApiError(409, "PROJECT_ARCHIVED", `Project '${projectId}' is archived`);
+  await requireActiveProject(env, projectId);
   const current = await env.DB.prepare(`
     SELECT version FROM workflow_workspaces WHERE project_id = ?
   `).bind(projectId).first();
@@ -2090,6 +2105,11 @@ async function saveWorkflow(env, projectId, expectedVersion, workspace) {
       UPDATE workflow_workspaces
       SET workspace = ?, version = version + 1, updated_at = ?
       WHERE project_id = ? AND version = ?
+        AND EXISTS (
+          SELECT 1 FROM projects
+          WHERE projects.id = workflow_workspaces.project_id
+            AND projects.archived_at IS NULL
+        )
     `).bind(
       JSON.stringify(workspace),
       timestamp,
@@ -2097,6 +2117,7 @@ async function saveWorkflow(env, projectId, expectedVersion, workspace) {
       expectedVersion,
     ).run();
     if (!changed(result)) {
+      await requireActiveProject(env, projectId);
       const latest = await env.DB.prepare(`
         SELECT version FROM workflow_workspaces WHERE project_id = ?
       `).bind(projectId).first();
@@ -2109,12 +2130,16 @@ async function saveWorkflow(env, projectId, expectedVersion, workspace) {
     }
   } else {
     try {
-      await env.DB.prepare(`
+      const result = await env.DB.prepare(`
         INSERT INTO workflow_workspaces (project_id, workspace, version, updated_at)
-        VALUES (?, ?, 1, ?)
-      `).bind(projectId, JSON.stringify(workspace), timestamp).run();
+        SELECT projects.id, ?, 1, ?
+        FROM projects
+        WHERE projects.id = ? AND projects.archived_at IS NULL
+      `).bind(JSON.stringify(workspace), timestamp, projectId).run();
+      if (!changed(result)) await requireActiveProject(env, projectId);
     } catch (error) {
       if (String(error.message).includes("UNIQUE constraint failed")) {
+        await requireActiveProject(env, projectId);
         const latest = await env.DB.prepare(`
           SELECT version FROM workflow_workspaces WHERE project_id = ?
         `).bind(projectId).first();

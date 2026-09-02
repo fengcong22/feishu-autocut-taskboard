@@ -1336,6 +1336,10 @@ export class TaskboardDatabase {
       const row = this.database.prepare("SELECT id, source FROM projects WHERE id = ?").get(id);
       if (!row) throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${id}' does not exist`);
       if (row.source !== "feishu") throw new ApiError(409, "PROJECT_SOURCE_MISMATCH", "Project source does not match Feishu");
+      const subject = this.database.prepare("SELECT subject_key, project_id FROM feishu_subjects WHERE project_id = ?").get(id);
+      if (!subject || subject.project_id !== feishuSubjectProjectId(subject.subject_key)) {
+        throw new ApiError(409, "PROJECT_SOURCE_MISMATCH", "Feishu subject project identity is invalid");
+      }
       this.database.prepare("UPDATE projects SET archived_at = ?, updated_at = ? WHERE id = ?").run(archived ? now() : null, now(), id);
       return this.getProject(id);
     };
@@ -1347,12 +1351,29 @@ export class TaskboardDatabase {
 
   freezeSourceWorkflowState(subjectKey, transaction = null) {
     const execute = () => {
-      const subject = this.database.prepare("SELECT subject_key, project_id FROM feishu_subjects WHERE subject_key = ?").get(subjectKey);
-      if (!subject?.project_id) throw new ApiError(404, "FEISHU_SUBJECT_NOT_FOUND", `Feishu subject '${subjectKey}' does not exist`);
-      if (subject.project_id !== feishuSubjectProjectId(subject.subject_key)) {
+      const hasViewSets = this.database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'feishu_unified_view_sets'").get();
+      if (!hasViewSets) return null;
+      const subject = this.database.prepare(`
+        SELECT feishu_subjects.subject_key, feishu_subjects.project_id, projects.source
+        FROM feishu_subjects
+        LEFT JOIN projects ON projects.id = feishu_subjects.project_id
+        WHERE feishu_subjects.subject_key = ?
+      `).get(subjectKey);
+      if (!subject) {
+        throw new ApiError(404, "FEISHU_SUBJECT_NOT_FOUND", `Feishu subject '${subjectKey}' does not exist`);
+      }
+      if (subject.source !== "feishu" || subject.project_id !== feishuSubjectProjectId(subject.subject_key)) {
         throw new ApiError(409, "PROJECT_SOURCE_MISMATCH", "Feishu subject project identity is invalid");
       }
-      return this.syncSourceProjectArchived(subject.project_id, true, "feishu", this.database);
+      const result = this.database.prepare(`
+        UPDATE feishu_unified_view_sets
+        SET active_view_id = 'all', read_only = 1, updated_at = ?
+        WHERE subject_key = ?
+      `).run(now(), subjectKey);
+      return result.changes === 0 ? null : this.database.prepare(`
+        SELECT subject_key, active_view_id, read_only, revision, updated_at
+        FROM feishu_unified_view_sets WHERE subject_key = ?
+      `).get(subjectKey);
     };
     if (transaction && typeof transaction.prepare === "function") return execute();
     if (typeof transaction === "function") return transaction(execute);
@@ -1378,7 +1399,12 @@ export class TaskboardDatabase {
     result.feishuOrigins = taskCount("feishu_task_origins");
     result.packageSnapshots = taskCount("feishu_task_package_snapshots");
     result.executions = taskCount("feishu_task_executions");
-    if (tableExists("task_relations")) result.relations = count("SELECT COUNT(*) AS count FROM task_relations JOIN tasks ON tasks.id = task_relations.source_task_id WHERE tasks.project_id = ?", id);
+    if (tableExists("task_relations")) result.relations = count(`
+      SELECT COUNT(*) AS count
+      FROM task_relations
+      WHERE EXISTS (SELECT 1 FROM tasks WHERE tasks.id = task_relations.source_task_id AND tasks.project_id = ?)
+         OR EXISTS (SELECT 1 FROM tasks WHERE tasks.id = task_relations.target_task_id AND tasks.project_id = ?)
+    `, id, id);
     if (tableExists("workflow_workspaces")) result.workflowWorkspaces = count("SELECT COUNT(*) AS count FROM workflow_workspaces WHERE project_id = ?", id);
     if (tableExists("project_summaries")) result.projectSummaries = count("SELECT COUNT(*) AS count FROM project_summaries WHERE project_id = ?", id);
     if (tableExists("ai_chat_threads")) result.aiChatThreads = count("SELECT COUNT(*) AS count FROM ai_chat_threads WHERE origin_project_id = ?", id);

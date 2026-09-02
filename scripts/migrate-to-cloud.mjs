@@ -264,6 +264,17 @@ function validateBundle(bundle) {
       throw new Error(`Cloud migration bundle is missing table '${table}'`);
     }
   }
+  if (bundle.schemaVersion === 2) {
+    for (const project of bundle.tables.projects) {
+      if (!Object.hasOwn(project, "source") || !["global", "local", "feishu"].includes(project.source)) {
+        throw new Error(`Cloud migration project '${project.id}' has an invalid source`);
+      }
+      if (!Object.hasOwn(project, "archived_at")
+        || (project.archived_at !== null && typeof project.archived_at !== "string")) {
+        throw new Error(`Cloud migration project '${project.id}' has an invalid archived_at`);
+      }
+    }
+  }
   if (!Array.isArray(bundle.attachments)) {
     throw new Error("Cloud migration bundle is missing attachment payloads");
   }
@@ -321,6 +332,7 @@ function validateBundle(bundle) {
 
 function normalizeBundle(bundle) {
   if (!bundle || ![1, SCHEMA_VERSION].includes(bundle.schemaVersion)) return bundle;
+  if (bundle.schemaVersion === SCHEMA_VERSION) return bundle;
   return {
     ...bundle,
     schemaVersion: SCHEMA_VERSION,
@@ -701,13 +713,15 @@ export async function readCloudMigrationBundle(inputDirectory) {
     attachments.push({ ...entry, body });
   }
   const bundle = {
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: manifest.schemaVersion,
     createdAt: manifest.createdAt,
     counts: manifest.counts,
     tables,
     attachments,
   };
-  return normalizeBundle(bundle);
+  const normalized = normalizeBundle(bundle);
+  validateBundle(normalized);
+  return normalized;
 }
 
 function parseOptions(args, allowed, required) {

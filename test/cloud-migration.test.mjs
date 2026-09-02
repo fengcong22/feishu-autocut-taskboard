@@ -534,6 +534,25 @@ test("migration records attachment bytes, SHA-256, and actual size", async () =>
   }
 });
 
+test("v2 migration bundles reject projects missing archive lifecycle fields", async () => {
+  const fixture = await createMigrationFixture();
+  const bundle = await createCloudMigrationBundle({
+    databasePath: fixture.databasePath,
+    attachmentsDirectory: fixture.attachmentsDirectory,
+  });
+  for (const field of ["source", "archived_at"]) {
+    const invalid = structuredClone(bundle);
+    delete invalid.tables.projects[0][field];
+    await assert.rejects(
+      () => importCloudMigrationBundle(invalid, {
+        d1: createD1Adapter(invalid),
+        r2: createR2Adapter(),
+      }),
+      new RegExp(`project.*${field}|${field}.*project`, "i"),
+    );
+  }
+});
+
 test("migration fails before import when an attachment referenced by SQLite is missing", async () => {
   const fixture = await createMigrationFixture({ missingAttachmentId: "attachment-a-comment" });
 

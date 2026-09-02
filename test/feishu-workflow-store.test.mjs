@@ -54,6 +54,15 @@ test("catalog preview creates independent Base/subject rows and deterministic pr
     assert.equal(database.database.prepare("SELECT COUNT(*) AS count FROM feishu_subjects").get().count, 1);
     const again = await store.listCatalog();
     assert.deepEqual(again, [catalog]);
+    const projectId = subjectProjectId("bas_demo:tbl_math");
+    assert.equal(database.getProject(projectId).source, "feishu");
+    database.database.prepare("UPDATE projects SET source = 'local' WHERE id = ?").run(projectId);
+    await store.upsertBasePreview(preview());
+    assert.equal(database.getProject(projectId).source, "feishu");
+    assert.throws(
+      () => database.setProjectArchived(projectId, true),
+      (error) => error.code === "PROJECT_ARCHIVE_FORBIDDEN",
+    );
   } finally {
     database.close();
     await rm(directory, { recursive: true, force: true });

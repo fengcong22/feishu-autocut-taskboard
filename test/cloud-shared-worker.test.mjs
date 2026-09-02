@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { after, before, test } from "node:test";
 
 import { createCloudWorkerHarness } from "./helpers/cloud-worker-harness.mjs";
@@ -123,6 +124,84 @@ test("cloud project archive hides history and blocks only new intake", async () 
     method: "POST", actorName: alice, json: { archived: false },
   });
   assert.equal(restored.body.project.archivedAt, null);
+});
+
+test("cloud archive races never commit intake after the archived state wins", async () => {
+  for (let index = 0; index < 8; index += 1) {
+    const projectId = `temp-archive-race-${index}`;
+    await createProject(projectId);
+    const [archive, task] = await Promise.all([
+      cloud.request(`/api/projects/${projectId}/archive`, {
+        method: "POST", actorName: alice, json: { archived: true },
+      }),
+      createTask(projectId, `Race ${index}`),
+    ]);
+    assert.equal(archive.response.status, 200);
+    if (task.response.status === 409) {
+      assert.equal(task.body.error.code, "PROJECT_ARCHIVED");
+    } else {
+      assert.equal(task.response.status, 201);
+    }
+    const after = await createTask(projectId, "After archive");
+    assert.equal(after.response.status, 409);
+    assert.equal(after.body.error.code, "PROJECT_ARCHIVED");
+  }
+});
+
+test("archived cloud projects reject workflow creates and updates", async () => {
+  await createProject("temp-archived-workflow");
+  const workspace = {
+    version: 1,
+    tabs: [{ id: "delivery", name: "Delivery" }],
+    activeWorkflowId: "delivery",
+    snapshots: {
+      delivery: {
+        nodes: [],
+        flow: { version: 2, root: { items: [] } },
+        selectedNodeId: null,
+      },
+    },
+  };
+  const created = await cloud.request("/api/projects/temp-archived-workflow/workflow-workspace", {
+    method: "PUT", actorName: alice, json: { version: 0, workspace },
+  });
+  assert.equal(created.response.status, 200);
+  await cloud.request("/api/projects/temp-archived-workflow/archive", {
+    method: "POST", actorName: alice, json: { archived: true },
+  });
+  const update = await cloud.request("/api/projects/temp-archived-workflow/workflow-workspace", {
+    method: "PUT", actorName: alice, json: { version: 1, workspace },
+  });
+  assert.equal(update.response.status, 409);
+  assert.equal(update.body.error.code, "PROJECT_ARCHIVED");
+});
+
+test("cloud intake SQL keeps the active-project predicate in each final write", async () => {
+  const source = await readFile(new URL("../cloud/src/index.mjs", import.meta.url), "utf8");
+  assert.match(source, /FROM projects[\s\S]*WHERE projects\.id = \?[\s\S]*AND projects\.archived_at IS NULL/);
+  assert.match(source, /UPDATE workflow_workspaces[\s\S]*WHERE project_id = \? AND version = \?[\s\S]*EXISTS[\s\S]*projects\.archived_at IS NULL/);
+  assert.match(source, /INSERT INTO workflow_workspaces[\s\S]*SELECT[\s\S]*FROM projects[\s\S]*archived_at IS NULL/);
+  assert.match(source, /task_relations\.source_task_id[\s\S]*tasks\.project_id = \?[\s\S]*OR EXISTS[\s\S]*task_relations\.target_task_id[\s\S]*tasks\.project_id = \?/);
+});
+
+test("cloud project association counts do not double count a same-project relation", async () => {
+  await createProject("temp-relation-same");
+  const sameSource = await createTask("temp-relation-same", "Same source");
+  const sameTarget = await createTask("temp-relation-same", "Same target");
+  const timestamp = new Date().toISOString();
+  const [sourceTaskId, targetTaskId] = [sameSource.body.task.id, sameTarget.body.task.id].sort();
+  await cloud.db.prepare(`
+    INSERT INTO task_relations (relation_type, source_task_id, target_task_id, created_at)
+    VALUES ('related', ?, ?, ?)
+  `).bind(sourceTaskId, targetTaskId, timestamp).run();
+
+  const result = await cloud.request("/api/projects/temp-relation-same", {
+    method: "DELETE",
+    actorName: alice,
+  });
+  assert.equal(result.response.status, 409);
+  assert.equal(result.body.error.code, "PROJECT_NOT_EMPTY");
+  assert.equal(result.body.error.details.associations.relations, 1);
 });
 
 test("projects, tasks, comments, relations, and workflows preserve the current API contract", async () => {

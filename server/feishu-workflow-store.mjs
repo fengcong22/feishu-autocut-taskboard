@@ -621,9 +621,10 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
                   next.displayEnabled ? 1 : 0, next.configVersion, JSON.stringify(next), JSON.stringify(metadata), timestamp, timestamp);
             }
             db.prepare(`INSERT INTO projects
-              (id, name, workspace_path, next_task_number, created_at, updated_at)
-              VALUES (?, ?, NULL, 1, ?, ?)
-              ON CONFLICT(id) DO UPDATE SET name=excluded.name, updated_at=excluded.updated_at`)
+              (id, name, workspace_path, source, archived_at, next_task_number, created_at, updated_at)
+              VALUES (?, ?, NULL, 'feishu', NULL, 1, ?, ?)
+              ON CONFLICT(id) DO UPDATE SET name=excluded.name, source='feishu', archived_at=NULL,
+                updated_at=excluded.updated_at`)
               .run(next.projectId, next.tableName, timestamp, timestamp);
             saveVersion({ subject_key: next.subjectKey }, next, next.configVersion, timestamp);
           }
@@ -686,7 +687,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
               db.prepare("UPDATE feishu_subjects SET removed_at = NULL, updated_at = ? WHERE subject_key = ?")
                 .run(timestamp, key);
             }
-            db.prepare("UPDATE projects SET name = ?, updated_at = ? WHERE id = ?")
+            db.prepare("UPDATE projects SET name = ?, source = 'feishu', archived_at = NULL, updated_at = ? WHERE id = ?")
               .run(tableName, timestamp, subjectProjectId(key));
           } else {
             const initial = validate({
@@ -710,9 +711,10 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
               VALUES (?, ?, ?, ?, ?, 0, 'draft', 1, ?, ?, ?, ?)`)
               .run(key, baseToken, tableId, tableName, subjectProjectId(key), JSON.stringify(initial), JSON.stringify(metadata), timestamp, timestamp);
             db.prepare(`INSERT INTO projects
-              (id, name, workspace_path, next_task_number, created_at, updated_at)
-              VALUES (?, ?, NULL, 1, ?, ?)
-              ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at`)
+              (id, name, workspace_path, source, archived_at, next_task_number, created_at, updated_at)
+              VALUES (?, ?, NULL, 'feishu', NULL, 1, ?, ?)
+              ON CONFLICT(id) DO UPDATE SET name = excluded.name, source = 'feishu', archived_at = NULL,
+                updated_at = excluded.updated_at`)
               .run(subjectProjectId(key), tableName, timestamp, timestamp);
             saveVersion({ subject_key: key }, initial, 1, timestamp);
           }
