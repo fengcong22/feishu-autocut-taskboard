@@ -6,7 +6,8 @@ const board = await readFile(new URL("../web/src/components/WorkflowBoard.tsx", 
 const node = await readFile(new URL("../web/src/components/WorkflowNode.tsx", import.meta.url), "utf8");
 const inspector = await readFile(new URL("../web/src/components/WorkflowInspector.tsx", import.meta.url), "utf8");
 const picker = await readFile(new URL("../web/src/components/WorkflowStepPicker.tsx", import.meta.url), "utf8");
-const catalog = await readFile(new URL("../web/src/components/workflowCatalog.ts", import.meta.url), "utf8");
+const catalog = (await readFile(new URL("../web/src/components/workflowCatalog.ts", import.meta.url), "utf8"))
+  .replace(/\r\n/g, "\n");
 const styles = await readFile(new URL("../web/src/components/workflow.css", import.meta.url), "utf8");
 const globalStyles = await readFile(new URL("../web/src/styles.css", import.meta.url), "utf8");
 const controlFlow = await readFile(new URL("../shared/workflow-control-flow.mjs", import.meta.url), "utf8");

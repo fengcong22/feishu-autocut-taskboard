@@ -4,6 +4,7 @@ dist/
 .wrangler/
 .dev.vars*
 .tmp/
+.runtime/
 cloud-migration-exports/
 .playwright-cli/
 *.log
