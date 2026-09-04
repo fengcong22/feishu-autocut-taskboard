@@ -234,6 +234,12 @@ Each device keeps its own project checkout mapping and continues to use a local 
 
 See [Cloud collaboration](docs/cloud-collaboration.md) for owner deployment, existing GitHub installation setup, password rotation, local path mapping, and the one-time local-data migration flow.
 
+## License and source
+
+This standalone distribution is published at [fengcong22/feishu-autocut-taskboard](https://github.com/fengcong22/feishu-autocut-taskboard). It is based on the upstream [chuspeeism/dashi-taskboard](https://github.com/chuspeeism/dashi-taskboard) project; the current Feishu Auto-Cut feature version is maintained in this independent repository.
+
+Unless a file or a third-party notice says otherwise, project contributions in this repository are licensed under the [Apache License 2.0](LICENSE). See [NOTICE.md](NOTICE.md) for the source history, third-party materials, and the scope of the repository-level license. Third-party product names and logos remain subject to their respective owners' terms.
+
 ## Verify
 
 ```bash

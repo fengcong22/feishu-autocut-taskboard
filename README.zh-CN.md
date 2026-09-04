@@ -227,6 +227,12 @@ Bridge 用下面的回环接口做生命周期同步：
 
 请参阅[云端协作](docs/cloud-collaboration.md)，了解所有者部署、现有 GitHub 安装设置、密码轮换、本地路径映射和一次性本地数据迁移流程。
 
+## 许可证与来源
+
+当前独立发布地址是 [fengcong22/feishu-autocut-taskboard](https://github.com/fengcong22/feishu-autocut-taskboard)。本项目基于上游 [chuspeeism/dashi-taskboard](https://github.com/chuspeeism/dashi-taskboard)，当前飞书 Auto-Cut 功能版本在这个独立仓库中维护。
+
+除文件自身或第三方说明另有规定外，本仓库中的项目贡献均按 [Apache 2.0 许可证](LICENSE) 发布。来源历史、第三方材料和仓库级许可证的适用范围见 [NOTICE.md](NOTICE.md)。飞书、Codex、剪映、LobeHub、X 等产品名称和标志仍受其各自所有者的条款约束。
+
 ## 验证
 
 ```bash
