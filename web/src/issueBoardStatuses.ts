@@ -22,3 +22,4 @@ export const OTHER_TASK_TABS = [
 export type MainTaskStatus = (typeof MAIN_STATUSES)[number];
 export type SecondaryTaskStatus = (typeof SECONDARY_STATUSES)[number];
 export type OtherTaskTab = (typeof OTHER_TASK_TABS)[number];
+export type OtherTasksPanelTab = OtherTaskTab | "ordinary";

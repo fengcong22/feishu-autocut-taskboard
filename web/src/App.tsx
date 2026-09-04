@@ -31,21 +31,27 @@ import {
   getCodexThreadProgress,
   getHostRuntime,
   getTaskboardRevision,
+  getUnifiedWorkflowStageDisplays,
+  getUnifiedWorkflowViews,
   getWorkflowWorkspace,
   getTaskboardMetadata,
+  listArtifactUploads,
   listArchivedTasks,
   listDevelopmentContexts,
   listDeviceWorkspaces,
   listFeishuWorkflowCatalog,
   listProjects,
+  listTaskArtifactSummaries,
   listTasks,
   moveTask as moveTaskRequest,
   publishHostRuntime,
   removeTaskRelation,
   resolveTaskboardUrl,
   restoreTask as restoreTaskRequest,
+  retryTaskArtifactUpload,
   setApiText,
   setCurrentUserActor,
+  setProjectArchived,
   startTaskWithCodex,
   uploadAttachment,
   updateTask as updateTaskRequest,
@@ -59,6 +65,10 @@ import { BoardColumn } from "./components/BoardColumn";
 import { AiChat, type AiChatOpenThreadRequest } from "./components/AiChat";
 import { DashboardView } from "./components/DashboardView";
 import { ArtifactUploadView } from "./components/ArtifactUploadView";
+import {
+  UnifiedWorkflowBoard,
+  type UnifiedWorkflowStage,
+} from "./components/UnifiedWorkflowBoard";
 import { IssueListView } from "./components/IssueListView";
 import { OtherTasksPanel } from "./components/OtherTasksPanel";
 import {
@@ -74,6 +84,8 @@ import { FeishuBaseNavigator } from "./components/FeishuBaseNavigator";
 import { FeishuWorkflowPanel } from "./components/FeishuWorkflowPanel";
 import { FeishuPackageManager } from "./components/FeishuPackageManager";
 import { BoardStageSettings } from "./components/BoardStageSettings";
+import { UnifiedWorkflowStageSettings } from "./components/UnifiedWorkflowStageSettings";
+import { UnifiedWorkflowViewControls } from "./components/UnifiedWorkflowViewControls";
 import {
   addFeishuBaseFromUrl,
   removeFeishuBase,
@@ -97,7 +109,7 @@ import {
 } from "./i18n";
 import {
   MAIN_STATUSES,
-  type OtherTaskTab,
+  type OtherTasksPanelTab,
 } from "./issueBoardStatuses";
 import { DEFAULT_LABELS } from "./labels";
 import {
@@ -118,14 +130,18 @@ import {
   TASK_STATUSES,
   type ActorIdentity,
   type AiChatThread,
+  type ArtifactUploadListItem,
   type DevelopmentScan,
   type HostContext,
   type IssueRelationType,
   type Project,
+  type StageDisplayOverride,
   type Task,
+  type TaskArtifactSummary,
   type TaskboardMetadata,
   type TaskDraft,
   type TaskStatus,
+  type UnifiedWorkflowViewsState,
   type WorkflowOption,
 } from "./types";
 import {
@@ -136,13 +152,32 @@ import {
 // The poller stays in ESM JavaScript so its lifecycle can be tested directly with node:test.
 // @ts-expect-error The module's option contract is enforced by its focused node tests.
 import { createRevisionPoller, getRevisionPollingInterval } from "./revisionPolling.mjs";
+// These selection rules stay runtime-independent so history navigation can be regression-tested.
+// @ts-expect-error The helper's structural inputs are enforced at its call sites.
+import { findFeishuSubjectKeyForProject, resolveProjectIdAfterRefresh } from "./projectSelection.mjs";
+// The classifier is intentionally kept in ESM JavaScript so node:test can use it directly.
+// @ts-expect-error The helper has no runtime-dependent TypeScript surface.
+import { classifyUnifiedStage } from "./unifiedWorkflow.mjs";
+// Browser-only board preferences are removed with the owning project.
+// @ts-expect-error The helper's storage contract is covered by focused node tests.
+import { clearUnifiedWorkflowLayoutsForProject } from "./unifiedWorkflowLayout.mjs";
+// The drop predicate stays runtime-independent so it can be shared with focused node tests.
+// @ts-expect-error The helper's structural contract is covered by node tests.
+import { canDropUnifiedWorkflowTask } from "./unifiedWorkflowDropGuard.mjs";
 
 type ConnectionState = "connecting" | "live" | "reconnecting";
 type Theme = "light" | "dark";
 type BoardView = "dashboard" | "issues" | "list" | "gantt" | "workflow" | "completed_editing"
   | "upload_queue" | "uploading" | "uploaded" | "autocut_packages";
+type BoardColumnScrollKey = TaskStatus | UnifiedWorkflowStage;
 type DetailSourceScroll =
-  | { projectId: string; view: "issues"; status: TaskStatus; scrollTop: number }
+  | {
+    projectId: string;
+    view: "issues";
+    columnKey: BoardColumnScrollKey;
+    scrollTop: number;
+    scrollLeft: number;
+  }
   | { projectId: string; view: "list" | "completed_editing"; scrollTop: number };
 type GanttZoom = "day" | "week" | "month";
 type ActionError = string | readonly [string, string];
@@ -175,6 +210,9 @@ interface ProjectChoice {
   id: string;
   name: string;
   issueCount: number;
+  archivedIssueCount: number;
+  archivedAt: string | null;
+  source: Project["source"];
   inCodex: boolean;
   persisted: boolean;
 }
@@ -183,6 +221,11 @@ interface ProjectContextMenuState {
   project: ProjectChoice;
   x: number;
   y: number;
+}
+
+interface ProjectDeleteAssociations {
+  total: number;
+  tasks: number;
 }
 
 interface UndoOperation {
@@ -307,6 +350,12 @@ function readIssueActivityKeys(storageKey: string): Record<string, string> {
 
 function readProjectBoardView(projectId: string): BoardView {
   const view = taskboardStorage.getItem(`${PROJECT_VIEW_KEY_PREFIX}${projectId}`);
+  if (view === "completed_editing" || view === "upload_queue" || view === "uploading" || view === "uploaded") {
+    // These views predate the single Feishu workflow board. Keep the stored
+    // value readable for older clients, but open the project in the unified view.
+    taskboardStorage.setItem(`${PROJECT_VIEW_KEY_PREFIX}${projectId}`, "issues");
+    return "issues";
+  }
   return view === "dashboard" || view === "list" || view === "gantt" || view === "issues" || view === "completed_editing"
     || view === "upload_queue" || view === "uploading" || view === "uploaded" || view === "workflow" || view === "autocut_packages"
     ? view
@@ -343,6 +392,7 @@ const EVENT_NAMES = [
   "autocut.package.updated",
   "board-stage-labels.updated",
   "project.created",
+  "project.updated",
   "workflow.updated",
 ] as const;
 
@@ -509,6 +559,10 @@ interface LocalRealtimeSyncProps {
     projectId: string,
     options?: { quiet?: boolean; signal?: AbortSignal },
   ) => Promise<void>;
+  refreshArtifactUploads: (
+    projectId: string,
+    options?: { quiet?: boolean; signal?: AbortSignal },
+  ) => Promise<void>;
   refreshWorkflowOptions: (projectId: string, signal?: AbortSignal) => Promise<void>;
   setConnection: Dispatch<SetStateAction<ConnectionState>>;
   setCommentsRevision: Dispatch<SetStateAction<number>>;
@@ -522,6 +576,7 @@ function LocalRealtimeSync({
   detailTaskId,
   refreshProjectList,
   refreshTasks,
+  refreshArtifactUploads,
   refreshWorkflowOptions,
   setConnection,
   setCommentsRevision,
@@ -559,7 +614,7 @@ function LocalRealtimeSync({
       }
       const affectsSelectedProject = Boolean(selectedProjectId)
         && (!payload.projectId || payload.projectId === selectedProjectId);
-      if (event.type === "project.created") {
+      if (event.type === "project.created" || event.type === "project.updated") {
         scheduleRefresh({ projects: true });
         return;
       }
@@ -588,6 +643,9 @@ function LocalRealtimeSync({
         return;
       }
       if (event.type.startsWith("attachment.") || event.type.startsWith("artifact.")) {
+        if (event.type.startsWith("artifact.")) {
+          void refreshArtifactUploads(selectedProjectId, { quiet: true });
+        }
         if (!detailTaskId || !payload.taskId || payload.taskId === detailTaskId) {
           setAttachmentsRevision((current) => current + 1);
           if (event.type.startsWith("attachment.")) {
@@ -602,7 +660,10 @@ function LocalRealtimeSync({
       setConnection("live");
       scheduleRefresh({ projects: true, tasks: Boolean(selectedProjectId) });
       void getBoardStageLabels().then(setBoardStageLabels).catch(() => {});
-      if (selectedProjectId) void refreshWorkflowOptions(selectedProjectId);
+      if (selectedProjectId) {
+        void refreshArtifactUploads(selectedProjectId, { quiet: true });
+        void refreshWorkflowOptions(selectedProjectId);
+      }
       if (detailTaskId) {
         setCommentsRevision((current) => current + 1);
         setAttachmentsRevision((current) => current + 1);
@@ -618,6 +679,7 @@ function LocalRealtimeSync({
   }, [
     detailTaskId,
     refreshProjectList,
+    refreshArtifactUploads,
     refreshTasks,
     refreshWorkflowOptions,
     selectedProjectId,
@@ -668,6 +730,11 @@ export function App() {
   const [archivedTasks, setArchivedTasks] = useState<Task[]>([]);
   const [tasksLoading, setTasksLoading] = useState(false);
   const [hasLoadedTasks, setHasLoadedTasks] = useState(false);
+  const [artifactUploadItems, setArtifactUploadItems] = useState<ArtifactUploadListItem[]>([]);
+  const [taskArtifactSummaries, setTaskArtifactSummaries] = useState<TaskArtifactSummary[]>([]);
+  const [artifactUploadsLoading, setArtifactUploadsLoading] = useState(false);
+  const [artifactUploadsError, setArtifactUploadsError] = useState<string | null>(null);
+  const [retryingArtifactUploadIds, setRetryingArtifactUploadIds] = useState<Set<string>>(() => new Set());
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<ActionError | null>(null);
   const actionErrorText = actionError === null
@@ -687,7 +754,7 @@ export function App() {
   const [otherTasksOpen, setOtherTasksOpen] = useState(false);
   const [otherTasksMounted, setOtherTasksMounted] = useState(false);
   const [otherTasksVisible, setOtherTasksVisible] = useState(false);
-  const [otherTasksTab, setOtherTasksTab] = useState<OtherTaskTab>("backlog");
+  const [otherTasksTab, setOtherTasksTab] = useState<OtherTasksPanelTab>("backlog");
   const [restoringTaskId, setRestoringTaskId] = useState<string | null>(null);
   const [pendingArchivedTaskDelete, setPendingArchivedTaskDelete] = useState<Task | null>(null);
   const [deletingArchivedTaskId, setDeletingArchivedTaskId] = useState<string | null>(null);
@@ -704,6 +771,16 @@ export function App() {
   const [feishuCatalog, setFeishuCatalog] = useState<import("./types").FeishuBaseCatalog[]>([]);
   const [selectedFeishuSubjectKey, setSelectedFeishuSubjectKey] = useState<string | null>(null);
   const [feishuConfigurationBaseToken, setFeishuConfigurationBaseToken] = useState<string | null>(null);
+  const [feishuConfigurationOpen, setFeishuConfigurationOpen] = useState(false);
+  const [unifiedViewsState, setUnifiedViewsState] = useState<UnifiedWorkflowViewsState | null>(null);
+  const unifiedViewsStateRef = useRef(unifiedViewsState);
+  unifiedViewsStateRef.current = unifiedViewsState;
+  const [unifiedStageDisplays, setUnifiedStageDisplays] = useState<StageDisplayOverride[]>([]);
+  const [unifiedStageDisplaysLoadedFor, setUnifiedStageDisplaysLoadedFor] = useState<string | null>(null);
+  const [unifiedViewsLoading, setUnifiedViewsLoading] = useState(false);
+  const [unifiedViewsError, setUnifiedViewsError] = useState<string | null>(null);
+  const [unifiedViewsReloadRevision, setUnifiedViewsReloadRevision] = useState(0);
+  const [unifiedSearchScope, setUnifiedSearchScope] = useState<"activeView" | "allStages">("activeView");
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [draggedTaskId, setDraggedTaskId] = useState<string | null>(null);
   const [draggedTaskHeight, setDraggedTaskHeight] = useState(0);
@@ -716,11 +793,13 @@ export function App() {
   const [projectMenuOpen, setProjectMenuOpen] = useState(
     () => taskboardStorage.getItem(FIRST_USE_COMPLETE_KEY) === null,
   );
+  const [projectHistoryOpen, setProjectHistoryOpen] = useState(false);
+  const [projectLifecyclePendingId, setProjectLifecyclePendingId] = useState<string | null>(null);
   const [projectContextMenu, setProjectContextMenu] = useState<ProjectContextMenuState | null>(null);
   const [projectCreateOpen, setProjectCreateOpen] = useState(false);
   const [projectName, setProjectName] = useState("");
   const [pendingProjectDelete, setPendingProjectDelete] = useState<ProjectChoice | null>(null);
-  const [projectDeleteIssueCount, setProjectDeleteIssueCount] = useState<number | null>(null);
+  const [projectDeleteAssociations, setProjectDeleteAssociations] = useState<ProjectDeleteAssociations | null>(null);
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
   const [deviceWorkspacePaths, setDeviceWorkspacePaths] = useState(readDeviceWorkspacePaths);
   const [projectAutomations, setProjectAutomations] = useState(readProjectAutomations);
@@ -732,14 +811,22 @@ export function App() {
   const projectRequestAbortControllerRef = useRef<AbortController | null>(null);
   const feishuCatalogRequestGenerationRef = useRef(0);
   const feishuCatalogAbortControllerRef = useRef<AbortController | null>(null);
+  const unifiedViewsRequestGenerationRef = useRef(0);
+  const unifiedViewsAbortControllerRef = useRef<AbortController | null>(null);
+  const unifiedStageDisplaysRequestGenerationRef = useRef(0);
+  const unifiedStageDisplaysAbortControllerRef = useRef<AbortController | null>(null);
   const tasksRequestRef = useRef(0);
+  const artifactUploadsRequestRef = useRef(0);
+  const retryingArtifactUploadIdsRef = useRef(new Set<string>());
   const tasksRef = useRef<Task[]>([]);
   const undoSequenceRef = useRef(0);
   const undoStackRef = useRef<UndoOperation[]>([]);
   const undoInFlightRef = useRef(false);
+  const movingTaskRef = useRef<string | null>(null);
   const dragRegionRef = useRef<HTMLDivElement>(null);
   const issueListRef = useRef<HTMLDivElement>(null);
-  const boardColumnScrollRefs = useRef<Partial<Record<TaskStatus, HTMLDivElement | null>>>({});
+  const unifiedWorkflowScrollRef = useRef<HTMLDivElement>(null);
+  const boardColumnScrollRefs = useRef<Partial<Record<BoardColumnScrollKey, HTMLDivElement | null>>>({});
   const pendingDetailSourceScrollRef = useRef<DetailSourceScroll | null>(null);
   const selectedProjectIdRef = useRef(selectedProjectId);
   selectedProjectIdRef.current = selectedProjectId;
@@ -758,6 +845,16 @@ export function App() {
     selectedFeishuSubjectKeyRef.current = subjectKey;
     return { controller, generation: ++projectRequestGenerationRef.current };
   }, []);
+
+  function projectRequestIsCurrent(
+    projectId: string,
+    subjectKey: string | null,
+    generation: number,
+  ) {
+    return generation === projectRequestGenerationRef.current
+      && selectedProjectIdRef.current === projectId
+      && selectedFeishuSubjectKeyRef.current === subjectKey;
+  }
 
   useEffect(() => {
     const { controller } = beginProjectRequestContext(selectedProjectId, selectedFeishuSubjectKey);
@@ -820,6 +917,50 @@ export function App() {
   }, []);
 
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
+  const selectedFeishuSubject = useMemo(() => {
+    const subjects = feishuCatalog.flatMap((base) => base.subjects);
+    return subjects.find((subject) => (
+      subject.projectId === selectedProjectId && subject.subjectKey === selectedFeishuSubjectKey
+    ))
+      ?? subjects.find((subject) => subject.projectId === selectedProjectId)
+      ?? null;
+  }, [feishuCatalog, selectedFeishuSubjectKey, selectedProjectId]);
+  const selectedFeishuWorkflowSubjectKey = useMemo(() => (
+    findFeishuSubjectKeyForProject(
+      selectedProjectId,
+      selectedFeishuSubject?.subjectKey ?? null,
+      tasks,
+      archivedTasks,
+      selectedProject?.subjectKey ?? null,
+    ) as string | null
+  ), [archivedTasks, selectedFeishuSubject?.subjectKey, selectedProject?.subjectKey, selectedProjectId, tasks]);
+  const selectedFeishuWorkflowSubjectKeyRef = useRef(selectedFeishuWorkflowSubjectKey);
+  selectedFeishuWorkflowSubjectKeyRef.current = selectedFeishuWorkflowSubjectKey;
+  const isSelectedFeishuProject = selectedProjectId !== GLOBAL_PROJECT_ID
+    && (
+      selectedProject?.source === "feishu"
+      || Boolean(selectedFeishuSubject)
+      || tasks.some((task) => task.projectId === selectedProjectId && isFeishuWorkflowTask(task))
+    );
+  useEffect(() => {
+    if (!isSelectedFeishuProject && otherTasksTab === "ordinary") {
+      setOtherTasksTab("backlog");
+    }
+  }, [isSelectedFeishuProject, otherTasksTab]);
+  useLayoutEffect(() => {
+    if (isSelectedFeishuProject && boardView === "workflow" && !feishuConfigurationOpen) {
+      setBoardView("issues");
+      taskboardStorage.setItem(`${PROJECT_VIEW_KEY_PREFIX}${selectedProjectId}`, "issues");
+    }
+  }, [boardView, feishuConfigurationOpen, isSelectedFeishuProject, selectedProjectId]);
+  const unifiedWorkflowTasks = useMemo(() => {
+    const projectTasks = tasks.filter((task) => task.projectId === selectedProjectId);
+    if (!selectedFeishuWorkflowSubjectKey) return projectTasks;
+    return projectTasks.filter((task) => (
+      !task.feishuOrigin?.subjectKey
+      || task.feishuOrigin.subjectKey === selectedFeishuWorkflowSubjectKey
+    ));
+  }, [selectedFeishuWorkflowSubjectKey, selectedProjectId, tasks]);
   useLayoutEffect(() => {
     if (selectedProject) rememberProjectOpen(selectedProject.id);
   }, [rememberProjectOpen, selectedProject]);
@@ -921,6 +1062,9 @@ export function App() {
           ? text("全局", "Global")
           : persistedById.get(project.id)?.name ?? project.name,
         issueCount: persistedById.get(project.id)?.issueCount ?? 0,
+        archivedIssueCount: persistedById.get(project.id)?.archivedIssueCount ?? 0,
+        archivedAt: persistedById.get(project.id)?.archivedAt ?? null,
+        source: persistedById.get(project.id)?.source ?? (project.id === GLOBAL_PROJECT_ID ? "global" : "local"),
         inCodex: true,
         persisted: persistedById.has(project.id),
       });
@@ -931,6 +1075,9 @@ export function App() {
         id: project.id,
         name: project.id === GLOBAL_PROJECT_ID ? text("全局", "Global") : project.name,
         issueCount: project.issueCount,
+        archivedIssueCount: project.archivedIssueCount,
+        archivedAt: project.archivedAt,
+        source: project.source,
         inCodex: false,
         persisted: true,
       });
@@ -941,6 +1088,14 @@ export function App() {
       - (recentOrder.get(right.id) ?? recentProjectIds.length)
     ));
   }, [hostContext?.projects, projects, recentProjectIds, text]);
+  const activeProjectChoices = useMemo(
+    () => projectChoices.filter((project) => project.archivedAt === null),
+    [projectChoices],
+  );
+  const historicalProjectChoices = useMemo(
+    () => projectChoices.filter((project) => project.archivedAt !== null),
+    [projectChoices],
+  );
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
   const issueReadStorageKey = selectedProjectId
     ? `${ISSUE_READ_KEY_PREFIX}:${taskboardMetadata?.mode ?? "local"}:${selectedProjectId}`
@@ -1215,7 +1370,16 @@ export function App() {
     drainQueuedAutomationSaves,
   ]);
 
-  function openTaskDetail(task: Pick<Task, "identifier" | "projectId">) {
+  function detailColumnKey(task: Task, stage?: UnifiedWorkflowStage): BoardColumnScrollKey {
+    if (stage) return stage;
+    const uploads = artifactUploadItems.map((item) => item.upload);
+    return (classifyUnifiedStage(task, uploads) as UnifiedWorkflowStage | null) ?? task.status;
+  }
+
+  function openTaskDetail(
+    task: Pick<Task, "identifier" | "projectId">,
+    stage?: UnifiedWorkflowStage,
+  ) {
     const fullTask = tasksRef.current.find((candidate) => candidate.identifier === task.identifier);
     if (fullTask) markTaskRead(fullTask);
     if ((boardView === "list" || boardView === "completed_editing") && issueListRef.current) {
@@ -1225,13 +1389,15 @@ export function App() {
         scrollTop: issueListRef.current.scrollTop,
       };
     } else if (boardView === "issues" && fullTask) {
-      const scrollContainer = boardColumnScrollRefs.current[fullTask.status];
+      const columnKey = detailColumnKey(fullTask, stage);
+      const scrollContainer = boardColumnScrollRefs.current[columnKey];
       if (scrollContainer) {
         pendingDetailSourceScrollRef.current = {
           projectId: selectedProjectId,
           view: "issues",
-          status: fullTask.status,
+          columnKey,
           scrollTop: scrollContainer.scrollTop,
+          scrollLeft: unifiedWorkflowScrollRef.current?.scrollLeft ?? 0,
         };
       }
     }
@@ -1266,8 +1432,11 @@ export function App() {
       return;
     }
     const scrollContainer = pendingScroll.view === "issues"
-      ? boardColumnScrollRefs.current[pendingScroll.status]
+      ? boardColumnScrollRefs.current[pendingScroll.columnKey]
       : issueListRef.current;
+    if (pendingScroll.view === "issues" && unifiedWorkflowScrollRef.current) {
+      unifiedWorkflowScrollRef.current.scrollLeft = pendingScroll.scrollLeft;
+    }
     pendingDetailSourceScrollRef.current = null;
     if (!scrollContainer) return;
     scrollContainer.scrollTop = pendingScroll.scrollTop;
@@ -1292,15 +1461,15 @@ export function App() {
         const routeTask = tasksRef.current.find(
           (task) => task.identifier === routeIssueIdentifier,
         );
-        const scrollContainer = routeTask
-          ? boardColumnScrollRefs.current[routeTask.status]
-          : null;
-        if (routeTask && scrollContainer) {
+        const columnKey = routeTask ? detailColumnKey(routeTask) : null;
+        const scrollContainer = columnKey ? boardColumnScrollRefs.current[columnKey] : null;
+        if (routeTask && columnKey && scrollContainer) {
           pendingDetailSourceScrollRef.current = {
             projectId: selectedProjectId,
             view: "issues",
-            status: routeTask.status,
+            columnKey,
             scrollTop: scrollContainer.scrollTop,
+            scrollLeft: unifiedWorkflowScrollRef.current?.scrollLeft ?? 0,
           };
         }
       }
@@ -1309,6 +1478,7 @@ export function App() {
       const routeSubject = feishuCatalogRef.current
         .flatMap((base) => base.subjects)
         .find((subject) => subject.projectId === routeProjectId);
+      clearRemovedFeishuSelectionState();
       beginProjectRequestContext(routeProjectId, routeSubject?.subjectKey ?? null);
       setBoardView(readProjectBoardView(routeProjectId));
       setSelectedProjectId(routeProjectId);
@@ -1317,7 +1487,7 @@ export function App() {
 
     window.addEventListener("popstate", syncRouteFromLocation);
     return () => window.removeEventListener("popstate", syncRouteFromLocation);
-  }, [beginProjectRequestContext, boardView, selectedProjectId]);
+  }, [artifactUploadItems, beginProjectRequestContext, boardView, selectedProjectId]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -1521,7 +1691,7 @@ export function App() {
     setLoadError(null);
     try {
       const [nextProjects, metadata, workspaces, stageLabels] = await Promise.all([
-        listProjects(requestSignal),
+        listProjects({ includeArchived: true, signal: requestSignal }),
         getTaskboardMetadata(requestSignal),
         listDeviceWorkspaces(requestSignal),
         getBoardStageLabels(requestSignal),
@@ -1551,13 +1721,11 @@ export function App() {
       });
       setProjects(nextProjects);
       const fromQuery = new URLSearchParams(window.location.search).get("project");
-      const nextProjectId = fromQuery && nextProjects.some((project) => project.id === fromQuery)
-        ? fromQuery
-        : nextProjects.some((project) => project.id === projectId)
-          ? projectId
-          : nextProjects.find((project) => project.id === GLOBAL_PROJECT_ID)?.id
-            ?? nextProjects[0]?.id
-            ?? GLOBAL_PROJECT_ID;
+      const nextProjectId = resolveProjectIdAfterRefresh(nextProjects, {
+        requestedProjectId: fromQuery,
+        currentProjectId: projectId,
+        globalProjectId: GLOBAL_PROJECT_ID,
+      }) as string;
       if (nextProjectId !== projectId) {
         const nextSubject = feishuCatalogRef.current
           .flatMap((base) => base.subjects)
@@ -1585,7 +1753,10 @@ export function App() {
     const projectId = selectedProjectIdRef.current;
     const subjectKey = selectedFeishuSubjectKeyRef.current;
     try {
-      const nextProjects = await listProjects(projectRequestAbortControllerRef.current?.signal);
+      const nextProjects = await listProjects({
+        includeArchived: true,
+        signal: projectRequestAbortControllerRef.current?.signal,
+      });
       if (requestGeneration !== projectRequestGenerationRef.current
         || selectedProjectIdRef.current !== projectId
         || selectedFeishuSubjectKeyRef.current !== subjectKey) return;
@@ -1598,7 +1769,7 @@ export function App() {
         setLoadError(errorMessage(error));
       }
     }
-  }, []);
+  }, [beginProjectRequestContext]);
 
   const refreshTasks = useCallback(async (
     projectId: string,
@@ -1639,6 +1810,45 @@ export function App() {
     }
   }, []);
 
+  const refreshArtifactUploads = useCallback(async (
+    projectId: string,
+    options: { quiet?: boolean; signal?: AbortSignal } = {},
+  ) => {
+    const requestId = ++artifactUploadsRequestRef.current;
+    const requestGeneration = projectRequestGenerationRef.current;
+    const subjectKey = selectedFeishuSubjectKeyRef.current;
+    const requestSignal = options.signal ?? projectRequestAbortControllerRef.current?.signal;
+    if (!options.quiet) setArtifactUploadsLoading(true);
+    try {
+      const [next, nextArtifactSummaries] = await Promise.all([
+        listArtifactUploads(projectId, requestSignal),
+        listTaskArtifactSummaries(projectId, requestSignal),
+      ]);
+      if (requestId !== artifactUploadsRequestRef.current
+        || requestGeneration !== projectRequestGenerationRef.current
+        || selectedProjectIdRef.current !== projectId
+        || selectedFeishuSubjectKeyRef.current !== subjectKey) return;
+      setArtifactUploadItems(next);
+      setTaskArtifactSummaries(nextArtifactSummaries);
+      setArtifactUploadsError(null);
+    } catch (error) {
+      if ((error as Error).name !== "AbortError"
+        && requestId === artifactUploadsRequestRef.current
+        && requestGeneration === projectRequestGenerationRef.current
+        && selectedProjectIdRef.current === projectId
+        && selectedFeishuSubjectKeyRef.current === subjectKey) {
+        setArtifactUploadsError(errorMessage(error));
+      }
+    } finally {
+      if (requestId === artifactUploadsRequestRef.current
+        && requestGeneration === projectRequestGenerationRef.current
+        && selectedProjectIdRef.current === projectId
+        && selectedFeishuSubjectKeyRef.current === subjectKey) {
+        setArtifactUploadsLoading(false);
+      }
+    }
+  }, []);
+
   useEffect(() => {
     if (!selectedProjectId) {
       setTasks([]);
@@ -1650,9 +1860,28 @@ export function App() {
     void refreshTasks(selectedProjectId, { signal: projectRequestAbortControllerRef.current?.signal });
   }, [refreshTasks, selectedFeishuSubjectKey, selectedProjectId]);
 
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setArtifactUploadItems([]);
+      setTaskArtifactSummaries([]);
+      setArtifactUploadsError(null);
+      setArtifactUploadsLoading(false);
+      return;
+    }
+    setArtifactUploadItems([]);
+    setTaskArtifactSummaries([]);
+    setArtifactUploadsError(null);
+    void refreshArtifactUploads(selectedProjectId, { signal: projectRequestAbortControllerRef.current?.signal });
+  }, [refreshArtifactUploads, selectedFeishuSubjectKey, selectedProjectId]);
+
   const refreshWorkflowOptions = useCallback(async (projectId: string, signal?: AbortSignal) => {
-    const record = await getWorkflowWorkspace<unknown>(projectId, signal);
-    if (!signal?.aborted) setWorkflowOptions(workflowOptionsFromWorkspace(record.workspace));
+    const requestGeneration = projectRequestGenerationRef.current;
+    const subjectKey = selectedFeishuSubjectKeyRef.current;
+    const requestSignal = signal ?? projectRequestAbortControllerRef.current?.signal;
+    const record = await getWorkflowWorkspace<unknown>(projectId, requestSignal);
+    if (requestSignal?.aborted
+      || !projectRequestIsCurrent(projectId, subjectKey, requestGeneration)) return;
+    setWorkflowOptions(workflowOptionsFromWorkspace(record.workspace));
   }, []);
 
   useEffect(() => {
@@ -1662,13 +1891,81 @@ export function App() {
     }
     setWorkflowOptions(workflowOptionsFromWorkspace(readLegacyWorkflowWorkspace(selectedProjectId)));
     const controller = new AbortController();
+    const subjectKey = selectedFeishuSubjectKeyRef.current;
+    const requestGeneration = projectRequestGenerationRef.current;
     void refreshWorkflowOptions(selectedProjectId, controller.signal).catch((error) => {
-      if ((error as Error).name !== "AbortError") {
+      if ((error as Error).name !== "AbortError"
+        && !controller.signal.aborted
+        && projectRequestIsCurrent(selectedProjectId, subjectKey, requestGeneration)) {
         setWorkflowOptions(workflowOptionsFromWorkspace(readLegacyWorkflowWorkspace(selectedProjectId)));
       }
     });
     return () => controller.abort();
-  }, [refreshWorkflowOptions, selectedProjectId]);
+  }, [refreshWorkflowOptions, selectedFeishuSubjectKey, selectedProjectId]);
+
+  useEffect(() => {
+    unifiedViewsAbortControllerRef.current?.abort();
+    const viewsController = new AbortController();
+    unifiedViewsAbortControllerRef.current = viewsController;
+    const viewsGeneration = ++unifiedViewsRequestGenerationRef.current;
+    const subjectKey = selectedFeishuWorkflowSubjectKey;
+
+    setUnifiedViewsState(null);
+    setUnifiedViewsError(null);
+    setUnifiedSearchScope("activeView");
+    if (boardView !== "issues" || !subjectKey) {
+      setUnifiedViewsLoading(false);
+      return () => viewsController.abort();
+    }
+
+    setUnifiedViewsLoading(true);
+    void getUnifiedWorkflowViews(subjectKey, viewsController.signal).then((viewsState) => {
+      if (viewsController.signal.aborted
+        || viewsGeneration !== unifiedViewsRequestGenerationRef.current
+        || selectedFeishuWorkflowSubjectKeyRef.current !== subjectKey) return;
+      setUnifiedViewsState(viewsState);
+    }).catch((error) => {
+      if ((error as Error).name === "AbortError"
+        || viewsGeneration !== unifiedViewsRequestGenerationRef.current
+        || selectedFeishuWorkflowSubjectKeyRef.current !== subjectKey) return;
+      setUnifiedViewsError(errorMessage(error));
+    }).finally(() => {
+      if (viewsGeneration === unifiedViewsRequestGenerationRef.current
+        && selectedFeishuWorkflowSubjectKeyRef.current === subjectKey) {
+        setUnifiedViewsLoading(false);
+      }
+    });
+    return () => viewsController.abort();
+  }, [boardView, selectedFeishuWorkflowSubjectKey, unifiedViewsReloadRevision]);
+
+  useEffect(() => {
+    unifiedStageDisplaysAbortControllerRef.current?.abort();
+    const controller = new AbortController();
+    unifiedStageDisplaysAbortControllerRef.current = controller;
+    const generation = ++unifiedStageDisplaysRequestGenerationRef.current;
+    const subjectKey = selectedFeishuWorkflowSubjectKey;
+    setUnifiedStageDisplays([]);
+    setUnifiedStageDisplaysLoadedFor(null);
+    if (!subjectKey || (boardView !== "issues" && boardView !== "workflow")) {
+      return () => controller.abort();
+    }
+    void getUnifiedWorkflowStageDisplays(subjectKey, controller.signal)
+      .then((stageDisplays) => {
+        if (controller.signal.aborted
+          || generation !== unifiedStageDisplaysRequestGenerationRef.current
+          || selectedFeishuWorkflowSubjectKeyRef.current !== subjectKey) return;
+        setUnifiedStageDisplays(stageDisplays);
+        setUnifiedStageDisplaysLoadedFor(subjectKey);
+      })
+      .catch((error) => {
+        if ((error as Error).name !== "AbortError"
+          && generation === unifiedStageDisplaysRequestGenerationRef.current
+          && selectedFeishuWorkflowSubjectKeyRef.current === subjectKey) {
+          setActionError(errorMessage(error));
+        }
+      });
+    return () => controller.abort();
+  }, [boardView, selectedFeishuWorkflowSubjectKey]);
 
   useEffect(() => {
     feishuCatalogAbortControllerRef.current?.abort();
@@ -1710,7 +2007,7 @@ export function App() {
     try {
       const next = await addFeishuBaseFromUrl(url);
       const [nextProjects, nextCatalog] = await Promise.all([
-        listProjects(projectController.signal),
+        listProjects({ includeArchived: true, signal: projectController.signal }),
         listFeishuWorkflowCatalog(catalogController.signal),
       ]);
       if (requestGeneration !== projectRequestGenerationRef.current
@@ -1721,6 +2018,8 @@ export function App() {
       }
       setProjects(nextProjects);
       setFeishuCatalog(nextCatalog);
+      void refreshTasks(projectId, { quiet: true, signal: projectController.signal });
+      void refreshArtifactUploads(projectId, { quiet: true, signal: projectController.signal });
       return nextCatalog.find((base) => base.baseToken === next.baseToken) ?? next;
     } catch (error) {
       if ((error as Error).name === "AbortError"
@@ -1730,7 +2029,7 @@ export function App() {
         || selectedFeishuSubjectKeyRef.current !== subjectKey) return;
       throw error;
     }
-  }, [beginProjectRequestContext]);
+  }, [beginProjectRequestContext, refreshArtifactUploads, refreshTasks]);
 
   const updateFeishuSubject = useCallback((subject: import("./types").FeishuSubjectConfig) => {
     setFeishuCatalog((catalog) => catalog.map((base) => ({
@@ -1741,6 +2040,11 @@ export function App() {
 
   const clearRemovedFeishuSelectionState = useCallback(() => {
     tasksRequestRef.current += 1;
+    artifactUploadsRequestRef.current += 1;
+    unifiedViewsAbortControllerRef.current?.abort();
+    unifiedStageDisplaysAbortControllerRef.current?.abort();
+    unifiedViewsRequestGenerationRef.current += 1;
+    unifiedStageDisplaysRequestGenerationRef.current += 1;
     setDetailTaskIdentifier(null);
     setEditor(null);
     setNewTaskDraft(null);
@@ -1750,6 +2054,7 @@ export function App() {
     setDraggedTaskId(null);
     setDraggedTaskHeight(0);
     setDropTarget(null);
+    movingTaskRef.current = null;
     setMovingTaskId(null);
     setSettlingTaskId(null);
     tasksRef.current = [];
@@ -1757,12 +2062,28 @@ export function App() {
     setArchivedTasks([]);
     setHasLoadedTasks(false);
     setTasksLoading(false);
+    setArtifactUploadItems([]);
+    setTaskArtifactSummaries([]);
+    setArtifactUploadsLoading(false);
+    setArtifactUploadsError(null);
+    setUnifiedViewsState(null);
+    setUnifiedStageDisplays([]);
+    setUnifiedStageDisplaysLoadedFor(null);
+    setUnifiedViewsLoading(false);
+    setUnifiedViewsError(null);
+    setUnifiedSearchScope("activeView");
+    retryingArtifactUploadIdsRef.current.clear();
+    setRetryingArtifactUploadIds(new Set());
     setLoadError(null);
     setActionError(null);
     setOpeningThreadTaskId(null);
     setStartingCodexTaskId(null);
     pendingDetailSourceScrollRef.current = null;
     if (issueListRef.current) issueListRef.current.scrollTop = 0;
+    if (unifiedWorkflowScrollRef.current) {
+      unifiedWorkflowScrollRef.current.scrollTop = 0;
+      unifiedWorkflowScrollRef.current.scrollLeft = 0;
+    }
     for (const scrollContainer of Object.values(boardColumnScrollRefs.current)) {
       if (scrollContainer) scrollContainer.scrollTop = 0;
     }
@@ -1792,7 +2113,9 @@ export function App() {
     const subjectStillActive = subjectKey !== null && nextCatalog.some((base) => (
       base.subjects.some((subject) => subject.subjectKey === subjectKey)
     ));
-    const projectStillActive = nextProjects.some((project) => project.id === projectId);
+    const projectStillActive = nextProjects.some((project) => (
+      project.id === projectId && project.archivedAt === null
+    ));
     if ((subjectKey === null || subjectStillActive) && projectStillActive) {
       setFeishuConfigurationBaseToken((current) => current && nextCatalog.some((base) => base.baseToken === current)
         ? current
@@ -1811,9 +2134,13 @@ export function App() {
     const sameBaseFallback = removedSubjectIndex >= 0 && sameBaseSubjects.length > 0
       ? sameBaseSubjects[Math.min(removedSubjectIndex, sameBaseSubjects.length - 1)]
       : sameBaseSubjects[0];
-    const previousActiveProjects = previousProjects.filter((project) => project.id !== GLOBAL_PROJECT_ID);
+    const previousActiveProjects = previousProjects.filter((project) => (
+      project.id !== GLOBAL_PROJECT_ID && project.archivedAt === null
+    ));
     const removedProjectIndex = previousActiveProjects.findIndex((project) => project.id === projectId);
-    const remainingActiveProjects = nextProjects.filter((project) => project.id !== GLOBAL_PROJECT_ID);
+    const remainingActiveProjects = nextProjects.filter((project) => (
+      project.id !== GLOBAL_PROJECT_ID && project.archivedAt === null
+    ));
     const fallbackActiveProject = removedProjectIndex >= 0 && remainingActiveProjects.length > 0
       ? remainingActiveProjects[Math.min(removedProjectIndex, remainingActiveProjects.length - 1)]
       : remainingActiveProjects[0];
@@ -1866,7 +2193,7 @@ export function App() {
       try {
         const [recoveredCatalog, nextProjects] = await Promise.all([
           listFeishuWorkflowCatalog(catalogController.signal),
-          listProjects(projectController.signal),
+          listProjects({ includeArchived: true, signal: projectController.signal }),
         ]);
         applyRemovedFeishuCatalog(
           recoveredCatalog,
@@ -1884,7 +2211,7 @@ export function App() {
       throw error;
     }
     try {
-      const nextProjects = await listProjects(projectController.signal);
+      const nextProjects = await listProjects({ includeArchived: true, signal: projectController.signal });
       applyRemovedFeishuCatalog(
         nextCatalog,
         nextProjects,
@@ -1903,7 +2230,7 @@ export function App() {
       try {
         const [recoveredCatalog, nextProjects] = await Promise.all([
           listFeishuWorkflowCatalog(catalogController.signal),
-          listProjects(projectController.signal),
+          listProjects({ includeArchived: true, signal: projectController.signal }),
         ]);
         applyRemovedFeishuCatalog(
           recoveredCatalog,
@@ -1927,28 +2254,37 @@ export function App() {
       return;
     }
     const controller = new AbortController();
-    const codexProjectId = selectedProjectId === GLOBAL_PROJECT_ID ? hostContext?.projectId : selectedProjectId;
+    const projectId = selectedProjectId;
+    const subjectKey = selectedFeishuSubjectKeyRef.current;
+    const requestGeneration = projectRequestGenerationRef.current;
+    const codexProjectId = projectId === GLOBAL_PROJECT_ID ? hostContext?.projectId : projectId;
     const codexThreadId = hostContext?.threadId ?? detailTask?.threadId ?? undefined;
     setDevelopmentScan({ workspacePath: selectedDeviceWorkspacePath ?? null, contexts: [] });
     setDevelopmentScanLoading(true);
     void listDevelopmentContexts(
-      selectedProjectId,
+      projectId,
       codexProjectId,
       codexThreadId,
       controller.signal,
       selectedDeviceWorkspacePath,
     )
       .then((scan) => {
+        if (controller.signal.aborted
+          || !projectRequestIsCurrent(projectId, subjectKey, requestGeneration)) return;
         setDevelopmentScan(scan);
-        if (scan.workspacePath) rememberDeviceWorkspacePath(selectedProjectId, scan.workspacePath);
+        if (scan.workspacePath) rememberDeviceWorkspacePath(projectId, scan.workspacePath);
       })
       .catch((error) => {
-        if ((error as Error).name !== "AbortError") {
+        if ((error as Error).name !== "AbortError"
+          && projectRequestIsCurrent(projectId, subjectKey, requestGeneration)) {
           setDevelopmentScan({ workspacePath: selectedDeviceWorkspacePath ?? null, contexts: [] });
         }
       })
       .finally(() => {
-        if (!controller.signal.aborted) setDevelopmentScanLoading(false);
+        if (!controller.signal.aborted
+          && projectRequestIsCurrent(projectId, subjectKey, requestGeneration)) {
+          setDevelopmentScanLoading(false);
+        }
       });
     return () => controller.abort();
   }, [
@@ -1982,6 +2318,7 @@ export function App() {
         const projectId = selectedProjectIdRef.current;
         if (projectId) {
           void refreshTasks(projectId, { quiet: true });
+          void refreshArtifactUploads(projectId, { quiet: true });
           void refreshWorkflowOptions(projectId).catch(() => {});
         }
         setWorkflowRevision((current) => current + 1);
@@ -1997,6 +2334,7 @@ export function App() {
   }, [
     revisionPollingInterval,
     refreshProjectList,
+    refreshArtifactUploads,
     refreshTasks,
     refreshWorkflowOptions,
   ]);
@@ -2108,6 +2446,39 @@ export function App() {
     (task) => matchesTaskSearch(task, search, language) && matchesTaskFilters(task, filters),
   ), [archivedTasks, filters, language, search]);
 
+  // The unified Feishu board owns every active Feishu status. Keep secondary
+  // Feishu statuses and ordinary tasks in distinct panel tabs so no task can
+  // appear in both surfaces at once.
+  const unifiedTasksByStatus = useMemo(() => {
+    const scopedTaskIds = new Set(unifiedWorkflowTasks.map((task) => task.id));
+    const grouped = Object.fromEntries(
+      TASK_STATUSES.map((status) => [status, [] as Task[]]),
+    ) as Record<TaskStatus, Task[]>;
+    for (const task of filteredTasks) {
+      if (!scopedTaskIds.has(task.id)) continue;
+      if (!isFeishuWorkflowTask(task)) continue;
+      if (!["backlog", "canceled"].includes(task.status)) continue;
+      grouped[task.status].push(task);
+    }
+    return grouped;
+  }, [filteredTasks, unifiedWorkflowTasks]);
+
+  const unifiedOrdinaryTasks = useMemo(() => {
+    const scopedTaskIds = new Set(unifiedWorkflowTasks.map((task) => task.id));
+    return filteredTasks.filter((task) => (
+      scopedTaskIds.has(task.id) && !isFeishuWorkflowTask(task)
+    ));
+  }, [filteredTasks, unifiedWorkflowTasks]);
+
+  const unifiedArchivedTasks = useMemo(() => {
+    const scoped = filteredArchivedTasks.filter((task) => task.projectId === selectedProjectId);
+    if (!selectedFeishuWorkflowSubjectKey) return scoped;
+    return scoped.filter((task) => (
+      !task.feishuOrigin?.subjectKey
+      || task.feishuOrigin.subjectKey === selectedFeishuWorkflowSubjectKey
+    ));
+  }, [filteredArchivedTasks, selectedFeishuWorkflowSubjectKey, selectedProjectId]);
+
   const completedEditingTasks = useMemo(() => filteredTasks.filter(
     (task) => task.status === "done" && isFeishuWorkflowTask(task),
   ), [filteredTasks]);
@@ -2115,10 +2486,17 @@ export function App() {
   const activeFilterCount = taskFilterCount(filters);
   const hasActiveTaskFilters = Boolean(search.trim()) || activeFilterCount > 0;
 
+  const taskCodexThreadIds = useMemo(() => new Map(
+    aiThreads
+      .filter((thread) => thread.origin.issueId && thread.codexThreadId)
+      .map((thread) => [thread.origin.issueId!, normalizeCodexThreadId(thread.codexThreadId)] as const)
+      .filter((entry): entry is readonly [string, string] => Boolean(entry[1])),
+  ), [aiThreads]);
   const trackedCodexThreadIds = useMemo(() => [...new Set(tasks
-    .filter((task) => task.status === "in_progress" && task.threadId)
-    .map((task) => normalizeCodexThreadId(task.threadId))
-    .filter(Boolean))].sort(), [tasks]);
+    .filter((task) => task.status === "in_progress")
+    .map((task) => taskCodexThreadIds.get(task.id))
+    .filter((threadId): threadId is string => Boolean(threadId))
+  )].sort(), [taskCodexThreadIds, tasks]);
   const trackedCodexThreadIdsKey = trackedCodexThreadIds.join(",");
 
   useEffect(() => {
@@ -2166,7 +2544,7 @@ export function App() {
     const runningNativeThreadId = hostContext?.threadRunning
       ? hostContext.threadId ?? null
       : null;
-    const taskThreadId = normalizeCodexThreadId(task.threadId);
+    const taskThreadId = taskCodexThreadIds.get(task.id);
     return [task.id, taskCardPresentation(
       task,
       aiThreads,
@@ -2182,6 +2560,7 @@ export function App() {
     hostContext?.threadRunning,
     hostContext?.threadTodoProgress,
     readActivityKeys,
+    taskCodexThreadIds,
     tasks,
   ]);
   const hasRunningTask = useMemo(
@@ -2198,9 +2577,11 @@ export function App() {
 
 
   function selectBoardView(view: BoardView) {
+    endTaskDrag();
     closeContextMenu();
     setGanttViewMenuOpen(false);
     if (view === "autocut_packages") closeTaskDetail();
+    if (view !== "workflow") setFeishuConfigurationOpen(false);
     setBoardView(view);
     if (selectedProjectId) {
       taskboardStorage.setItem(`${PROJECT_VIEW_KEY_PREFIX}${selectedProjectId}`, view);
@@ -2213,15 +2594,19 @@ export function App() {
     inlineImages: PendingInlineImage[],
   ) {
     if (!selectedProjectId || !editor) return;
+    const projectId = selectedProjectId;
+    const editorSnapshot = editor;
+    const subjectKey = selectedFeishuSubjectKeyRef.current;
+    const requestGeneration = projectRequestGenerationRef.current;
     setActionError(null);
     try {
-      const creating = editor.task === null;
-      let saved = editor.task
-        ? await updateTaskRequest(editor.task, draft)
-        : await createTaskRequest(selectedProjectId, draft);
+      const creating = editorSnapshot.task === null;
+      let saved = editorSnapshot.task
+        ? await updateTaskRequest(editorSnapshot.task, draft)
+        : await createTaskRequest(projectId, draft);
       if (creating) {
         setProjects((current) => current.map((project) => (
-          project.id === selectedProjectId
+          project.id === projectId
             ? { ...project, issueCount: project.issueCount + 1 }
             : project
         )));
@@ -2248,6 +2633,7 @@ export function App() {
           saved = await updateTaskRequest(saved, { ...draft, description });
         }
       }
+      if (!projectRequestIsCurrent(projectId, subjectKey, requestGeneration)) return;
       setTasks((current) => sortTasks([
         ...current.filter((task) => task.id !== saved.id),
         saved,
@@ -2272,8 +2658,8 @@ export function App() {
           await archiveTaskRequest(current);
           setTasks((tasks) => tasks.filter((task) => task.id !== saved.id));
         });
-      } else if (editor.task) {
-        const previous = editor.task;
+      } else if (editorSnapshot.task) {
+        const previous = editorSnapshot.task;
         const previousAssigneeTarget = assigneeTargetForActor(previous.assignee, currentUser);
         if (!draft.assigneeTarget || previousAssigneeTarget) {
           pushUndo(
@@ -2283,8 +2669,10 @@ export function App() {
         }
       }
     } catch (error) {
-      if (error instanceof ApiError && error.code === "VERSION_CONFLICT") {
-        void refreshTasks(selectedProjectId, { quiet: true });
+      if (error instanceof ApiError
+        && error.code === "VERSION_CONFLICT"
+        && projectRequestIsCurrent(projectId, subjectKey, requestGeneration)) {
+        void refreshTasks(projectId, { quiet: true });
       }
       throw error;
     }
@@ -2296,7 +2684,19 @@ export function App() {
     beforeTaskId: string | null = null,
     useDropPosition = false,
   ) {
-    if (movingTaskId) {
+    if (
+      task.projectId !== selectedProjectIdRef.current
+      || (
+        isFeishuWorkflowTask(task)
+        && task.feishuOrigin?.subjectKey !== selectedFeishuWorkflowSubjectKeyRef.current
+      )
+    ) {
+      setDropTarget(null);
+      setDraggedTaskId(null);
+      setDraggedTaskHeight(0);
+      return;
+    }
+    if (movingTaskRef.current || movingTaskId) {
       setDropTarget(null);
       setDraggedTaskId(null);
       setDraggedTaskHeight(0);
@@ -2335,15 +2735,23 @@ export function App() {
           : 1024;
     const previous = task;
     setActionError(null);
+    movingTaskRef.current = task.id;
     setMovingTaskId(task.id);
     setTasks((current) => sortTasks(current.map((candidate) =>
       candidate.id === task.id ? { ...candidate, status, sortOrder } : candidate,
     )));
 
     try {
-      const moved = task.status === "todo" && status === "in_progress" && isFeishuWorkflowTask(task)
-        ? (await executeTaskWithCodex(task, "move")).task
-        : await moveTaskRequest(task, status, sortOrder);
+      const execution = task.status === "todo" && status === "in_progress" && isFeishuWorkflowTask(task)
+        ? await executeTaskWithCodex(task, "move")
+        : null;
+      const moved = execution?.task ?? await moveTaskRequest(task, status, sortOrder);
+      if (execution?.thread) {
+        setAiThreads((current) => [
+          execution.thread,
+          ...current.filter((thread) => thread.id !== execution.thread.id),
+        ]);
+      }
       setTasks((current) => sortTasks(current.map((candidate) =>
         candidate.id === moved.id ? moved : candidate,
       )));
@@ -2371,6 +2779,7 @@ export function App() {
         : errorMessage(error));
       if (selectedProjectId) void refreshTasks(selectedProjectId, { quiet: true });
     } finally {
+      if (movingTaskRef.current === task.id) movingTaskRef.current = null;
       setMovingTaskId(null);
       setDropTarget(null);
       setDraggedTaskId(null);
@@ -2390,12 +2799,29 @@ export function App() {
     setDropTarget(null);
   }
 
-  function finishTaskDrop(destination: TaskStatus, taskId: string, beforeTaskId: string | null = null) {
-    const task = tasks.find((candidate) => candidate.id === taskId);
+  function finishTaskDrop(destination: TaskStatus, taskId: string, beforeTaskId: string | null = null, sourceSurface?: "board" | "other-tasks-panel" | "unified-board") {
+    const task = tasksRef.current.find((candidate) => candidate.id === taskId);
     setDraggedTaskId(null);
     setDraggedTaskHeight(0);
     setDropTarget(null);
     if (!task) return;
+    if (sourceSurface === "unified-board") {
+      const projectId = selectedProjectIdRef.current;
+      const subjectKey = selectedFeishuWorkflowSubjectKeyRef.current;
+      const viewsState = unifiedViewsStateRef.current;
+      const activeView = viewsState?.subjectKey === subjectKey
+        ? viewsState.views.find((view) => view.id === viewsState.activeViewId)
+        : undefined;
+      const visibleStageIds = activeView?.stageIds ?? [];
+      if (!canDropUnifiedWorkflowTask({
+        projectId,
+        subjectKey,
+        visibleStageIds,
+        task,
+        targetStage: destination,
+        sourceSurface,
+      })) return;
+    }
     setSettlingTaskId(task.id);
     window.setTimeout(() => {
       setSettlingTaskId((current) => current === task.id ? null : current);
@@ -2448,6 +2874,31 @@ export function App() {
     }
   }
 
+  async function retryArtifactUploadFromBoard(item: ArtifactUploadListItem) {
+    if (retryingArtifactUploadIdsRef.current.has(item.upload.id)) return;
+    retryingArtifactUploadIdsRef.current.add(item.upload.id);
+    setRetryingArtifactUploadIds(new Set(retryingArtifactUploadIdsRef.current));
+    setActionError(null);
+    try {
+      const upload = await retryTaskArtifactUpload(item.task.id, item.upload.id);
+      if (selectedProjectIdRef.current === item.task.projectId) {
+        setArtifactUploadItems((current) => current.map((candidate) => (
+          candidate.upload.id === upload.id
+            ? { ...candidate, upload }
+            : candidate
+        )));
+        void refreshArtifactUploads(item.task.projectId, { quiet: true });
+      }
+    } catch (error) {
+      if (selectedProjectIdRef.current === item.task.projectId) {
+        setActionError(errorMessage(error));
+      }
+    } finally {
+      retryingArtifactUploadIdsRef.current.delete(item.upload.id);
+      setRetryingArtifactUploadIds(new Set(retryingArtifactUploadIdsRef.current));
+    }
+  }
+
   function openFeishuConfiguration(baseToken?: string, subjectKey?: string) {
     const base = feishuCatalog.find((item) => item.baseToken === baseToken)
       ?? feishuCatalog.find((item) => item.subjects.some((subject) => subject.subjectKey === selectedFeishuSubjectKey))
@@ -2458,9 +2909,17 @@ export function App() {
       ?? base?.subjects[0]
       ?? null;
     setFeishuConfigurationBaseToken(base?.baseToken ?? null);
-    setSelectedFeishuSubjectKey(subject?.subjectKey ?? null);
     closeTaskDetail();
-    selectBoardView("workflow");
+    if (subject) {
+      changeProject(subject.projectId, "workflow");
+      beginProjectRequestContext(subject.projectId, subject.subjectKey);
+      setSelectedFeishuSubjectKey(subject.subjectKey);
+      setFeishuConfigurationOpen(true);
+    } else {
+      setSelectedFeishuSubjectKey(null);
+      selectBoardView("workflow");
+      setFeishuConfigurationOpen(true);
+    }
   }
 
   async function startCodexForTask(task: Task) {
@@ -2518,13 +2977,17 @@ export function App() {
   }
 
   async function duplicateTask(task: Task) {
+    const projectId = task.projectId;
+    const subjectKey = selectedFeishuSubjectKeyRef.current;
+    const requestGeneration = projectRequestGenerationRef.current;
     setActionError(null);
     try {
-      const duplicated = await createTaskRequest(task.projectId, {
+      const duplicated = await createTaskRequest(projectId, {
         ...taskToDraft(task),
         assigneeTarget: assigneeTargetForActor(task.assignee, currentUser),
         developmentContext: null,
       });
+      if (!projectRequestIsCurrent(projectId, subjectKey, requestGeneration)) return;
       setTasks((current) => sortTasks([...current, duplicated]));
       pushUndo(text(
         `${duplicated.identifier} 副本已创建。`,
@@ -2536,7 +2999,9 @@ export function App() {
         setTasks((tasks) => tasks.filter((item) => item.id !== duplicated.id));
       });
     } catch (error) {
-      setActionError(errorMessage(error));
+      if (projectRequestIsCurrent(projectId, subjectKey, requestGeneration)) {
+        setActionError(errorMessage(error));
+      }
     }
   }
 
@@ -2695,9 +3160,11 @@ export function App() {
   function changeProject(projectId: string, preferredView?: BoardView) {
     const subject = feishuCatalog.flatMap((base) => base.subjects).find((candidate) => candidate.projectId === projectId);
     beginProjectRequestContext(projectId, subject?.subjectKey ?? null);
+    clearRemovedFeishuSelectionState();
     closeContextMenu();
     setProjectContextMenu(null);
     setProjectMenuOpen(false);
+    setFeishuConfigurationOpen(false);
     setDetailTaskIdentifier(null);
     if (preferredView) {
       setBoardView(preferredView);
@@ -2706,6 +3173,11 @@ export function App() {
       setBoardView(readProjectBoardView(projectId));
     }
     setSelectedFeishuSubjectKey(subject?.subjectKey ?? null);
+    setFeishuConfigurationBaseToken(subject
+      ? feishuCatalog.find((base) => base.subjects.some((candidate) => (
+        candidate.subjectKey === subject.subjectKey
+      )))?.baseToken ?? null
+      : null);
     rememberProjectOpen(projectId);
     setSelectedProjectId(projectId);
     setSearch("");
@@ -2733,7 +3205,7 @@ export function App() {
           setProjects((current) => [...current, project!]);
         } catch (error) {
           if (!(error instanceof ApiError) || error.code !== "PROJECT_EXISTS") throw error;
-          const nextProjects = await listProjects();
+          const nextProjects = await listProjects({ includeArchived: true });
           setProjects(nextProjects);
           project = nextProjects.find((candidate) => candidate.id === choice.id) ?? null;
           if (!project) throw error;
@@ -2787,14 +3259,42 @@ export function App() {
   function requestProjectDelete(project: ProjectChoice) {
     setProjectMenuOpen(false);
     setProjectContextMenu(null);
-    setProjectDeleteIssueCount(null);
+    setProjectDeleteAssociations(null);
     setPendingProjectDelete(project);
+  }
+
+  async function updateProjectArchived(project: ProjectChoice, archived: boolean) {
+    if (projectLifecyclePendingId || !project.persisted || project.source !== "local") return;
+    setProjectLifecyclePendingId(project.id);
+    setActionError(null);
+    try {
+      const updated = await setProjectArchived(project.id, archived);
+      const nextProjects = projectsRef.current.map((candidate) => (
+        candidate.id === updated.id ? updated : candidate
+      ));
+      setProjects(nextProjects);
+      setProjectContextMenu(null);
+      if (archived && selectedProjectIdRef.current === project.id) {
+        const fallback = nextProjects.find((candidate) => (
+          candidate.archivedAt === null && candidate.id === GLOBAL_PROJECT_ID
+        )) ?? nextProjects.find((candidate) => candidate.archivedAt === null);
+        if (fallback) changeProject(fallback.id);
+      }
+      if (!archived) setProjectHistoryOpen(false);
+      setAnnouncement(archived
+        ? text(`已归档项目“${project.name}”`, `Archived project “${project.name}”`)
+        : text(`已恢复项目“${project.name}”`, `Restored project “${project.name}”`));
+    } catch (error) {
+      setActionError(errorMessage(error));
+    } finally {
+      setProjectLifecyclePendingId(null);
+    }
   }
 
   function closeProjectDeleteDialog() {
     if (deletingProjectId) return;
     setPendingProjectDelete(null);
-    setProjectDeleteIssueCount(null);
+    setProjectDeleteAssociations(null);
   }
 
   async function deletePendingProject() {
@@ -2804,6 +3304,7 @@ export function App() {
     setActionError(null);
     try {
       await deleteProjectRequest(project.id);
+      clearUnifiedWorkflowLayoutsForProject(project.id);
       setProjects((current) => current.filter((candidate) => candidate.id !== project.id));
       setRecentProjectIds((current) => {
         const next = current.filter((candidate) => candidate !== project.id);
@@ -2811,16 +3312,31 @@ export function App() {
         return next;
       });
       setPendingProjectDelete(null);
-      setProjectDeleteIssueCount(null);
-      if (selectedProjectId === project.id) changeProject(GLOBAL_PROJECT_ID);
+      setProjectDeleteAssociations(null);
+      if (selectedProjectIdRef.current === project.id) {
+        const fallback = projectsRef.current.find((candidate) => (
+          candidate.id !== project.id && candidate.archivedAt === null && candidate.id === GLOBAL_PROJECT_ID
+        )) ?? projectsRef.current.find((candidate) => (
+          candidate.id !== project.id && candidate.archivedAt === null
+        ));
+        if (fallback) changeProject(fallback.id);
+      }
       setAnnouncement(text(
         `已删除项目“${project.name}”`,
         `Deleted project “${project.name}”`,
       ));
     } catch (error) {
       if (error instanceof ApiError && error.code === "PROJECT_NOT_EMPTY") {
-        const details = error.details as { issueCount: number };
-        setProjectDeleteIssueCount(details.issueCount);
+        const details = error.details as {
+          associations?: { total?: number; tasks?: number };
+        };
+        const total = Number.isInteger(details.associations?.total)
+          ? Math.max(1, details.associations!.total!)
+          : 1;
+        const tasks = Number.isInteger(details.associations?.tasks)
+          ? Math.max(0, Math.min(total, details.associations!.tasks!))
+          : 0;
+        setProjectDeleteAssociations({ total, tasks });
       } else {
         setPendingProjectDelete(null);
         setActionError(errorMessage(error));
@@ -2830,9 +3346,32 @@ export function App() {
     }
   }
 
-  const headerProjectName = selectedProject?.id === GLOBAL_PROJECT_ID
-    ? text("全局", "Global")
-    : selectedProject?.name ?? text("任务面板", "Taskboard");
+  const headerProjectName = selectedFeishuSubject
+    ? `${selectedFeishuSubject.baseName} / ${selectedFeishuSubject.tableName}`
+    : selectedProject?.id === GLOBAL_PROJECT_ID
+      ? text("全局", "Global")
+      : selectedProject?.name ?? text("任务面板", "Taskboard");
+  const projectDeleteAssociationMessage = projectDeleteAssociations
+    ? (() => {
+      const otherAssociations = projectDeleteAssociations.total - projectDeleteAssociations.tasks;
+      if (projectDeleteAssociations.tasks > 0 && otherAssociations > 0) {
+        return text(
+          `该项目还有 ${projectDeleteAssociations.tasks} 个任务和 ${otherAssociations} 项其他关联数据。请先清理这些数据。`,
+          `This project still has ${projectDeleteAssociations.tasks} tasks and ${otherAssociations} other associated records. Remove them first.`,
+        );
+      }
+      if (projectDeleteAssociations.tasks > 0) {
+        return text(
+          `该项目还有 ${projectDeleteAssociations.tasks} 个任务（包含已归档任务）。请先移动或删除这些任务。`,
+          `This project still has ${projectDeleteAssociations.tasks} tasks, including archived tasks. Move or delete them first.`,
+        );
+      }
+      return text(
+        `该项目还有 ${projectDeleteAssociations.total} 项关联数据，例如流程配置、摘要或聊天记录。请先清理这些数据。`,
+        `This project still has ${projectDeleteAssociations.total} associated records, such as workflow settings, summaries, or chats. Remove them first.`,
+      );
+    })()
+    : null;
   const appShellStyle = embedded
     ? { "--codex-titlebar-left-inset": `${hostContext?.titlebarLeftInset ?? 0}px` } as CSSProperties
     : undefined;
@@ -2846,6 +3385,7 @@ export function App() {
           detailTaskId={detailTaskId}
           refreshProjectList={refreshProjectList}
           refreshTasks={refreshTasks}
+          refreshArtifactUploads={refreshArtifactUploads}
           refreshWorkflowOptions={refreshWorkflowOptions}
           setConnection={setConnection}
           setCommentsRevision={setCommentsRevision}
@@ -2975,31 +3515,102 @@ export function App() {
                 {projectMenuOpen && (
                   <div className="header-project-menu" role="menu" aria-label={text("项目", "Projects")}>
                     <span>{text("切换项目", "Switch project")}</span>
-                    {projectChoices.map((project) => (
-                      <button
-                        type="button"
-                        role="menuitemradio"
-                        aria-checked={project.id === selectedProjectId}
-                        disabled={openingProjectId !== null}
-                        key={project.id}
-                        onContextMenu={project.id.startsWith("temp-") ? (event) => {
-                          event.preventDefault();
-                          setProjectContextMenu({
-                            project,
-                            x: event.clientX,
-                            y: event.clientY,
-                          });
-                        } : undefined}
-                        onClick={() => {
-                          if (project.id === selectedProjectId) setProjectMenuOpen(false);
-                          else void selectProject(project);
-                        }}
-                      >
-                        <TaskboardIcon className="project-avatar" name="projectFolder" />
-                        <span>{project.name}</span>
-                        {project.id === selectedProjectId && <span className="project-menu-check" aria-hidden="true"><LinearIcon name="check" /></span>}
-                      </button>
+                    {activeProjectChoices.map((project) => (
+                      <div className="project-menu-row" role="none" key={project.id}>
+                        <button
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={project.id === selectedProjectId}
+                          disabled={openingProjectId !== null}
+                          onContextMenu={project.persisted && project.source === "local" && project.id !== GLOBAL_PROJECT_ID ? (event) => {
+                            event.preventDefault();
+                            setProjectContextMenu({
+                              project,
+                              x: event.clientX,
+                              y: event.clientY,
+                            });
+                          } : undefined}
+                          onClick={() => {
+                            if (project.id === selectedProjectId) setProjectMenuOpen(false);
+                            else void selectProject(project);
+                          }}
+                        >
+                          <TaskboardIcon className="project-avatar" name="projectFolder" />
+                          <span>{project.name}</span>
+                          {project.id === selectedProjectId && <span className="project-menu-check" aria-hidden="true"><LinearIcon name="check" /></span>}
+                        </button>
+                        {project.persisted && project.source === "local" && project.id !== GLOBAL_PROJECT_ID && (
+                          <button
+                            type="button"
+                            className="project-menu-archive"
+                            role="menuitem"
+                            disabled={projectLifecyclePendingId !== null}
+                            aria-label={text(`归档 ${project.name}`, `Archive ${project.name}`)}
+                            title={text("归档项目", "Archive project")}
+                            onClick={() => void updateProjectArchived(project, true)}
+                          >
+                            <LinearIcon name="folder" />
+                          </button>
+                        )}
+                      </div>
                     ))}
+                    {historicalProjectChoices.length > 0 && (
+                      <div className="project-history-section">
+                        <button
+                          type="button"
+                          className="project-history-toggle"
+                          aria-expanded={projectHistoryOpen}
+                          onClick={() => setProjectHistoryOpen((current) => !current)}
+                        >
+                          <LinearIcon name="chevronRight" />
+                          <span>{text("已归档 / 历史项目", "Archived / history")}</span>
+                          <small>{historicalProjectChoices.length}</small>
+                        </button>
+                        {projectHistoryOpen && historicalProjectChoices.map((project) => (
+                          <div className="project-history-row" key={project.id}>
+                            <button
+                              type="button"
+                              className="project-history-open"
+                              disabled={openingProjectId !== null}
+                              aria-label={text(`查看 ${project.name}`, `View ${project.name}`)}
+                              onClick={() => void selectProject(project)}
+                            >
+                              <TaskboardIcon className="project-avatar" name="projectFolder" />
+                              <span title={project.name}>
+                                <strong>{project.name}</strong>
+                                <small>{project.source === "feishu"
+                                  ? text("飞书学科", "Feishu subject")
+                                  : project.source === "global"
+                                    ? text("全局项目", "Global project")
+                                    : text("本地项目", "Local project")} · {project.archivedAt
+                                  ? new Date(project.archivedAt).toLocaleDateString(locale)
+                                  : ""} · {text(
+                                    `${project.issueCount + project.archivedIssueCount} 个任务`,
+                                    `${project.issueCount + project.archivedIssueCount} tasks`,
+                                  )}</small>
+                              </span>
+                            </button>
+                            {project.source === "local" && (
+                              <div className="project-history-actions">
+                                <button
+                                  type="button"
+                                  disabled={projectLifecyclePendingId !== null}
+                                  onClick={() => void updateProjectArchived(project, false)}
+                                >{text("恢复", "Restore")}</button>
+                                {project.id.startsWith("temp-") && (
+                                  <button
+                                    type="button"
+                                    className="danger"
+                                    disabled={projectLifecyclePendingId !== null}
+                                    onClick={() => requestProjectDelete(project)}
+                                  >{text("删除", "Delete")}</button>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
                     <button
                       type="button"
                       role="menuitem"
@@ -3048,7 +3659,8 @@ export function App() {
           </div>
         </header>
 
-        {selectedProjectId && !detailTask && boardView !== "autocut_packages" && <div className="board-toolbar">
+        {selectedProjectId && !detailTask && boardView !== "autocut_packages" && (
+          <div className={`board-toolbar${boardView === "issues" && isSelectedFeishuProject ? " unified-workflow-toolbar" : ""}`}>
           <div className="view-tabs" aria-label={text("看板视图", "Board views")}>
             <button
               className={`view-tab${boardView === "dashboard" ? " active" : ""}`}
@@ -3064,7 +3676,9 @@ export function App() {
               aria-pressed={boardView === "issues"}
               onClick={() => selectBoardView("issues")}
             >
-              {text("议题看板", "Issue board")}
+              {isSelectedFeishuProject
+                ? text("流程看板", "Workflow board")
+                : text("议题看板", "Issue board")}
             </button>
             <button
               className={`view-tab${boardView === "list" ? " active" : ""}`}
@@ -3082,39 +3696,7 @@ export function App() {
             >
               {text("甘特图", "Gantt")}
             </button>
-            <button
-              className={`view-tab${boardView === "completed_editing" ? " active" : ""}`}
-              type="button"
-              aria-pressed={boardView === "completed_editing"}
-              onClick={() => selectBoardView("completed_editing")}
-            >
-              {text("已完成剪辑", "Completed editing")}
-            </button>
-            <button
-              className={`view-tab${boardView === "upload_queue" ? " active" : ""}`}
-              type="button"
-              aria-pressed={boardView === "upload_queue"}
-              onClick={() => selectBoardView("upload_queue")}
-            >
-              {text("上传队列", "Upload queue")}
-            </button>
-            <button
-              className={`view-tab${boardView === "uploading" ? " active" : ""}`}
-              type="button"
-              aria-pressed={boardView === "uploading"}
-              onClick={() => selectBoardView("uploading")}
-            >
-              {text("上传中", "Uploading")}
-            </button>
-            <button
-              className={`view-tab${boardView === "uploaded" ? " active" : ""}`}
-              type="button"
-              aria-pressed={boardView === "uploaded"}
-              onClick={() => selectBoardView("uploaded")}
-            >
-              {text("已经上传", "Uploaded")}
-            </button>
-            {SHOW_WORKFLOW_BOARD_ENTRY && (
+            {SHOW_WORKFLOW_BOARD_ENTRY && !isSelectedFeishuProject && (
               <button
                 className={`view-tab${boardView === "workflow" ? " active" : ""}`}
                 type="button"
@@ -3125,8 +3707,40 @@ export function App() {
               </button>
             )}
           </div>
-          {(boardView === "issues" || boardView === "list" || boardView === "gantt" || boardView === "completed_editing"
-            || boardView === "upload_queue" || boardView === "uploading" || boardView === "uploaded") && <div className="toolbar-tools">
+          {boardView === "issues" && isSelectedFeishuProject && selectedFeishuWorkflowSubjectKey && (
+            <div className="unified-workflow-toolbar-controls">
+              {unifiedViewsState && unifiedViewsState.subjectKey === selectedFeishuWorkflowSubjectKey ? (
+                <UnifiedWorkflowViewControls
+                  projectId={selectedProjectId}
+                  subjectKey={selectedFeishuWorkflowSubjectKey}
+                  state={unifiedViewsState}
+                  stageDisplays={unifiedStageDisplays}
+                  onChange={setUnifiedViewsState}
+                  onError={setActionError}
+                />
+              ) : unifiedViewsLoading ? (
+                <span>{text("正在加载流程视图…", "Loading workflow views…")}</span>
+              ) : unifiedViewsError ? (
+                <span className="unified-view-load-error" role="alert">
+                  {unifiedViewsError}
+                  <button type="button" onClick={() => setUnifiedViewsReloadRevision((current) => current + 1)}>
+                    {text("重新加载", "Reload")}
+                  </button>
+                </span>
+              ) : null}
+              <label className="unified-search-scope">
+                <span>{text("搜索范围", "Search scope")}</span>
+                <select
+                  value={unifiedSearchScope}
+                  onChange={(event) => setUnifiedSearchScope(event.target.value as "activeView" | "allStages")}
+                >
+                  <option value="activeView">{text("当前视图", "Current view")}</option>
+                  <option value="allStages">{text("全部流程", "All stages")}</option>
+                </select>
+              </label>
+            </div>
+          )}
+          {(boardView === "issues" || boardView === "list" || boardView === "gantt") && <div className="toolbar-tools">
             <div className={`search-field${search ? " has-value" : ""}`} title={text("搜索议题 (/)", "Search issues (/)")}>
               <TaskboardIcon className="search-icon" name="search" />
               <input
@@ -3202,7 +3816,8 @@ export function App() {
               </button>
             )}
           </div>}
-        </div>}
+          </div>
+        )}
 
         {(loadError || actionErrorText) && (
           <div className="error-banner" role="alert">
@@ -3213,6 +3828,7 @@ export function App() {
               onClick={() => {
                 setActionError(null);
                 if (selectedProjectId) void refreshTasks(selectedProjectId);
+                if (selectedProjectId) void refreshArtifactUploads(selectedProjectId);
                 else void loadProjectList();
               }}
             >
@@ -3273,6 +3889,97 @@ export function App() {
             onOpenTask={openTaskDetail}
             onOpenConversation={openTaskConversation}
           />
+        ) : boardView === "issues" && isSelectedFeishuProject ? (
+          <div
+            className={`issue-board-layout unified-workflow-layout${otherTasksVisible ? " has-other-tasks" : ""}`}
+            data-main-columns={mainStatuses.length}
+          >
+            <div className="unified-workflow-main">
+              <UnifiedWorkflowBoard
+                key={selectedProjectId}
+                projectId={selectedProjectId}
+                subjectKey={selectedFeishuWorkflowSubjectKey ?? ""}
+                viewId={unifiedViewsState?.subjectKey === selectedFeishuWorkflowSubjectKey
+                  ? unifiedViewsState.activeViewId
+                  : "all"}
+                stageIds={unifiedViewsState?.subjectKey === selectedFeishuWorkflowSubjectKey
+                  ? unifiedViewsState.views.find((view) => view.id === unifiedViewsState.activeViewId)?.stageIds
+                  : undefined}
+                stageDisplays={unifiedStageDisplays}
+                searchScope={unifiedSearchScope}
+                tasks={unifiedWorkflowTasks}
+                uploadItems={artifactUploadItems}
+                artifactSummaries={taskArtifactSummaries}
+                presentations={taskPresentations}
+                now={processingNow}
+                loading={tasksLoading && !hasLoadedTasks}
+                uploadLoading={artifactUploadsLoading}
+                uploadError={artifactUploadsError}
+                hasActiveFilters={hasActiveTaskFilters}
+                filters={filters}
+                search={search}
+                availableLabels={availableLabels}
+                currentUser={currentUser}
+                draggedTaskId={draggedTaskId}
+                draggedTaskHeight={draggedTaskHeight}
+                movingTaskId={movingTaskId}
+                settlingTaskId={settlingTaskId}
+                contextMenuTaskId={contextMenu?.taskId ?? null}
+                dropTarget={dropTarget}
+                onOpenTask={(task, stage) => openTaskDetail(task, stage)}
+                onUpdate={updateTaskProperties}
+                onComplete={(task) => void moveTask(task, "done")}
+                onContextMenu={(task, position) => setContextMenu({ taskId: task.id, ...position })}
+                onDragStart={startTaskDrag}
+                onDragEnd={endTaskDrag}
+                onDragEnter={setDropTarget}
+                onDrop={finishTaskDrop}
+                onOpenConversation={openTaskConversation}
+                onRetryUpload={(item) => void retryArtifactUploadFromBoard(item)}
+                retryingUploadIds={retryingArtifactUploadIds}
+                onColumnScrollRef={(status, element) => {
+                  boardColumnScrollRefs.current[status] = element;
+                }}
+                onBoardScrollRef={unifiedWorkflowScrollRef}
+              />
+            </div>
+            {otherTasksMounted && (
+              <OtherTasksPanel
+                open={otherTasksVisible}
+                activeTab={otherTasksTab}
+                tasksByStatus={unifiedTasksByStatus}
+                ordinaryTasks={unifiedOrdinaryTasks}
+                archivedTasks={unifiedArchivedTasks}
+                presentations={taskPresentations}
+                now={processingNow}
+                hasActiveFilters={hasActiveTaskFilters}
+                isDropTarget={otherTasksTab !== "archived"
+                  && otherTasksTab !== "ordinary"
+                  && dropTarget === otherTasksTab}
+                draggedTaskId={draggedTaskId}
+                draggedTaskHeight={draggedTaskHeight}
+                movingTaskId={movingTaskId}
+                settlingTaskId={settlingTaskId}
+                contextMenuTaskId={contextMenu?.taskId ?? null}
+                availableLabels={availableLabels}
+                currentUser={currentUser}
+                restoringTaskId={restoringTaskId}
+                deletingTaskId={deletingArchivedTaskId}
+                onTabChange={setOtherTasksTab}
+                onCreate={(initialStatus) => setEditor({ task: null, status: initialStatus })}
+                onRestore={(task) => void restoreArchivedTask(task)}
+                onDelete={setPendingArchivedTaskDelete}
+                onEdit={openTaskDetail}
+                onUpdate={updateTaskProperties}
+                onContextMenu={(task, position) => setContextMenu({ taskId: task.id, ...position })}
+                onDragStart={startTaskDrag}
+                onDragEnd={endTaskDrag}
+                onDragEnter={setDropTarget}
+                onDrop={finishTaskDrop}
+                onOpenConversation={openTaskConversation}
+              />
+            )}
+          </div>
         ) : boardView === "list" ? (
           <IssueListView
             scrollRef={issueListRef}
@@ -3317,31 +4024,59 @@ export function App() {
               onUpdate={updateTaskProperties}
             />
           </Suspense>
-        ) : boardView === "workflow" ? (
-          <div className="workflow-view-stack">
+        ) : boardView === "workflow" && feishuConfigurationOpen ? (
+          <div className="workflow-view-stack feishu-configuration-stack">
             <FeishuWorkflowPanel
               catalog={feishuCatalog}
               configurationBaseToken={feishuConfigurationBaseToken}
               selectedSubjectKey={selectedFeishuSubjectKey}
               onSelectSubject={(subjectKey, openProject = true) => {
-                beginProjectRequestContext(selectedProjectIdRef.current, subjectKey);
-                setSelectedFeishuSubjectKey(subjectKey);
                 const subject = feishuCatalog.flatMap((base) => base.subjects).find((item) => item.subjectKey === subjectKey);
-                if (subject && openProject) changeProject(subject.projectId, "issues");
+                if (!subject) return;
+                changeProject(subject.projectId, openProject ? "issues" : "workflow");
+                beginProjectRequestContext(subject.projectId, subjectKey);
+                setSelectedFeishuSubjectKey(subjectKey);
+                setFeishuConfigurationOpen(!openProject);
               }}
               onAddBase={async (url) => {
                 const next = await addFeishuBaseAndRefreshProjects(url);
                 if (!next) return;
                 const nextSubjectKey = next.subjects[0]?.subjectKey ?? null;
-                beginProjectRequestContext(selectedProjectIdRef.current, nextSubjectKey);
+                const nextSubject = next.subjects[0];
+                if (nextSubject) {
+                  changeProject(nextSubject.projectId, "workflow");
+                  beginProjectRequestContext(nextSubject.projectId, nextSubject.subjectKey);
+                  setSelectedFeishuSubjectKey(nextSubject.subjectKey);
+                  setFeishuConfigurationOpen(true);
+                } else {
+                  beginProjectRequestContext(selectedProjectIdRef.current, nextSubjectKey);
+                  setSelectedFeishuSubjectKey(nextSubjectKey);
+                }
                 setFeishuConfigurationBaseToken(next.baseToken);
-                setSelectedFeishuSubjectKey(nextSubjectKey);
                 return next;
               }}
               onCatalogChange={setFeishuCatalog}
               onSubjectChange={updateFeishuSubject}
               onError={(message) => setActionError(message)}
             />
+            {selectedFeishuSubjectKey && unifiedStageDisplaysLoadedFor === selectedFeishuSubjectKey ? (
+              <UnifiedWorkflowStageSettings
+                subjectKey={selectedFeishuSubjectKey}
+                overrides={unifiedStageDisplays}
+                onChange={(override) => setUnifiedStageDisplays((current) => [
+                  ...current.filter((item) => !(
+                    item.subjectKey === override.subjectKey && item.stageId === override.stageId
+                  )),
+                  override,
+                ])}
+                onError={setActionError}
+              />
+            ) : selectedFeishuSubjectKey ? (
+              <div className="workflow-board-loading">{text("正在加载流程显示设置…", "Loading stage display settings…")}</div>
+            ) : null}
+          </div>
+        ) : boardView === "workflow" && !isSelectedFeishuProject ? (
+          <div className="workflow-view-stack">
             <Suspense fallback={<div className="workflow-board-loading">{text("正在打开节点模式…", "Opening workflow…")}</div>}>
               <WorkflowBoard
                 key={selectedProject?.id ?? GLOBAL_PROJECT_ID}
@@ -3466,14 +4201,26 @@ export function App() {
           style={{ left: projectContextMenu.x, top: projectContextMenu.y }}
         >
           <button
-            className="context-menu-item is-danger"
+            className="context-menu-item"
             type="button"
             role="menuitem"
-            onClick={() => requestProjectDelete(projectContextMenu.project)}
+            disabled={projectLifecyclePendingId !== null}
+            onClick={() => void updateProjectArchived(projectContextMenu.project, true)}
           >
-            <span className="context-menu-icon" aria-hidden="true"><LinearIcon name="trash" /></span>
-            <span className="context-menu-label">{text("删除项目", "Delete project")}</span>
+            <span className="context-menu-icon" aria-hidden="true"><LinearIcon name="folder" /></span>
+            <span className="context-menu-label">{text("归档项目", "Archive project")}</span>
           </button>
+          {projectContextMenu.project.id.startsWith("temp-") && (
+            <button
+              className="context-menu-item is-danger"
+              type="button"
+              role="menuitem"
+              onClick={() => requestProjectDelete(projectContextMenu.project)}
+            >
+              <span className="context-menu-icon" aria-hidden="true"><LinearIcon name="trash" /></span>
+              <span className="context-menu-label">{text("永久删除项目", "Delete project permanently")}</span>
+            </button>
+          )}
         </div>
       )}
 
@@ -3548,7 +4295,7 @@ export function App() {
               if (event.key === "Escape") closeProjectDeleteDialog();
             }}
           >
-            {projectDeleteIssueCount === null ? (
+            {projectDeleteAssociations === null ? (
               <>
                 <h2 id="project-delete-title">{text(
                   `删除项目“${pendingProjectDelete.name}”？`,
@@ -3585,10 +4332,7 @@ export function App() {
                   `无法删除项目“${pendingProjectDelete.name}”`,
                   `Cannot delete project “${pendingProjectDelete.name}”`,
                 )}</h2>
-                <p>{text(
-                  `该项目还有 ${projectDeleteIssueCount} 个议题（包含已归档议题）。请先移动或删除这些议题。`,
-                  `This project still has ${projectDeleteIssueCount} issues, including archived issues. Move or delete them first.`,
-                )}</p>
+                <p>{projectDeleteAssociationMessage}</p>
                 <div>
                   <button className="button primary" type="button" onClick={closeProjectDeleteDialog}>
                     {text("知道了", "Got it")}

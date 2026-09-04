@@ -18,17 +18,16 @@ test("project upload API returns task-bound upload rows without local paths", as
   assert.doesNotMatch(api, /listArtifactUploads[\s\S]{0,500}storageKey/);
 });
 
-test("Taskboard persists three independent upload status views", async () => {
+test("Taskboard keeps legacy upload view compatibility while using one unified board entry", async () => {
   const app = await source("web/src/App.tsx");
 
   assert.match(app, /type BoardView =[\s\S]*?"upload_queue"[\s\S]*?"uploading"[\s\S]*?"uploaded"/);
-  assert.match(app, /view === "upload_queue"/);
-  assert.match(app, /view === "uploading"/);
-  assert.match(app, /view === "uploaded"/);
-  assert.match(app, /上传队列/);
-  assert.match(app, /上传中/);
-  assert.match(app, /已经上传/);
+  assert.match(app, /view === "completed_editing"[\s\S]*?view === "upload_queue"[\s\S]*?view === "uploading"[\s\S]*?view === "uploaded"/);
+  assert.match(app, /setItem\([\s\S]*?"issues"\)/);
   assert.match(app, /<ArtifactUploadView/);
   assert.match(app, /revision=\{attachmentsRevision\}/);
   assert.match(app, /onOpenTask=\{openTaskDetail\}/);
+  assert.doesNotMatch(app, /onClick=\{\(\) => selectBoardView\("upload_queue"\)\}/);
+  assert.doesNotMatch(app, /onClick=\{\(\) => selectBoardView\("uploading"\)\}/);
+  assert.doesNotMatch(app, /onClick=\{\(\) => selectBoardView\("uploaded"\)\}/);
 });

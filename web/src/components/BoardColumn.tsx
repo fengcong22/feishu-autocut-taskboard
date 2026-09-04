@@ -88,7 +88,7 @@ interface BoardColumnProps {
   onDragStart: (task: Task, height: number) => void;
   onDragEnd: () => void;
   onDragEnter: (status: TaskStatus) => void;
-  onDrop: (status: TaskStatus, taskId: string, beforeTaskId: string | null) => void;
+  onDrop: (status: TaskStatus, taskId: string, beforeTaskId: string | null, sourceSurface?: "board" | "other-tasks-panel" | "unified-board") => void;
   onOpenConversation: (conversation: TaskConversationItem) => void;
 }
 
@@ -148,7 +148,11 @@ export function BoardColumn({
     const taskId =
       event.dataTransfer.getData("application/x-taskboard-task") ||
       event.dataTransfer.getData("text/plain");
-    if (taskId) onDrop(status, taskId, findDropBefore(event.currentTarget, event.clientY));
+    const sourceSurface = event.dataTransfer.getData("application/x-taskboard-source-surface");
+    const normalizedSourceSurface = sourceSurface === "other-tasks-panel" || sourceSurface === "unified-board"
+      ? sourceSurface
+      : "board";
+    if (taskId) onDrop(status, taskId, findDropBefore(event.currentTarget, event.clientY), normalizedSourceSurface);
     setDropBeforeTaskId(undefined);
   }
 
@@ -215,6 +219,7 @@ export function BoardColumn({
               isMoving={movingTaskId === task.id}
               isSettling={settlingTaskId === task.id}
               isContextMenuOpen={contextMenuTaskId === task.id}
+              dragSourceSurface="board"
               availableLabels={availableLabels}
               currentUser={currentUser}
               onEdit={onEdit}

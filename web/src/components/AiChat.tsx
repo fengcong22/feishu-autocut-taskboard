@@ -2152,7 +2152,7 @@ export function AiChat({
 
   if (!available) return null;
 
-  return (
+  return createPortal(
     <div
       className={`ai-chat-root is-${launcherState}`}
       onPointerDown={(event) => {
@@ -2728,14 +2728,19 @@ export function AiChat({
           type="button"
           className={`ai-chat-launcher is-${launcherState}`}
           aria-label={text("打开 AI 对话", "Open AI chat")}
-          aria-expanded="false"
+          aria-expanded={panelOpen}
           title={text("AI 对话", "AI chat")}
-          onClick={() => setPanelOpen(true)}
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation();
+            setPanelOpen(true);
+          }}
         >
           <TaskboardIcon name="aiLauncher" />
           {launcherState !== "idle" && <span className="ai-chat-launcher-state" aria-hidden="true" />}
         </button>
       )}
-    </div>
+    </div>,
+    document.body,
   );
 }

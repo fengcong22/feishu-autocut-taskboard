@@ -17,30 +17,31 @@ const styles = await readFile(new URL("../web/src/components/workflow.css", impo
 const globalStyles = await readFile(new URL("../web/src/styles.css", import.meta.url), "utf8");
 
 test("the taskboard defaults to issues and exposes the current project views", () => {
-  assert.match(appSource, /type BoardView = "dashboard" \| "issues" \| "list" \| "gantt" \| "workflow"/);
+  assert.match(appSource, /type BoardView = "dashboard" \| "issues" \| "list" \| "gantt" \| "workflow" \| "completed_editing"/);
   assert.match(
     appSource,
-    /function readProjectBoardView\(projectId: string\): BoardView \{\s*const view = [^;]+;\s*return [\s\S]*?\? view\s*: "issues";\s*\}/,
+    /function readProjectBoardView\(projectId: string\): BoardView \{[\s\S]*?view === "completed_editing"[\s\S]*?setItem\([\s\S]*?"issues"\)[\s\S]*?return "issues";/,
   );
   assert.match(appSource, /useState<BoardView>\(\(\) => readProjectBoardView\(initialProjectId\)\)/);
   assert.match(appSource, />\s*\{text\("仪表盘", "Dashboard"\)\}\s*<\/button>/);
-  assert.match(appSource, />\s*\{text\("议题看板", "Issue board"\)\}\s*<\/button>/);
+  assert.match(appSource, /text\("议题看板", "Issue board"\)/);
+  assert.match(appSource, /text\("流程看板", "Workflow board"\)/);
   assert.match(appSource, />\s*\{text\("列表视图", "List"\)\}\s*<\/button>/);
   assert.match(appSource, />\s*\{text\("甘特图", "Gantt"\)\}\s*<\/button>/);
   assert.match(appSource, /aria-pressed=\{boardView === "issues"\}/);
   assert.match(appSource, /onClick=\{\(\) => selectBoardView\("issues"\)\}/);
-  assert.match(appSource, /const SHOW_WORKFLOW_BOARD_ENTRY = false/);
-  assert.match(appSource, /SHOW_WORKFLOW_BOARD_ENTRY && \([\s\S]*?>\s*\{text\("节点模式", "Workflow"\)\}\s*<\/button>/);
+  assert.match(appSource, /const SHOW_WORKFLOW_BOARD_ENTRY = true/);
+  assert.match(appSource, /SHOW_WORKFLOW_BOARD_ENTRY && !isSelectedFeishuProject && \([\s\S]*?>\s*\{text\("节点模式", "Workflow"\)\}\s*<\/button>/);
   assert.match(appSource, /function changeProject[\s\S]*?setBoardView\(readProjectBoardView\(projectId\)\)/);
   assert.doesNotMatch(appSource, /<span>活跃<\/span>|<span>积压事项<\/span>|所有议题|add-view/);
 });
 
-test("secondary views lazy-load while issue controls remain isolated", () => {
+test("secondary views lazy-load while searchable operational views share the toolbar", () => {
   assert.match(appSource, /lazy\(\(\) => import\("\.\/components\/WorkflowBoard"\)/);
   assert.match(appSource, /lazy\(\(\) => import\("\.\/components\/GanttView"\)/);
   assert.match(appSource, /\(boardView === "issues" \|\| boardView === "list" \|\| boardView === "gantt"\) && <div className="toolbar-tools">/);
   assert.match(appSource, /boardView === "issues" && \([\s\S]*?className=\{`other-tasks-trigger/);
-  assert.match(appSource, /boardView === "workflow" \? \([\s\S]*?<Suspense[\s\S]*?<WorkflowBoard/);
+  assert.match(appSource, /boardView === "workflow" && !isSelectedFeishuProject \? \([\s\S]*?<Suspense[\s\S]*?<WorkflowBoard/);
   assert.match(appSource, /projectId=\{selectedProject\?\.id \?\? GLOBAL_PROJECT_ID\}/);
   assert.match(appSource, /onWorkflowsChange=\{setWorkflowOptions\}/);
   assert.match(workflowSource, /export function WorkflowBoard\(/);
@@ -52,6 +53,18 @@ test("secondary views lazy-load while issue controls remain isolated", () => {
   assert.match(styles, /\.workflow-board/);
   assert.match(globalStyles, /\.workflow-node/);
   assert.doesNotMatch(appSource, /workflow-board-placeholder|具体功能将在后续开发/);
+});
+
+test("Feishu subjects use one unified workflow board and migrate legacy upload views", () => {
+  assert.match(appSource, /UnifiedWorkflowBoard/);
+  assert.match(appSource, /流程看板/);
+  assert.match(appSource, /completed_editing[\s\S]*issues|upload_queue[\s\S]*issues|uploading[\s\S]*issues|uploaded[\s\S]*issues/);
+  assert.match(appSource, /selectedFeishuSubjectKey/);
+  assert.match(appSource, /artifactUploadItems/);
+  assert.doesNotMatch(appSource, /onClick=\{\(\) => selectBoardView\("upload_queue"\)\}/);
+  assert.doesNotMatch(appSource, /onClick=\{\(\) => selectBoardView\("uploading"\)\}/);
+  assert.doesNotMatch(appSource, /onClick=\{\(\) => selectBoardView\("uploaded"\)\}/);
+  assert.doesNotMatch(appSource, /onClick=\{\(\) => selectBoardView\("completed_editing"\)\}/);
 });
 
 test("the workflow catalog retains the real trigger, capability, API, integration, planning and result steps", () => {
@@ -192,7 +205,7 @@ test("issue workflow choices read the shared service workspace without loading R
   assert.match(workflowStoreSource, /INITIAL_WORKFLOW_ID = "issue-delivery"/);
   assert.match(workflowStoreSource, /INITIAL_WORKFLOW_NAME = "议题处理与交付"/);
   assert.match(workflowStoreSource, /export function workflowOptionsFromWorkspace\(workspace: unknown\)/);
-  assert.match(appSource, /getWorkflowWorkspace<unknown>\(projectId, signal\)/);
+  assert.match(appSource, /getWorkflowWorkspace<unknown>\(projectId, requestSignal\)/);
   assert.match(appSource, /event\.type === "workflow\.updated"/);
   assert.match(appSource, /refreshWorkflowOptions\(selectedProjectId\)/);
   assert.match(appSource, /const WorkflowBoard = lazy/);
@@ -234,7 +247,7 @@ test("Git and issue configuration render the selected action in each step title"
   assert.match(inspectorSource, /aria-label=\{text\("Git Worktree 目录", "Git worktree directory"\)\}/);
   assert.match(inspectorSource, /aria-label=\{text\("议题触发状态", "Issue trigger status"\)\}/);
   assert.match(catalogSource, /function workflowNodeDisplayTitle[\s\S]*?data\.kind === "git"[\s\S]*?data\.kind === "issue-trigger"[\s\S]*?data\.kind === "issue-update"/);
-  assert.match(workflowSource, /displayTitle: workflowNodeDisplayTitle\(node\.data, text\)/);
+  assert.match(workflowSource, /displayTitle: workflowNodeDisplayTitle\(node\.data, text(?:, statusLabel)?\)/);
   assert.match(workflowNodeSource, /data\.displayTitle \?\? data\.title/);
 });
 

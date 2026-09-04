@@ -7,16 +7,14 @@ import type {
 } from "../types";
 import {
   addFeishuBaseFromUrl,
+  exportFeishuWorkflowShare,
+  importFeishuWorkflowShare,
   saveFeishuWorkflowDraft,
   setFeishuSubjectDisabled,
   setFeishuSubjectDisplay,
   setFeishuSubjectEnabled,
 } from "../feishuWorkflow";
-import {
-  exportFeishuWorkflowShare,
-  importFeishuWorkflowShare,
-  listFeishuPackages,
-} from "../api";
+import { listFeishuPackages } from "../api";
 
 export interface FeishuWorkflowPanelProps {
   catalog: FeishuBaseCatalog[];
@@ -435,7 +433,7 @@ export function FeishuWorkflowPanel({
           <label className="feishu-settings-wide">Auto-Cut 包<select value={subjectForm.packageAlias} onChange={(event) => setSubjectForm({ ...subjectForm, packageAlias: event.target.value })}>
             {!selectedPackage && subjectForm.packageAlias && <option value={subjectForm.packageAlias}>{subjectForm.packageAlias}（不可用）</option>}
             <option value="">未选择包</option>
-            {(packageOptions ?? []).map((item) => <option key={item.alias} value={item.alias}>{item.name}（{item.alias}）{item.state === "enabled" ? "" : ` · ${item.state === "disabled" ? "已停用" : "草稿"}`}</option>)}
+            {(packageOptions ?? []).filter((item) => item.state === "enabled").map((item) => <option key={item.alias} value={item.alias}>{item.name}（{item.alias}）</option>)}
           </select></label>
         </div>
       </fieldset>

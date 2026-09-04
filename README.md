@@ -46,7 +46,7 @@ npm run taskctl -- issue create \
   --labels product,mvp
 ```
 
-Use `npm link` if you want `taskctl` on your shell path. Set `CODEX_TASKBOARD_URL` to point the CLI at another local or LAN service. Cloud deployments are configured through the loopback companion with `taskctl cloud login`.
+Use `npm link` if you want `taskctl` on your shell path. Set `CODEX_TASKBOARD_URL` to point the CLI at another local loopback service. Cloud deployments are configured through the loopback companion with `taskctl cloud login`.
 
 ## Install the Codex Skill
 
@@ -118,18 +118,54 @@ The script adds a Taskboard entry to the Codex sidebar and renders the iframe ac
 
 To use a different UI origin, set `window.__CODEX_TASKBOARD_URL__` before the user script runs.
 
+## Feishu Auto-Cut integration
+
+The Feishu Bridge and Taskboard integration is local-only. The Bridge creates workflow tasks through `POST /api/local/feishu/tasks` with the `x-taskboard-client: feishu-bridge` header and the per-launch `x-feishu-bridge-secret` shared secret. `start-local.ps1` injects the same `CODEX_FEISHU_BRIDGE_SECRET` into both services. That route stores a server-owned Base/table/record provenance row alongside the task. A normal `POST /api/tasks` request that merely copies the Feishu description marker or the `feishu` label is not eligible to start Auto-Cut, upload artifacts, or appear in the Bridge waiting-task query.
+
+A server-registered Feishu task may run its locally registered Auto-Cut package from a non-Git workspace. Taskboard supplies Codex's non-Git workspace option only after resolving the server-owned task provenance and trusted package snapshot; ordinary tasks, copied markers, browser input, and Feishu cells cannot request it.
+
+If Codex exits before returning a native thread ID, moving the trusted task back to `todo` and starting it again detaches the failed local conversation while preserving that conversation in history. A task whose native Codex thread already started is never detached automatically, which prevents an accidental duplicate Auto-Cut run.
+
+The Bridge uses these loopback routes for lifecycle reconciliation:
+
+- `GET /api/local/feishu/tasks` — query trusted tasks by event or Base/table/record/trigger scope.
+- `POST /api/local/feishu/tasks/:id/archive` — archive only a trusted task after an optimistic version check.
+- `POST /api/local/tasks/:id/execute` — the single execution claim path used by manual start and drag-to-`in_progress`. Repeated requests for the same task and trigger reuse the existing reservation; a different trigger remains protected by the start-in-progress conflict.
+
+Each Base/table subject has a deterministic isolated project id: `feishu-` plus the first 16 hexadecimal characters of `sha256(baseToken:tableId)`. The Bridge and Taskboard must use this same rule; existing legacy project ids are not rewritten automatically, and newly delivered tasks use the 16-character form.
+
+Use the workflow panel to paste either a direct Feishu `/base/{base_token}` link or a knowledge-base `/wiki/{wiki_token}` link from an official `https://*.feishu.cn` domain. Taskboard passes the complete link to the loopback Bridge for read-only metadata. For Wiki links, the Bridge first confirms that the node is a bitable and resolves its real Base token while preserving the optional `table` selection; the Wiki token is never treated as a Base identity. Every discovered table remains a draft until it is explicitly shown and enabled, and display visibility remains independent from Bridge enablement. `/base/workspace/{token}` links are still unsupported. Wiki imports require the Feishu application used by the Bridge to have read access to the Wiki node.
+
+Each subject draft independently stores its one trigger field/value, manual or automatic execution mode, package alias, concurrency limits, and upload policy. Enabling performs live metadata and local package validation before replacing the active Bridge snapshot. Exported shared configuration omits credentials, workspace paths, ZIP source paths, upload paths, runtime state, and task history. Import first shows live Bridge plus local binding diagnostics, lists the actual warning/error messages for confirmation, and always writes subjects as drafts.
+Refreshing metadata for an already-enabled subject creates a new local draft and leaves the last validated Bridge snapshot active until that draft is explicitly enabled.
+
+Automatic execution is an explicit server policy (`allowAutomaticExecution`) and remains off unless the local deployment enables it with `CODEX_TASKBOARD_ALLOW_AUTOMATIC_EXECUTION`. A successful Auto-Cut run remains `in_progress` until its Jianying ZIP is validated and SHA-256 hashed; that verified ZIP moves manual tasks to `in_review` and automatic tasks to `done`. Automatic upload configuration queues automatic tasks after ZIP verification and queues manual tasks after acceptance moves them to `done`; manual upload configuration leaves enqueueing to the completed-task UI. Upload jobs copy the verified artifact to a configured local or UNC/NAS destination with per-subject concurrency, manual retry, and conflict protection.
+
+The current artifact source is `manual_select`: choose the complete ZIP from the task detail. `watch_directory` and `driver_report` remain reserved configuration values and are not enabled in the UI until their collectors are implemented.
+
+### Unified Feishu subject workflow board
+
+For a Feishu subject, the Base and subject selected in the sidebar are the only scope of the workflow board. Tasks, saved views, stage names, and descriptions from another Base or subject never enter the current page. On first entry, Taskboard creates only the protected `All stages` system view, which lists the available stages in their stable order. It cannot be edited or deleted, and Taskboard does not pre-create business views such as an editing or upload view.
+
+To make a board for a particular workflow, choose `New view`, enter a name, select the required stages, arrange their order, and choose `Save`. You can then select that view from the workflow board and use `Manage views` to copy, edit, make default, or delete a custom view. Views and filters change only the current subject's display; they do not change a task's actual status or affect another subject. In that subject's stage-display settings, stage names and descriptions can be changed to explain when cards appear. Those labels are descriptive only: they do not change Auto-Cut, review, or upload execution rules.
+
+Hidden stages do not lose work. The board keeps counts for tasks, verified ZIPs, and failed uploads in hidden stages. To find a hidden task, set `Search scope` to `All stages`; a result can temporarily reveal its stage without changing the saved view. ZIP details are folded by default and can be opened with a pointer or keyboard; failed-upload details open automatically so their retry state is visible. Upload columns are read-only, so dragging cannot change upload state; enqueue, the upload worker, and retry actions continue to drive those states. Ordinary tasks remain under the `Other tasks` tab instead of being mixed into the subject workflow.
+
+Ordinary local projects keep their `node mode`; Feishu subjects use the unified workflow board and do not show the node-mode entry. From the project menu, archiving moves a local project to `Archived / history`, where it can be restored. Only an empty manually-created project can be deleted permanently, and that deletion cannot be undone. Removing a Base or subject from Taskboard archives its local history and workflow views only; it does not delete the remote Feishu Base, table, or records. Re-adding the same subject restores its local history.
+
+Base cells provide only controlled values and package aliases. They never provide a workspace path, shell command, prompt, credential, or upload destination; those bindings stay in the local Taskboard/Bridge configuration.
+
 ## Configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CODEX_TASKBOARD_HOST` | `0.0.0.0` | HTTP bind address; use `127.0.0.1` to disable LAN access |
+| `CODEX_TASKBOARD_HOST` | `127.0.0.1` | HTTP bind address; only loopback is allowed |
 | `CODEX_TASKBOARD_PORT` | `47823` | Local HTTP port |
 | `CODEX_TASKBOARD_DATA_DIR` | `.data` | SQLite data directory |
 | `CODEX_TASKBOARD_URL` | `http://127.0.0.1:47823` | CLI API origin |
+| `CODEX_TASKBOARD_ALLOW_AUTOMATIC_EXECUTION` | unset (off) | Set to `1`, `true`, `yes`, or `on` only on an explicitly approved local deployment |
 
-`npm start` prints both the local URL and the available LAN URLs. Teammates on the same trusted network can open one of those LAN URLs and use the same taskboard service. Task, comment, and attachment changes are broadcast to every open client through server-sent events; reconnecting clients perform a full refresh so changes made while disconnected are not missed. A teammate using `taskctl` can point it at the shared service with `CODEX_TASKBOARD_URL=http://<host-ip>:47823`.
-
-LAN mode has no account authentication: anyone on the trusted local network who can reach the URL can read and write the taskboard. Public internet and cloud deployment require an authenticated deployment boundary.
+`npm start` exposes the taskboard only on the local machine. Task, comment, and attachment changes are broadcast to every open local client through server-sent events; reconnecting clients perform a full refresh so changes made while disconnected are not missed.
 
 ## Share through Cloudflare
 

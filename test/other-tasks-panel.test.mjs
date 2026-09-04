@@ -23,8 +23,8 @@ function cssBlock(selector) {
   return styles.slice(start, end + 2);
 }
 
-test("the issue workspace projects the seven statuses into adaptive main and secondary groups", () => {
-  assert.deepEqual(statusList("MAIN_STATUSES"), ["todo", "in_progress", "blocked", "in_review"]);
+test("the issue workspace projects the statuses into adaptive main and secondary groups", () => {
+  assert.deepEqual(statusList("MAIN_STATUSES"), ["todo", "queued", "in_progress", "blocked", "in_review"]);
   assert.deepEqual(statusList("SECONDARY_STATUSES"), ["backlog", "done", "canceled"]);
   assert.match(statusSource, /satisfies readonly TaskStatus\[\]/);
   assert.match(appSource, /const mainStatuses = hasBlockedTasks[\s\S]*?MAIN_STATUSES\.filter\(\(status\) => status !== "blocked"\)/);
@@ -38,7 +38,7 @@ test("the issue workspace projects the seven statuses into adaptive main and sec
 
 test("other tasks is a closed-by-default non-modal panel with archived issues", () => {
   assert.match(appSource, /useState\(false\)/);
-  assert.match(appSource, /useState<OtherTaskTab>\("backlog"\)/);
+  assert.match(appSource, /useState<OtherTasksPanelTab>\("backlog"\)/);
   assert.match(statusSource, /OTHER_TASK_TABS = \[[\s\S]*?\.\.\.SECONDARY_STATUSES,[\s\S]*?"archived"/);
   assert.match(appSource, /className=\{`other-tasks-trigger\$\{otherTasksOpen \? " is-open" : ""\}`\}/);
   assert.match(appSource, /aria-controls="other-tasks-panel"/);
@@ -48,9 +48,9 @@ test("other tasks is a closed-by-default non-modal panel with archived issues", 
   assert.match(panelSource, /<aside[\s\S]*?id="other-tasks-panel"/);
   assert.match(panelSource, /aria-hidden=\{!open\}/);
   assert.match(panelSource, /role="tablist"/);
-  assert.match(panelSource, /OTHER_TASK_TABS\.map\(\(tab\) =>/);
+  assert.match(panelSource, /tabs\.map\(\(tab\) =>/);
   assert.match(panelSource, /aria-selected=\{selected\}/);
-  assert.match(panelSource, /tab === "archived" \? archivedTasks\.length : tasksByStatus\[tab\]\.length/);
+  assert.match(panelSource, /tab === "ordinary"[\s\S]*?ordinaryTasks\?\.length[\s\S]*?archivedTasks\.length[\s\S]*?tasksByStatus\[tab\]\.length/);
   assert.match(panelSource, /<ArchivedTaskCard/);
   assert.doesNotMatch(panelSource, /createPortal|role="dialog"|backdrop|overlay/);
   assert.match(cssBlock(".issue-board-layout"), /display: grid/);
@@ -69,7 +69,7 @@ test("search and filters feed the same status buckets used by the board and pane
   assert.match(appSource, /tasksByStatus=\{tasksByStatus\}/);
   assert.match(appSource, /archivedTasks=\{filteredArchivedTasks\}/);
   assert.match(appSource, /hasActiveFilters=\{hasActiveTaskFilters\}/);
-  assert.match(panelSource, /const tasks = archived \? archivedTasks : tasksByStatus\[activeTab\]/);
+  assert.match(panelSource, /const tasks = ordinary[\s\S]*?ordinaryTasks \?\? \[\][\s\S]*?archivedTasks[\s\S]*?tasksByStatus\[resolvedActiveTab\]/);
   assert.match(panelSource, /hasActiveFilters\s*\? text\("当前筛选下无匹配议题", "No issues match the current filters"\)/);
   assert.match(boardColumnSource, /tasks\.length === 0 && <div className="column-empty">\{emptyMessage\}<\/div>/);
 });
@@ -84,15 +84,27 @@ test("panel cards reuse TaskCard and the existing ranked board drop path", () =>
   assert.match(panelSource, /onDragStart=\{onDragStart\}/);
   assert.match(panelSource, /onDragEnd=\{onDragEnd\}/);
   assert.match(panelSource, /onOpenConversation=\{onOpenConversation\}/);
-  assert.equal(appSource.match(/onDragStart=\{startTaskDrag\}/g)?.length, 2);
-  assert.equal(appSource.match(/onDragEnd=\{endTaskDrag\}/g)?.length, 2);
+  assert.match(panelSource, /data-source-surface="other-tasks-panel"/);
+  assert.match(panelSource, /data-drag-source="other-tasks-panel"/);
+  assert.match(panelSource, /sourceSurface/);
+  assert.equal(appSource.match(/onDragStart=\{startTaskDrag\}/g)?.length, 4);
+  assert.equal(appSource.match(/onDragEnd=\{endTaskDrag\}/g)?.length, 4);
   assert.match(boardColumnSource, /findDropBefore\(event\.currentTarget, event\.clientY\)/);
+  assert.match(boardColumnSource, /getData\("application\/x-taskboard-source-surface"\)/);
   assert.match(boardColumnSource, /onDrop\(status, taskId, findDropBefore/);
   assert.match(panelSource, /findDropBefore\(event\.currentTarget, event\.clientY\)/);
-  assert.match(panelSource, /onDrop\(activeTab, taskId, findDropBefore/);
+  assert.match(panelSource, /getData\("application\/x-taskboard-source-surface"\)/);
+  assert.match(panelSource, /onDrop\(taskStatusTab, taskId, findDropBefore/);
   assert.match(panelSource, /busy=\{restoringTaskId !== null \|\| deletingTaskId !== null\}/);
   assert.match(appSource, /onDrop=\{finishTaskDrop\}/);
   assert.match(appSource, /moveTask\(task, destination, beforeTaskId, true\)/);
+});
+
+test("other tasks panel rejects unified workflow drags before fallback source normalization", () => {
+  assert.match(panelSource, /hasUnifiedWorkflowDragType/);
+  assert.match(panelSource, /hasUnifiedWorkflowDragType\(event\.dataTransfer\.types\)/);
+  assert.match(panelSource, /sourceSurface === "unified-board"/);
+  assert.match(panelSource, /setDropBeforeTaskId\(undefined\);\s*return;/);
 });
 
 test("global creation defaults to todo while per-column creation keeps the chosen status", () => {
@@ -123,4 +135,13 @@ test("the adaptive desktop grid fills available width and degrades to horizontal
   assert.match(styles, /@media \(max-width: 719px\)[\s\S]*?\.board \{[\s\S]*?display: flex[\s\S]*?width: max-content/);
   assert.match(styles, /@media \(max-width: 719px\)[\s\S]*?\.board-column \{[\s\S]*?flex: 0 0 300px/);
   assert.match(styles, /@media \(max-width: 719px\)[\s\S]*?\.other-tasks-panel \{[\s\S]*?width: 300px/);
+});
+
+test("the optional ordinary tab keeps one adaptive tab row and resets outside Feishu projects", () => {
+  assert.match(panelSource, /"--other-tasks-tab-count": tabs\.length/);
+  assert.match(styles, /grid-template-columns: repeat\(var\(--other-tasks-tab-count, 4\), minmax\(0, 1fr\)\)/);
+  assert.match(
+    appSource,
+    /if \(!isSelectedFeishuProject && otherTasksTab === "ordinary"\) \{[\s\S]*?setOtherTasksTab\("backlog"\)/,
+  );
 });
