@@ -26,8 +26,13 @@ test("project automation state is device-local and scoped by taskboard project",
   assert.match(appSource, /type ProjectAutomationStatus = "ACTIVE" \| "PAUSED"/);
   assert.match(appSource, /automationId\?: string/);
   assert.match(appSource, /codexProjectId: string/);
+  assert.match(appSource, /codexProjectKind: "local" \| "remote"/);
+  assert.match(appSource, /codexHostId: string/);
+  assert.match(appSource, /workspacePath: string/);
   assert.match(appSource, /type AutomationIntervalMinutes = 5 \| 10 \| 15 \| 30 \| 60/);
-  assert.match(appSource, /DEFAULT_AUTOMATION_OPTIONS[\s\S]*?model: "gpt-5\.5"[\s\S]*?reasoningEffort: "high"/);
+  assert.match(appSource, /getAiChatCatalog\(\s*selectedProject\.id,\s*controller\.signal,\s*selectedCodexProjectIdentity,\s*\)/);
+  assert.match(appSource, /defaultModel\.slug/);
+  assert.match(appSource, /defaultModel\.defaultReasoningEffort/);
   assert.match(appSource, /taskboardStorage\.getItem\(PROJECT_AUTOMATIONS_KEY\)/);
   assert.match(appSource, /taskboardStorage\.setItem\(PROJECT_AUTOMATIONS_KEY, JSON\.stringify\(next\)\)/);
   assert.match(appSource, /projectAutomations\[selectedProjectId\]/);
@@ -38,6 +43,8 @@ test("automation requests use the exact Codex host message contract", () => {
   assert.match(appSource, /operation: "ensure-active" \| "pause" \| "list"/);
   assert.match(appSource, /context: AutomationRequestContext[\s\S]*?taskboardProjectId: context\.taskboardProjectId/);
   assert.match(appSource, /codexProjectId/);
+  assert.match(appSource, /codexProjectKind/);
+  assert.match(appSource, /codexHostId/);
   assert.match(appSource, /projectName: selectedProject\.name/);
   assert.match(appSource, /workspacePath/);
   assert.match(appSource, /skillPath: manageTaskboardSkillPath/);
@@ -51,10 +58,45 @@ test("automation requests use the exact Codex host message contract", () => {
 });
 
 test("project mapping is based on exact ids and workspace paths, never project names", () => {
-  assert.match(appSource, /hostContext\?\.projects\?\.some\([\s\S]*?project\.id === selectedProject\.id/);
-  assert.match(appSource, /deviceWorkspacePaths\[project\.id\] === workspacePath/);
+  const automationContextSource = appSource.slice(
+    appSource.indexOf("const automationProjectContext"),
+    appSource.indexOf("const automationRequestContext"),
+  );
+  assert.match(
+    automationContextSource,
+    /const effectiveCodexProjectId = selectedProject\.id === GLOBAL_PROJECT_ID\s*\? hostContext\?\.projectId\s*: selectedProject\.id/,
+  );
+  assert.match(automationContextSource, /project\.id === effectiveCodexProjectId/);
+  assert.match(automationContextSource, /savedIdentity\?\.codexProjectKind === "remote"/);
+  assert.match(automationContextSource, /project\.id === savedIdentity\.codexProjectId/);
+  assert.match(automationContextSource, /liveProject\.hostId !== savedIdentity\.codexHostId/);
+  assert.match(automationContextSource, /liveProject\.workspacePath !== savedIdentity\.workspacePath/);
+  assert.match(appSource, /directCodexProject\?\.workspacePath/);
+  assert.match(appSource, /\(deviceWorkspacePaths\[project\.id\] \?\? project\.workspacePath\) === workspacePath/);
   assert.match(appSource, /请先在 Codex 中添加并映射该项目目录/);
   assert.doesNotMatch(appSource, /project\.name === selectedProject\.name/);
+});
+
+test("global tasks open a projectless conversation", () => {
+  const openTaskSource = appSource.slice(
+    appSource.indexOf("function codexProjectContextForTaskProject"),
+    appSource.indexOf("function changeProject"),
+  );
+  assert.match(
+    openTaskSource,
+    /if \(taskboardProjectId === GLOBAL_PROJECT_ID\) return null/,
+  );
+  assert.match(
+    openTaskSource,
+    /const projectless = task\.projectId === GLOBAL_PROJECT_ID/,
+  );
+  assert.match(openTaskSource, /codexProjectId: codexProject\.id,\s*codexProjectKind: codexProject\.projectKind/);
+  assert.match(openTaskSource, /const savedRemoteIdentity = projectCodexIdentities\[task\.projectId\]/);
+  assert.match(openTaskSource, /codexProjectContextForTaskProject\(task\.projectId\)/);
+  assert.match(openTaskSource, /project\.hostId === baseIdentity\.codexHostId/);
+  assert.match(openTaskSource, /project\.workspacePath === worktreePath/);
+  assert.match(openTaskSource, /if \(matches\.length !== 1\) return null/);
+  assert.match(openTaskSource, /codexProjectId: codexProjectContext\?\.codexProjectId/);
 });
 
 test("the project navigation automation menu owns the icon, fields, and accessible popover", () => {
@@ -66,7 +108,7 @@ test("the project navigation automation menu owns the icon, fields, and accessib
   assert.doesNotMatch(menuSource, /已开启自动认领|自动认领未开启/);
   assert.match(menuSource, /自动认领开关/);
   assert.match(menuSource, /5, 10, 15, 30, 60/);
-  assert.match(menuSource, /AUTOMATION_MODELS\.map/);
+  assert.match(menuSource, /models\.map/);
   assert.match(menuSource, /EFFORT_LABELS\[effort\]/);
   assert.match(menuSource, /createPortal/);
   assert.match(menuSource, /window\.addEventListener\("resize"/);
@@ -97,13 +139,13 @@ test("the automation menu reuses the board switches and keeps form focus chrome 
   assert.match(menuSource, /className=\{`board-setting-switch\$\{draft\.quotaAware \? " is-on" : ""\}`\}/);
   assert.match(menuSource, /aria-checked=\{draft\.quotaAware\}/);
   assert.doesNotMatch(menuSource, /type="checkbox"/);
-  assert.match(styles, /\.project-automation-field select:focus-visible\s*\{[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s);
+  assert.match(styles, /\.project-automation-picker-trigger:focus-visible\s*\{[^}]*outline:\s*0;[^}]*box-shadow:\s*0 0 0 2px var\(--accent-soft\);/s);
   assert.doesNotMatch(styles, /\.project-automation-switch input:focus-visible/);
 });
 
 test("unavailable automation state has one notice, clears stale errors, and cannot change", () => {
   assert.match(menuSource, /error && error !== unavailableReason/);
-  assert.match(menuSource, /const disabled = pending \|\| Boolean\(unavailableReason\)/);
+  assert.match(menuSource, /const disabled = pending \|\| !selectedModel \|\| Boolean\(unavailableReason\)/);
   assert.equal(menuSource.match(/disabled=\{disabled\}/g)?.length, 5);
   const reconcileSource = appSource.slice(
     appSource.indexOf("const reconcileProjectAutomation"),
@@ -118,11 +160,12 @@ test("unavailable automation state has one notice, clears stale errors, and cann
 
 test("automation changes submit immediately with model-specific effort normalization", () => {
   assert.match(menuSource, /onChange: \(options: AutomationOptions\) => void/);
-  assert.match(menuSource, /const disabled = pending \|\| Boolean\(unavailableReason\)/);
+  assert.match(menuSource, /const disabled = pending \|\| !selectedModel \|\| Boolean\(unavailableReason\)/);
   assert.match(menuSource, /const submitChange = \(next: AutomationOptions\) => \{[\s\S]*?setDraft\(next\);[\s\S]*?onChange\(next\);[\s\S]*?\}/);
-  assert.match(menuSource, /submitChange\(withAutomationModel\(draft, event\.target\.value as AutomationModel\)\)/);
-  assert.match(menuSource, /getAutomationModel\(draft\.model\)\.efforts\.map/);
-  assert.match(menuSource, /<option key=\{effort\} value=\{effort\}>\{text\(\.\.\.EFFORT_LABELS\[effort\]\)\}<\/option>/);
+  assert.match(menuSource, /const model = models\.find\(\(candidate\) => candidate\.slug === value\)/);
+  assert.match(menuSource, /model\.supportedReasoningEfforts\.includes\(draft\.reasoningEffort\)/);
+  assert.match(menuSource, /selectedModel\.supportedReasoningEfforts\.map/);
+  assert.match(menuSource, /EFFORT_LABELS\[effort\] \? text\(\.\.\.EFFORT_LABELS\[effort\]\) : effort/);
   assert.match(menuSource, /low: \["轻度", "Low"\]/);
   assert.match(menuSource, /xhigh: \["极高 \(xhigh\)", "Extra high \(xhigh\)"\]/);
   assert.match(menuSource, /max: \["最高", "Maximum"\]/);
@@ -138,7 +181,7 @@ test("pending completion reconciles the optimistic draft to confirmed host state
   assert.match(menuSource, /const wasPendingRef = useRef\(pending\)/);
   assert.match(
     menuSource,
-    /if \(wasPendingRef\.current && !pending\) \{\s*setDraft\(\{ \.\.\.DEFAULT_OPTIONS, \.\.\.automation \}\);\s*\}/,
+    /if \(wasPendingRef\.current && !pending\) \{\s*setDraft\(automationOptions\(models, automation\)\);\s*\}/,
   );
   assert.match(menuSource, /wasPendingRef\.current = pending/);
   assert.match(menuSource, /disabled=\{disabled\}/);
@@ -163,6 +206,10 @@ test("opening settings and changing projects reconcile with the host list", () =
     /sendAutomationRequest\(\s*"apply-policy",\s*queuedSave\.options,\s*queuedSave\.context,\s*previousRecord\?\.automationId,\s*\)/,
   );
   assert.match(appSource, /const policy = isAutomationHostPolicy\(response\.policy\) \? response\.policy : null/);
+  assert.match(appSource, /typeof value\.codexProjectId === "string"/);
+  assert.match(appSource, /value\.codexProjectKind === "local" \|\| value\.codexProjectKind === "remote"/);
+  assert.match(appSource, /typeof value\.codexHostId === "string"/);
+  assert.match(appSource, /typeof value\.workspacePath === "string"/);
   assert.match(appSource, /const item = \(isAutomationHostItem\(response\.item\) \? response\.item : undefined\)\s*\?\? items\.find\(\(candidate\) => candidate\.id === policy\.automationId\)/);
   assert.match(appSource, /items\.find\(\(candidate\) => candidate\.id === policy\.automationId\)/);
   assert.match(appSource, /items\.length === 1 \? items\[0\] : undefined/);
@@ -170,6 +217,16 @@ test("opening settings and changing projects reconcile with the host list", () =
   assert.match(appSource, /status: item\?\.status \?\? "PAUSED"/);
   assert.match(appSource, /enabledByUser: policy\.enabledByUser/);
   assert.match(appSource, /quotaAware: policy\.quotaAware/);
+  assert.match(drainSource, /codexProjectId: policy\.codexProjectId/);
+  assert.match(drainSource, /codexProjectKind: policy\.codexProjectKind/);
+  assert.match(drainSource, /codexHostId: policy\.codexHostId/);
+  assert.match(drainSource, /workspacePath: policy\.workspacePath/);
+  assert.doesNotMatch(drainSource, /codexProjectId: queuedSave\.context\.codexProjectId/);
+  assert.match(reconcileSource, /const effectiveProjectIdentity = policy \?\? automationRequestContext/);
+  assert.match(reconcileSource, /codexProjectId: effectiveProjectIdentity\.codexProjectId/);
+  assert.match(reconcileSource, /codexProjectKind: effectiveProjectIdentity\.codexProjectKind/);
+  assert.match(reconcileSource, /codexHostId: effectiveProjectIdentity\.codexHostId/);
+  assert.match(reconcileSource, /workspacePath: effectiveProjectIdentity\.workspacePath/);
   assert.match(appSource, /automationId: undefined,[\s\S]*?status: "PAUSED"/);
   assert.match(drainSource, /writeProjectAutomation\(queuedSave\.projectId, previousRecord\)/);
 });

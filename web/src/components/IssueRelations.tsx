@@ -13,13 +13,143 @@ import type {
 } from "../types";
 import { useTaskboardI18n } from "../i18n";
 import { ActorAvatar } from "./ActorAvatar";
-import { StatusIcon } from "./BoardColumn";
 import { LinearIcon } from "./LinearIcon";
-import { TaskboardIcon } from "./TaskboardIcon";
+import {
+  BlockingRelationIcon,
+  PlusIcon,
+  RelationIcon,
+  StatusIcon,
+} from "./SemanticIcons";
 
 export interface RelationMutationResult {
   task: Task;
   relatedTask: Task;
+}
+
+export function IssuePickerContent({
+  candidates,
+  selectedIds,
+  disabled,
+  onSelect,
+  onEscape,
+}: {
+  candidates: Task[];
+  selectedIds?: ReadonlySet<string>;
+  disabled?: boolean;
+  onSelect: (task: Task) => void | Promise<void>;
+  onEscape: () => void;
+}) {
+  const { text } = useTaskboardI18n();
+  const [query, setQuery] = useState("");
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [savingId, setSavingId] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const results = useMemo(() => {
+    const normalized = query.trim().toLocaleLowerCase();
+    if (!normalized) return candidates;
+    return candidates.filter((task) => (
+      (task.externalKey ?? task.identifier).toLocaleLowerCase().includes(normalized)
+      || task.title.toLocaleLowerCase().includes(normalized)
+    ));
+  }, [candidates, query]);
+
+  useEffect(() => {
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }, []);
+
+  useEffect(() => {
+    optionRefs.current[activeIndex]?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex]);
+
+  async function choose(task: Task) {
+    setSavingId(task.id);
+    try {
+      await onSelect(task);
+    } catch {
+    } finally {
+      setSavingId(null);
+    }
+  }
+
+  return (
+    <>
+      <div className="issue-relation-search">
+        <LinearIcon name="search" />
+        <input
+          ref={inputRef}
+          value={query}
+          role="combobox"
+          aria-expanded="true"
+          aria-controls="issue-relation-results"
+          aria-activedescendant={results[activeIndex] ? `relation-option-${results[activeIndex].id}` : undefined}
+          placeholder={text("搜索议题…", "Search issues…")}
+          onChange={(event) => {
+            setQuery(event.target.value);
+            setActiveIndex(0);
+          }}
+          onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+            if (event.key === "Enter") {
+              if (event.metaKey || event.ctrlKey) return;
+              event.preventDefault();
+              const activeResult = results[activeIndex];
+              if (activeResult) void choose(activeResult);
+            } else if (event.key === "Escape") {
+              event.preventDefault();
+              onEscape();
+            } else if (event.key === "ArrowDown" && results.length > 0) {
+              event.preventDefault();
+              setActiveIndex((index) => (index + 1) % results.length);
+            } else if (event.key === "ArrowUp" && results.length > 0) {
+              event.preventDefault();
+              setActiveIndex((index) => (index - 1 + results.length) % results.length);
+            }
+          }}
+        />
+      </div>
+      <div
+        className={`issue-relation-results${selectedIds ? " has-selections" : ""}`}
+        id="issue-relation-results"
+        role="listbox"
+      >
+        {results.length > 0 ? results.map((candidate, index) => {
+          const selected = selectedIds?.has(candidate.id) ?? false;
+          const className = [
+            index === activeIndex ? "is-active" : "",
+            selected ? "is-selected" : "",
+          ].filter(Boolean).join(" ");
+          return (
+            <button
+              ref={(element) => {
+                optionRefs.current[index] = element;
+              }}
+              id={`relation-option-${candidate.id}`}
+              className={className}
+              type="button"
+              role="option"
+              aria-selected={selectedIds ? selected : index === activeIndex}
+              disabled={disabled || savingId !== null}
+              key={candidate.id}
+              onMouseEnter={() => setActiveIndex(index)}
+              onClick={() => void choose(candidate)}
+            >
+              <StatusIcon status={candidate.status} size={14} />
+              <span className="issue-relation-option-id">{candidate.externalKey ?? candidate.identifier}</span>
+              <span className="issue-relation-option-title">{candidate.title}</span>
+              {selectedIds && (
+                <span className="issue-relation-option-check">
+                  {selected && <LinearIcon name="check" />}
+                </span>
+              )}
+            </button>
+          );
+        }) : (
+          <p className="issue-relation-empty">{text("没有匹配的议题", "No matching issues")}</p>
+        )}
+      </div>
+    </>
+  );
 }
 
 interface RelationActions {
@@ -38,7 +168,7 @@ interface RelationActions {
   ) => Promise<RelationMutationResult>;
 }
 
-function IssuePicker({
+export function IssuePicker({
   label,
   candidates,
   disabled,
@@ -49,44 +179,17 @@ function IssuePicker({
   disabled?: boolean;
   onSelect: (task: Task) => Promise<void>;
 }) {
-  const { text } = useTaskboardI18n();
   const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState("");
-  const [activeIndex, setActiveIndex] = useState(0);
-  const [savingId, setSavingId] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const results = useMemo(() => {
-    const normalized = query.trim().toLocaleLowerCase();
-    if (!normalized) return candidates;
-    return candidates.filter((task) => (
-      task.identifier.toLocaleLowerCase().includes(normalized)
-      || task.title.toLocaleLowerCase().includes(normalized)
-    ));
-  }, [candidates, query]);
 
   useEffect(() => {
     if (!open) return;
-    setActiveIndex(0);
-    requestAnimationFrame(() => inputRef.current?.focus());
     const close = (event: PointerEvent) => {
       if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
     };
     window.addEventListener("pointerdown", close);
     return () => window.removeEventListener("pointerdown", close);
   }, [open]);
-
-  async function choose(task: Task) {
-    setSavingId(task.id);
-    try {
-      await onSelect(task);
-      setOpen(false);
-      setQuery("");
-    } catch {
-    } finally {
-      setSavingId(null);
-    }
-  }
 
   return (
     <div className="issue-relation-picker" ref={rootRef}>
@@ -98,63 +201,20 @@ function IssuePicker({
         aria-expanded={open}
         onClick={() => setOpen((value) => !value)}
       >
-        <LinearIcon name="plus" />
+        <PlusIcon color="currentColor" size={13} />
         <span>{label}</span>
       </button>
       {open && (
         <div className="issue-relation-popover">
-          <div className="issue-relation-search">
-            <LinearIcon name="search" />
-            <input
-              ref={inputRef}
-              value={query}
-              role="combobox"
-              aria-expanded="true"
-              aria-controls="issue-relation-results"
-              aria-activedescendant={results[activeIndex] ? `relation-option-${results[activeIndex].id}` : undefined}
-              placeholder={text("搜索议题…", "Search issues…")}
-              onChange={(event) => {
-                setQuery(event.target.value);
-                setActiveIndex(0);
-              }}
-              onKeyDown={(event) => {
-                if (event.key === "Escape") {
-                  event.preventDefault();
-                  setOpen(false);
-                } else if (event.key === "ArrowDown" && results.length > 0) {
-                  event.preventDefault();
-                  setActiveIndex((index) => (index + 1) % results.length);
-                } else if (event.key === "ArrowUp" && results.length > 0) {
-                  event.preventDefault();
-                  setActiveIndex((index) => (index - 1 + results.length) % results.length);
-                } else if (event.key === "Enter" && results[activeIndex]) {
-                  event.preventDefault();
-                  void choose(results[activeIndex]);
-                }
-              }}
-            />
-          </div>
-          <div className="issue-relation-results" id="issue-relation-results" role="listbox">
-            {results.length > 0 ? results.map((candidate, index) => (
-              <button
-                id={`relation-option-${candidate.id}`}
-                className={index === activeIndex ? "is-active" : ""}
-                type="button"
-                role="option"
-                aria-selected={index === activeIndex}
-                disabled={savingId !== null}
-                key={candidate.id}
-                onMouseEnter={() => setActiveIndex(index)}
-                onClick={() => void choose(candidate)}
-              >
-                <StatusIcon status={candidate.status} />
-                <span className="issue-relation-option-id">{candidate.identifier}</span>
-                <span className="issue-relation-option-title">{candidate.title}</span>
-              </button>
-            )) : (
-              <p className="issue-relation-empty">{text("没有匹配的议题", "No matching issues")}</p>
-            )}
-          </div>
+          <IssuePickerContent
+            candidates={candidates}
+            disabled={disabled}
+            onEscape={() => setOpen(false)}
+            onSelect={async (task) => {
+              await onSelect(task);
+              setOpen(false);
+            }}
+          />
         </div>
       )}
     </div>
@@ -192,15 +252,18 @@ function IssueRelationRow({
   return (
     <div className="issue-relation-row">
       <button className="issue-relation-target" type="button" onClick={onOpen}>
-        <StatusIcon status={issue.status} />
-        <span className="issue-relation-id">{issue.identifier}</span>
+        <StatusIcon status={issue.status} size={14} />
+        <span className="issue-relation-id">{issue.externalKey ?? issue.identifier}</span>
         <span className="issue-relation-title">{issue.title}</span>
         {showAssignee && <ActorAvatar actor={issue.assignee} className="issue-relation-assignee" />}
       </button>
       <button
         className="issue-relation-remove"
         type="button"
-        aria-label={text(`移除 ${issue.identifier}`, `Remove ${issue.identifier}`)}
+        aria-label={text(
+          `移除 ${issue.externalKey ?? issue.identifier}`,
+          `Remove ${issue.externalKey ?? issue.identifier}`,
+        )}
         disabled={removing}
         onClick={onRemove}
       >
@@ -381,9 +444,9 @@ export function IssueRelationSidebar({
             <header>
               <span>
                 {group.type === "related" ? (
-                  <LinearIcon name="link" />
+                  <RelationIcon color="currentColor" size={14} />
                 ) : (
-                  <TaskboardIcon name={group.type === "blocked_by" ? "relationBlockedBy" : "relationBlocks"} />
+                  <BlockingRelationIcon type={group.type} color="currentColor" />
                 )}
                 {label}
               </span>

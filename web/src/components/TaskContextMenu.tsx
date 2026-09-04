@@ -16,9 +16,16 @@ import {
   type TaskStatus,
 } from "../types";
 import { labelPresentation } from "../labels";
-import { taskPriorityLabel, useTaskboardI18n } from "../i18n";
-import { STATUS_DETAILS } from "./BoardColumn";
-import { LinearIcon, LinearPriorityIcon, LinearStatusIcon } from "./LinearIcon";
+import { taskPriorityLabel, taskStatusLabel, useTaskboardI18n } from "../i18n";
+import { LinearIcon } from "./LinearIcon";
+import {
+  DeleteIcon,
+  EditIcon,
+  LabelIcon,
+  NewConversationIcon,
+  PriorityIcon,
+  StatusIcon,
+} from "./SemanticIcons";
 
 type SubmenuName = "status" | "priority" | "labels" | "copy";
 
@@ -33,6 +40,7 @@ interface TaskContextMenuProps {
   onLabelsChange: (task: Task, labels: string[]) => void;
   onDuplicate: (task: Task) => void;
   onCopy: (text: string, announcement: string) => void;
+  openInThreadDisabled?: boolean;
   onOpenInThread: (task: Task) => void;
   onArchive: (task: Task) => void;
 }
@@ -104,10 +112,12 @@ export function TaskContextMenu({
   onLabelsChange,
   onDuplicate,
   onCopy,
+  openInThreadDisabled = false,
   onOpenInThread,
   onArchive,
 }: TaskContextMenuProps) {
-  const { language, text, statusLabel } = useTaskboardI18n();
+  const { language, text } = useTaskboardI18n();
+  const displayIdentifier = task.externalKey ?? task.identifier;
   const menuRef = useRef<HTMLDivElement>(null);
   const submenuTimerRef = useRef<number | null>(null);
   const [submenu, setSubmenu] = useState<SubmenuName | null>(null);
@@ -175,7 +185,8 @@ export function TaskContextMenu({
     function closeFromOutside(event: PointerEvent) {
       if (!menuRef.current?.contains(event.target as Node)) onClose();
     }
-    function closeFromViewportChange() {
+    function closeFromViewportChange(event: Event) {
+      if (event.type === "scroll" && menuRef.current?.contains(event.target as Node)) return;
       onClose();
     }
 
@@ -255,7 +266,7 @@ export function TaskContextMenu({
       ref={menuRef}
       className="task-context-menu"
       role="menu"
-      aria-label={text(`${task.identifier} 操作`, `${task.identifier} actions`)}
+      aria-label={text(`${displayIdentifier} 操作`, `${displayIdentifier} actions`)}
       data-submenu-side={submenuSide}
       style={{ left: placedPosition.x, top: placedPosition.y }}
       onKeyDown={handleKeyDown}
@@ -264,7 +275,7 @@ export function TaskContextMenu({
       <div className="context-menu-group">
         <MenuItem
           label={text("状态", "Status")}
-          icon={<LinearIcon name="status" />}
+          icon={<StatusIcon status={task.status} color="currentColor" />}
           shortcut="S"
           submenu="status"
           submenuOpen={submenu === "status"}
@@ -277,8 +288,8 @@ export function TaskContextMenu({
               {TASK_STATUSES.filter((status) => status !== "queued").map((status, index) => (
                 <MenuItem
                   key={status}
-                  label={statusLabel(status)}
-                  icon={<LinearStatusIcon status={status} className={`status-icon-${STATUS_DETAILS[status].tone}`} />}
+                  label={taskStatusLabel(language, status)}
+                  icon={<StatusIcon status={status} color="currentColor" />}
                   shortcut={String(index + 1)}
                   checked={task.status === status}
                   onClick={() => closeThen(() => onStatusChange(task, status))}
@@ -290,7 +301,7 @@ export function TaskContextMenu({
 
         <MenuItem
           label={text("优先级", "Priority")}
-          icon={<LinearPriorityIcon priority={task.priority} />}
+          icon={<PriorityIcon priority={task.priority} />}
           shortcut="P"
           submenu="priority"
           submenuOpen={submenu === "priority"}
@@ -304,7 +315,7 @@ export function TaskContextMenu({
                 <MenuItem
                   key={priority}
                   label={taskPriorityLabel(language, priority)}
-                  icon={<LinearPriorityIcon priority={priority} />}
+                  icon={<PriorityIcon priority={priority} />}
                   shortcut={String(index)}
                   checked={task.priority === priority}
                   onClick={() => closeThen(() => onPriorityChange(task, priority))}
@@ -316,7 +327,7 @@ export function TaskContextMenu({
 
         <MenuItem
           label={text("标签", "Labels")}
-          icon={<LinearIcon name="label" />}
+          icon={<LabelIcon color="currentColor" />}
           shortcut="L"
           submenu="labels"
           submenuOpen={submenu === "labels"}
@@ -353,7 +364,7 @@ export function TaskContextMenu({
               <div className="context-menu-divider" role="separator" />
               <MenuItem
                 label={text("在编辑器中管理…", "Manage in editor…")}
-                icon={<LinearIcon name="write" />}
+                icon={<EditIcon color="currentColor" />}
                 onClick={() => closeThen(() => onEdit(task))}
               />
             </div>
@@ -366,17 +377,19 @@ export function TaskContextMenu({
       <div className="context-menu-group">
         <MenuItem
           label={text("编辑议题", "Edit issue")}
-          icon={<LinearIcon name="write" />}
+          icon={<EditIcon color="currentColor" />}
           shortcut="↵"
           onPointerEnter={closeSubmenu}
           onClick={() => closeThen(() => onEdit(task))}
         />
-        <MenuItem
-          label={text("创建副本", "Create copy")}
-          icon={<LinearIcon name="copy" />}
-          onPointerEnter={closeSubmenu}
-          onClick={() => closeThen(() => onDuplicate(task))}
-        />
+        {task.source !== "jira" && (
+          <MenuItem
+            label={text("创建副本", "Create copy")}
+            icon={<LinearIcon name="copy" />}
+            onPointerEnter={closeSubmenu}
+            onClick={() => closeThen(() => onDuplicate(task))}
+          />
+        )}
         <MenuItem
           label={text("复制", "Copy")}
           icon={<LinearIcon name="copy" />}
@@ -390,8 +403,8 @@ export function TaskContextMenu({
               <MenuItem
                 label={text("复制议题 ID", "Copy issue ID")}
                 onClick={() => closeThen(() => onCopy(
-                  task.identifier,
-                  text(`${task.identifier} 已复制。`, `${task.identifier} copied.`),
+                  displayIdentifier,
+                  text(`${displayIdentifier} 已复制。`, `${displayIdentifier} copied.`),
                 ))}
               />
               <MenuItem
@@ -404,7 +417,7 @@ export function TaskContextMenu({
               <MenuItem
                 label={text("复制 Markdown", "Copy Markdown")}
                 onClick={() => closeThen(() => onCopy(
-                  `**${task.identifier}** ${task.title}`,
+                  `**${displayIdentifier}** ${task.title}`,
                   text("Markdown 已复制。", "Markdown copied."),
                 ))}
               />
@@ -412,25 +425,29 @@ export function TaskContextMenu({
           )}
         </MenuItem>
         <MenuItem
-          label={text("在对话中打开", "Open in conversation")}
-          icon={<LinearIcon name="link" />}
+          label={text("在新对话打开", "Open in new conversation")}
+          icon={<NewConversationIcon color="currentColor" size={16} />}
+          disabled={openInThreadDisabled}
           onPointerEnter={closeSubmenu}
           onClick={() => closeThen(() => onOpenInThread(task))}
         />
       </div>
 
-      <div className="context-menu-divider" role="separator" />
-
-      <div className="context-menu-group">
-        <MenuItem
-          label={text("归档议题", "Archive issue")}
-          icon={<LinearIcon name="trash" />}
-          shortcut="⌘⌫"
-          danger
-          onPointerEnter={closeSubmenu}
-          onClick={() => closeThen(() => onArchive(task))}
-        />
-      </div>
+      {task.source !== "jira" && (
+        <>
+          <div className="context-menu-divider" role="separator" />
+          <div className="context-menu-group">
+            <MenuItem
+              label={text("归档议题", "Archive issue")}
+              icon={<DeleteIcon color="currentColor" />}
+              shortcut="⌘⌫"
+              danger
+              onPointerEnter={closeSubmenu}
+              onClick={() => closeThen(() => onArchive(task))}
+            />
+          </div>
+        </>
+      )}
     </div>
   );
 

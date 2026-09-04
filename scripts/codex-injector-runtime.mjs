@@ -2,7 +2,7 @@ const HOST_REQUEST_ERROR = "自动认领配置暂时无法应用，请刷新后�
 const AUTOMATION_SCHEMA_DIAGNOSTIC = "AUTOMATION_SCHEMA_MISMATCH";
 
 function parseHostRequest(payload, parseAutomationRequest) {
-  if (typeof payload !== "string" || payload.length > 4_096) {
+  if (typeof payload !== "string" || payload.length > 4_194_304) {
     return { id: null, request: null, error: HOST_REQUEST_ERROR };
   }
 
@@ -20,6 +20,7 @@ function parseHostRequest(payload, parseAutomationRequest) {
   ) ? request.id : null;
   if (!id) return { id: null, request: null, error: HOST_REQUEST_ERROR };
   if (request.action === "ensure") return { id, request, error: null };
+  if (request.action === "read-current-user") return { id, request, error: null };
   if (
     request.action === "load-frame"
     && typeof request.frameName === "string"
@@ -30,11 +31,22 @@ function parseHostRequest(payload, parseAutomationRequest) {
   if (request.action === "open-external" && typeof request.url === "string") {
     try {
       const url = new URL(request.url);
-      if (url.protocol === "https:" && url.href.length <= 2_048) {
+      if ((url.protocol === "http:" || url.protocol === "https:") && url.href.length <= 2_048) {
         return { id, request: { ...request, url: url.href }, error: null };
       }
     } catch {}
   }
+  if (
+    request.action === "open-attachment"
+    && typeof request.attachmentId === "string"
+    && /^[a-f0-9-]{36}$/i.test(request.attachmentId)
+    && typeof request.filename === "string"
+    && request.filename.length > 0
+    && request.filename.length <= 240
+    && request.filename !== "."
+    && request.filename !== ".."
+    && !/[\u0000-\u001f\u007f/\\]/.test(request.filename)
+  ) return { id, request, error: null };
   if (request.action === "automation") {
     const parsed = parseAutomationRequest(request);
     return parsed
@@ -47,10 +59,32 @@ function parseHostRequest(payload, parseAutomationRequest) {
         };
   }
   if (
-    request.action === "prefill-task-composer"
+    request.action === "start-task-conversation"
+    && typeof request.taskId === "string"
+    && request.taskId.length > 0
+    && request.taskId.length <= 128
+    && !/[\u0000-\u001f\u007f]/.test(request.taskId)
+    && typeof request.previousThreadId === "string"
+    && request.previousThreadId.length <= 240
+    && typeof request.codexHostId === "string"
+    && request.codexHostId.length > 0
+    && request.codexHostId.length <= 240
+    && !/[\u0000-\u001f\u007f]/.test(request.codexHostId)
+    && typeof request.projectless === "boolean"
+    && (
+      request.projectless
+      || (
+        typeof request.targetRoot === "string"
+        && request.targetRoot.length > 0
+        && request.targetRoot.length <= 4_096
+      )
+    )
     && typeof request.instruction === "string"
     && request.instruction.length > 0
-    && request.instruction.length <= 1_024
+    && request.instruction.length <= 4_000_000
+    && typeof request.title === "string"
+    && request.title.length > 0
+    && request.title.length <= 240
   ) {
     return { id, request, error: null };
   }
@@ -81,14 +115,18 @@ export async function handleHostBindingPayload(params, handlers) {
     let result;
     if (parsed.request.action === "ensure") {
       result = await handlers.ensure();
+    } else if (parsed.request.action === "read-current-user") {
+      result = await handlers.readCurrentUser();
     } else if (parsed.request.action === "load-frame") {
       result = await handlers.loadFrame(parsed.request);
     } else if (parsed.request.action === "open-external") {
       result = await handlers.openExternal(parsed.request);
+    } else if (parsed.request.action === "open-attachment") {
+      result = await handlers.openAttachment(parsed.request);
     } else if (parsed.request.action === "automation") {
       result = await handlers.runAutomation(parsed.request, params.executionContextId);
     } else {
-      result = await handlers.prefill(parsed.request, params.executionContextId);
+      result = await handlers.startConversation(parsed.request, params.executionContextId);
     }
     await handlers.sendResponse(params.executionContextId, {
       id: parsed.request.id,
@@ -100,6 +138,8 @@ export async function handleHostBindingPayload(params, handlers) {
       id: parsed.request.id,
       ok: false,
       error: error.message,
+      ...(typeof error?.threadId === "string" ? { threadId: error.threadId } : {}),
+      ...(error?.uncertain === true ? { uncertain: true } : {}),
     });
   }
   return { responded: true, accepted: true };

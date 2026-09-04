@@ -27,9 +27,9 @@ test("the issue workspace projects the statuses into adaptive main and secondary
   assert.deepEqual(statusList("MAIN_STATUSES"), ["todo", "queued", "in_progress", "blocked", "in_review"]);
   assert.deepEqual(statusList("SECONDARY_STATUSES"), ["backlog", "done", "canceled"]);
   assert.match(statusSource, /satisfies readonly TaskStatus\[\]/);
-  assert.match(appSource, /const mainStatuses = hasBlockedTasks[\s\S]*?MAIN_STATUSES\.filter\(\(status\) => status !== "blocked"\)/);
-  assert.match(appSource, /mainStatuses\.map\(\(status\) => \([\s\S]*?<BoardColumn/);
-  assert.match(appSource, /mainStatuses\.map\(\(status\) => \([\s\S]*?className="loading-column"/);
+  assert.match(appSource, /const mainBoardItems = boardDisplaySettings\.mainStatuses/);
+  assert.match(appSource, /mainBoardItems\.map\(\(item\) => item === "archived" \? \([\s\S]*?<BoardColumn/);
+  assert.match(appSource, /mainBoardItems\.map\(\(item\) => \([\s\S]*?className="loading-column"/);
   assert.match(boardColumnSource, /todo: \{ label: "等待认领", tone: "todo" \}/);
   assert.match(boardColumnSource, /in_progress: \{ label: "处理中", tone: "progress" \}/);
   assert.match(boardColumnSource, /blocked: \{ label: "遇到阻碍", tone: "blocked" \}/);
@@ -65,11 +65,11 @@ test("other tasks is a closed-by-default non-modal panel with archived issues", 
 test("search and filters feed the same status buckets used by the board and panel", () => {
   assert.match(appSource, /const filteredTasks = useMemo\([\s\S]*?matchesTaskSearch\(task, search, language\) && matchesTaskFilters\(task, filters\)/);
   assert.match(appSource, /TASK_STATUSES\.map\(\(status\) => \[status, filteredTasks\.filter\(\(task\) => task\.status === status\)\]\)/);
-  assert.match(appSource, /tasks=\{tasksByStatus\[status\]\}/);
+  assert.match(appSource, /tasks=\{tasksByStatus\[item\]\}/);
   assert.match(appSource, /tasksByStatus=\{tasksByStatus\}/);
   assert.match(appSource, /archivedTasks=\{filteredArchivedTasks\}/);
   assert.match(appSource, /hasActiveFilters=\{hasActiveTaskFilters\}/);
-  assert.match(panelSource, /const tasks = ordinary[\s\S]*?ordinaryTasks \?\? \[\][\s\S]*?archivedTasks[\s\S]*?tasksByStatus\[resolvedActiveTab\]/);
+  assert.match(panelSource, /const tasks = ordinary[\s\S]*?ordinaryTasks \?\? \[\][\s\S]*?archivedTasks[\s\S]*?taskStatusTab \? tasksByStatus\[taskStatusTab\] : \[\]/);
   assert.match(panelSource, /hasActiveFilters\s*\? text\("当前筛选下无匹配议题", "No issues match the current filters"\)/);
   assert.match(boardColumnSource, /tasks\.length === 0 && <div className="column-empty">\{emptyMessage\}<\/div>/);
 });
@@ -108,7 +108,7 @@ test("other tasks panel rejects unified workflow drags before fallback source no
 });
 
 test("global creation defaults to todo while per-column creation keeps the chosen status", () => {
-  assert.equal(appSource.match(/setEditor\(\{ task: null, status: "todo" \}\)/g)?.length, 2);
+  assert.equal(appSource.match(/setEditor\(\{ task: null, status: "todo" \}\)/g)?.length, 3);
   assert.doesNotMatch(appSource, /setEditor\(\{ task: null, status: "backlog" \}\)/);
   assert.match(appSource, /onCreate=\{\(initialStatus\) => setEditor\(\{ task: null, status: initialStatus \}\)\}/);
 });
@@ -139,7 +139,10 @@ test("the adaptive desktop grid fills available width and degrades to horizontal
 
 test("the optional ordinary tab keeps one adaptive tab row and resets outside Feishu projects", () => {
   assert.match(panelSource, /"--other-tasks-tab-count": tabs\.length/);
-  assert.match(styles, /grid-template-columns: repeat\(var\(--other-tasks-tab-count, 4\), minmax\(0, 1fr\)\)/);
+  assert.match(
+    styles,
+    /grid-template-columns:\s*repeat\(\s*var\(--other-tasks-tab-count,\s*var\(--other-task-tab-count,\s*4\)\),\s*minmax\(70px,\s*1fr\)\s*\)/,
+  );
   assert.match(
     appSource,
     /if \(!isSelectedFeishuProject && otherTasksTab === "ordinary"\) \{[\s\S]*?setOtherTasksTab\("backlog"\)/,

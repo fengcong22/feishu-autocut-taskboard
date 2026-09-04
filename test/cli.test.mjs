@@ -1,5 +1,7 @@
-import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import path from "node:path";
+import { PassThrough } from "node:stream";
+import assert from "node:assert/strict";
 import test from "node:test";
 
 import { main, parseArgs } from "../cli/taskctl.mjs";
@@ -77,6 +79,121 @@ test("CODEX_TASKBOARD_URL overrides the service origin", async () => {
   assert.equal(requestedUrl.toString(), "https://tasks.example.test/api/projects");
 });
 
+test("--runtime-file reads the launcher endpoint without a leading environment assignment", async () => {
+  let requestedUrl;
+  const result = await run(
+    ["project", "list", "--runtime-file", "/tmp/taskboard-runtime.json"],
+    async (url) => {
+      requestedUrl = url;
+      return response({ projects: [] });
+    },
+    {
+      env: {},
+      readFile: async (filePath) => {
+        assert.equal(filePath, "/tmp/taskboard-runtime.json");
+        return JSON.stringify({ version: 1, url: "http://127.0.0.1:51550/token" });
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(requestedUrl.toString(), "http://127.0.0.1:51550/token/api/projects");
+});
+
+test("WSL taskctl discovers the Windows launcher runtime descriptor from Windows APPDATA", async () => {
+  let requestedUrl;
+  const runtimeFile = path.join(
+    "/windows/users/R&D Müller/AppData/Roaming",
+    "Codex Taskboard",
+    "launcher-runtime.json",
+  );
+  const readPaths = [];
+  const result = await run(
+    ["project", "list"],
+    async (url) => {
+      requestedUrl = url;
+      return response({ projects: [] });
+    },
+    {
+      env: { WSL_DISTRO_NAME: "Ubuntu" },
+      execFile: async (file, args, options) => {
+        if (file === "cmd.exe") {
+          assert.deepEqual(args, ["/d", "/u", "/s", "/c", "set APPDATA"]);
+          assert.deepEqual(options, { encoding: "buffer" });
+          return {
+            stdout: Buffer.from(
+              "APPDATA=C:\\Users\\R&D Müller\\AppData\\Roaming\r\n",
+              "utf16le",
+            ),
+            stderr: Buffer.alloc(0),
+          };
+        }
+        assert.equal(file, "wslpath");
+        assert.deepEqual(args, ["-u", "C:\\Users\\R&D Müller\\AppData\\Roaming"]);
+        assert.deepEqual(options, { encoding: "utf8" });
+        return { stdout: "/windows/users/R&D Müller/AppData/Roaming\n", stderr: "" };
+      },
+      readFile: async (filePath) => {
+        readPaths.push(filePath);
+        if (filePath === runtimeFile) {
+          return JSON.stringify({ version: 1, url: "http://127.0.0.1:51987/instance-token" });
+        }
+        const error = new Error("missing");
+        error.code = "ENOENT";
+        throw error;
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(requestedUrl.toString(), "http://127.0.0.1:51987/instance-token/api/projects");
+  assert.equal(readPaths.at(-1), runtimeFile);
+});
+
+test("CODEX_TASKBOARD_WSL_RUNTIME_FILE overrides WSL automatic discovery", async () => {
+  const runtimeFile = "/runtime/taskboard.json";
+  let curlArgs;
+  const result = await run(
+    ["project", "list"],
+    undefined,
+    {
+      env: {
+        WSL_DISTRO_NAME: "Ubuntu",
+        CODEX_TASKBOARD_WSL_RUNTIME_FILE: runtimeFile,
+      },
+      execFile: async () => {
+        assert.fail("automatic discovery must not run for an explicit WSL runtime file");
+      },
+      readFile: async (filePath) => {
+        assert.equal(filePath, runtimeFile);
+        return JSON.stringify({ version: 1, url: "http://127.0.0.1:51988/override-token" });
+      },
+      spawn: (file, args) => {
+        assert.equal(file, "curl.exe");
+        curlArgs = args;
+        const child = new EventEmitter();
+        child.stdin = new PassThrough();
+        child.stdout = new PassThrough();
+        child.stderr = new PassThrough();
+        queueMicrotask(() => {
+          child.stdout.end(JSON.stringify({ projects: [] }));
+          child.stderr.end("__CODEX_TASKBOARD_CURL_RESPONSE__200\tapplication/json\t15");
+          child.emit("close", 0);
+        });
+        return child;
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(result.stdout.projects, []);
+  assert.deepEqual(curlArgs.slice(0, 3), ["--disable", "--noproxy", "*"]);
+  assert.equal(
+    curlArgs.at(-1),
+    "http://127.0.0.1:51988/override-token/api/projects",
+  );
+});
+
 test("project create sends id, name, and an absolute workspace path", async () => {
   let requestBody;
   const result = await run(
@@ -90,8 +207,7 @@ test("project create sends id, name, and an absolute workspace path", async () =
   assert.equal(result.exitCode, 0);
   assert.equal(requestBody.id, "docs");
   assert.equal(requestBody.name, "Docs");
-  assert.equal(path.isAbsolute(requestBody.workspacePath), true);
-  assert.equal(path.basename(requestBody.workspacePath), "docs");
+  assert.equal(requestBody.workspacePath, path.resolve("./docs"));
 });
 
 test("issue list serializes project and status filters", async () => {
@@ -222,6 +338,8 @@ test("issue update sends an explicit optimistic concurrency version", async () =
 
 test("issue update binds one worktree context", async () => {
   let requestBody;
+  const repositoryPath = path.resolve("/work/repo");
+  const worktreePath = path.resolve(repositoryPath, "../taskboard-worktree");
   const result = await run(
     [
       "issue", "update", "TASK-1",
@@ -233,14 +351,14 @@ test("issue update binds one worktree context", async () => {
       requestBody = JSON.parse(init.body);
       return response({ task: { id: "TASK-1", ...requestBody, version: 5 } });
     },
-    { cwd: "/work/repo" },
+    { cwd: repositoryPath },
   );
 
   assert.equal(result.exitCode, 0);
   assert.deepEqual(requestBody, {
     developmentContext: {
       type: "worktree",
-      path: path.resolve("/work/repo", "../taskboard-worktree"),
+      path: worktreePath,
       branch: "worktree/taskboard",
     },
     threadId: "thread-current",
@@ -276,6 +394,53 @@ test("issue move fetches the current version when --if-version is omitted", asyn
   assert.deepEqual(JSON.parse(calls[1].init.body), {
     status: "done",
     threadId: "thread-current",
+    version: 3,
+  });
+});
+
+test("issue move separates controller attribution from the task thread binding", async () => {
+  let requestBody;
+  const windowsWorkspacePath = String.raw`C:\Users\admin\Documents\dashi-taskboard`;
+  const result = await run([
+    "issue", "move", "TASK-1", "--status", "blocked", "--if-version", "3",
+    "--binding-thread-id", "remote-thread",
+    "--binding-codex-project-id", "remote-project",
+    "--binding-codex-project-kind", "remote",
+    "--binding-codex-host-id", "remote-host",
+    "--binding-workspace-path", windowsWorkspacePath,
+  ], async (_url, init) => {
+    requestBody = JSON.parse(init.body);
+    return response({ task: { id: "TASK-1", version: 4 } });
+  });
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(requestBody, {
+    status: "blocked",
+    threadId: "thread-current",
+    threadBinding: {
+      threadId: "remote-thread",
+      codexProjectId: "remote-project",
+      codexProjectKind: "remote",
+      codexHostId: "remote-host",
+      workspacePath: windowsWorkspacePath,
+    },
+    version: 3,
+  });
+});
+
+test("issue move can clear an unconfirmed task binding", async () => {
+  let requestBody;
+  const result = await run([
+    "issue", "move", "TASK-1", "--status", "todo", "--if-version", "3",
+    "--clear-binding-thread",
+  ], async (_url, init) => {
+    requestBody = JSON.parse(init.body);
+    return response({ task: { id: "TASK-1", version: 4 } });
+  });
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(requestBody, {
+    status: "todo",
+    threadId: "thread-current",
+    threadBinding: null,
     version: 3,
   });
 });
@@ -358,6 +523,32 @@ test("issue relation add and remove use typed relation endpoints", async () => {
   });
 });
 
+test("issue tree uses the bounded directional tree endpoint", async () => {
+  let requestedUrl;
+  const result = await run(
+    ["issue", "tree", "TASK/1", "--direction", "ancestors", "--depth", "3", "--json"],
+    async (url, init) => {
+      requestedUrl = url;
+      assert.equal(init.method, "GET");
+      return response({ tree: { rootId: "TASK/1", direction: "ancestors", depth: 3, nodes: [] } });
+    },
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(requestedUrl.pathname, "/api/tasks/TASK%2F1/tree");
+  assert.equal(requestedUrl.searchParams.get("direction"), "ancestors");
+  assert.equal(requestedUrl.searchParams.get("depth"), "3");
+
+  for (const argv of [
+    ["issue", "tree", "TASK-1", "--direction", "down", "--depth", "1"],
+    ["issue", "tree", "TASK-1", "--direction", "descendants", "--depth", "0"],
+    ["issue", "tree", "TASK-1", "--direction", "descendants"],
+  ]) {
+    const invalid = await run(argv, async () => assert.fail("fetch should not be called"));
+    assert.equal(invalid.exitCode, 2);
+    assert.equal(invalid.stderr.error.code, "USAGE_ERROR");
+  }
+});
+
 test("issue relation validates its action and relation type before fetching", async () => {
   for (const argv of [
     ["issue", "relation", "replace", "TASK-1", "--type", "related", "--issue", "TASK-2"],
@@ -432,16 +623,16 @@ test("comment update and delete require an explicit version", async () => {
 });
 
 test("context current selects the project with the most specific matching workspace", async () => {
-  const repoPath = path.resolve("/work/repo");
-  const appPath = path.resolve("/work/repo/packages/app");
+  const repositoryPath = path.resolve("/work/repo");
+  const appPath = path.join(repositoryPath, "packages", "app");
   const result = await run(
     ["context", "current", "--cwd", appPath],
     async () => response({ projects: [
       { id: "local", name: "Local", workspacePath: null },
-      { id: "repo", workspacePath: repoPath },
+      { id: "repo", workspacePath: repositoryPath },
       { id: "app", workspacePath: appPath },
     ] }),
-    { cwd: "/unused" },
+    { cwd: path.resolve("/unused") },
   );
 
   assert.equal(result.exitCode, 0);

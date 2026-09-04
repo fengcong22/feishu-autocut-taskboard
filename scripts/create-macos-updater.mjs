@@ -16,9 +16,15 @@ if (!appPath || !outputDirectory || !releaseTag) {
 }
 
 const packageJson = JSON.parse(await readFile(path.join(projectRoot, "package.json"), "utf8"));
-if (releaseTag !== `v${packageJson.version}`) {
+const stableTag = `v${packageJson.version}`;
+const betaPrefix = `${stableTag}-beta.`;
+const betaNumber = releaseTag.startsWith(betaPrefix)
+  ? releaseTag.slice(betaPrefix.length)
+  : "";
+if (releaseTag !== stableTag && !/^[1-9]\d*$/.test(betaNumber)) {
   throw new Error("Release tag does not match package.json version");
 }
+const releaseVersion = releaseTag.slice(1);
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: "utf8", ...options });
@@ -39,8 +45,8 @@ const signature = await readFile(`${artifactPath}.sig`, "utf8");
 const downloadUrl = `https://github.com/chuspeeism/dashi-taskboard/releases/download/${releaseTag}/${artifactName}`;
 const platform = { signature, url: downloadUrl };
 const latest = {
-  version: packageJson.version,
-  notes: `Codex Taskboard ${packageJson.version}`,
+  version: releaseVersion,
+  notes: `Codex Taskboard ${releaseVersion}`,
   pub_date: new Date().toISOString(),
   platforms: {
     "darwin-aarch64": platform,

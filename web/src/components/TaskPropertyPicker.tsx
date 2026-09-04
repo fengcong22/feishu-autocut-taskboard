@@ -3,6 +3,8 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type FocusEvent,
+  type KeyboardEvent,
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
@@ -21,7 +23,9 @@ interface TaskPropertyPickerProps<Value extends string> {
   open: boolean;
   disabled?: boolean;
   className?: string;
+  popoverClassName?: string;
   triggerClassName: string;
+  triggerContent?: ReactNode;
   ariaLabel: string;
   title?: string;
   onOpenChange: (open: boolean) => void;
@@ -34,7 +38,9 @@ export function TaskPropertyPicker<Value extends string>({
   open,
   disabled = false,
   className = "",
+  popoverClassName = "",
   triggerClassName,
+  triggerContent,
   ariaLabel,
   title,
   onOpenChange,
@@ -44,8 +50,51 @@ export function TaskPropertyPicker<Value extends string>({
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const [position, setPosition] = useState({ left: 0, top: 0 });
+  const [focusedIndex, setFocusedIndex] = useState(0);
   const selected = options.find((option) => option.value === value) ?? options[0];
-  const portalTarget = triggerRef.current?.closest("dialog") ?? document.body;
+  const portalTarget = triggerRef.current?.closest("dialog, [role='dialog']") ?? document.body;
+
+  function optionElements(): HTMLButtonElement[] {
+    return Array.from(menuRef.current?.querySelectorAll<HTMLButtonElement>("[role='option']") ?? []);
+  }
+
+  function selectOption(option: TaskPropertyOption<Value>) {
+    onOpenChange(false);
+    if (option.value !== value) onChange(option.value);
+    requestAnimationFrame(() => triggerRef.current?.focus());
+  }
+
+  function handleMenuKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    const elements = optionElements();
+    const currentIndex = elements.indexOf(document.activeElement as HTMLButtonElement);
+    if (event.key === "Tab") {
+      requestAnimationFrame(() => onOpenChange(false));
+      return;
+    }
+    if (event.key === "Enter" || event.key === " ") {
+      if (currentIndex < 0) return;
+      event.preventDefault();
+      selectOption(options[currentIndex]);
+      return;
+    }
+    let nextIndex = currentIndex;
+    if (event.key === "ArrowDown") nextIndex = Math.min(currentIndex + 1, elements.length - 1);
+    else if (event.key === "ArrowUp") nextIndex = Math.max(currentIndex - 1, 0);
+    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = elements.length - 1;
+    else return;
+    event.preventDefault();
+    setFocusedIndex(nextIndex);
+    elements[nextIndex]?.focus();
+  }
+
+  function closeFromFocusLeave(event: FocusEvent<HTMLElement>) {
+    if (menuRef.current?.matches(":active")) return;
+    const next = event.relatedTarget as Node | null;
+    if (!next || (!rootRef.current?.contains(next) && !menuRef.current?.contains(next))) {
+      onOpenChange(false);
+    }
+  }
 
   useLayoutEffect(() => {
     if (!open) return;
@@ -66,12 +115,13 @@ export function TaskPropertyPicker<Value extends string>({
 
   useEffect(() => {
     if (!open) return;
+    const nextIndex = Math.max(0, options.findIndex((option) => option.value === value));
+    setFocusedIndex(nextIndex);
+    requestAnimationFrame(() => optionElements()[nextIndex]?.focus({ preventScroll: true }));
+  }, [open]);
 
-    requestAnimationFrame(() => {
-      menuRef.current
-        ?.querySelector<HTMLElement>("[aria-selected='true']")
-        ?.focus({ preventScroll: true });
-    });
+  useEffect(() => {
+    if (!open) return;
 
     function closeFromOutside(event: PointerEvent) {
       const target = event.target as Node;
@@ -82,21 +132,27 @@ export function TaskPropertyPicker<Value extends string>({
 
     function closeFromEscape(event: globalThis.KeyboardEvent) {
       if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
       onOpenChange(false);
       triggerRef.current?.focus();
     }
 
-    function closeFromViewportChange() {
+    function closeFromViewportChange(event: Event) {
+      if (event.type === "scroll" && menuRef.current?.contains(event.target as Node)) return;
       onOpenChange(false);
     }
 
     document.addEventListener("pointerdown", closeFromOutside);
     window.addEventListener("keydown", closeFromEscape);
-    window.addEventListener("resize", closeFromViewportChange);
-    window.addEventListener("scroll", closeFromViewportChange, true);
+    const viewportListenerFrame = requestAnimationFrame(() => {
+      window.addEventListener("resize", closeFromViewportChange);
+      window.addEventListener("scroll", closeFromViewportChange, true);
+    });
     return () => {
       document.removeEventListener("pointerdown", closeFromOutside);
       window.removeEventListener("keydown", closeFromEscape);
+      cancelAnimationFrame(viewportListenerFrame);
       window.removeEventListener("resize", closeFromViewportChange);
       window.removeEventListener("scroll", closeFromViewportChange, true);
     };
@@ -105,23 +161,24 @@ export function TaskPropertyPicker<Value extends string>({
   const menu = open ? createPortal(
     <div
       ref={menuRef}
-      className="composer-popover task-property-popover"
+      className={`composer-popover task-property-popover${popoverClassName ? ` ${popoverClassName}` : ""}`}
       role="listbox"
       aria-label={ariaLabel}
       style={{ position: "fixed", left: position.left, top: position.top }}
+      onKeyDown={handleMenuKeyDown}
+      onBlur={closeFromFocusLeave}
     >
       <div className="task-property-options">
-        {options.map((option) => (
+        {options.map((option, index) => (
           <button
             type="button"
             role="option"
             aria-selected={option.value === value}
+            tabIndex={index === focusedIndex ? 0 : -1}
             className={`task-property-option${option.className ? ` ${option.className}` : ""}`}
             key={option.value}
-            onClick={() => {
-              onOpenChange(false);
-              if (option.value !== value) onChange(option.value);
-            }}
+            onClick={() => selectOption(option)}
+            onFocus={() => setFocusedIndex(index)}
           >
             <span className="task-property-option-icon">{option.icon}</span>
             <span className="task-property-option-label">{option.label}</span>
@@ -136,7 +193,7 @@ export function TaskPropertyPicker<Value extends string>({
   ) : null;
 
   return (
-    <div ref={rootRef} className={`task-property-picker${className ? ` ${className}` : ""}`}>
+    <div ref={rootRef} className={`task-property-picker${className ? ` ${className}` : ""}`} onBlur={closeFromFocusLeave}>
       <button
         ref={triggerRef}
         type="button"
@@ -147,9 +204,18 @@ export function TaskPropertyPicker<Value extends string>({
         aria-expanded={open}
         title={title}
         onClick={() => onOpenChange(!open)}
+        onKeyDown={(event) => {
+          if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+          event.preventDefault();
+          onOpenChange(true);
+        }}
       >
-        <span className="task-property-trigger-icon">{selected.icon}</span>
-        <span className="task-property-trigger-label">{selected.label}</span>
+        {triggerContent ?? (
+          <>
+            <span className="task-property-trigger-icon">{selected.icon}</span>
+            <span className="task-property-trigger-label">{selected.label}</span>
+          </>
+        )}
       </button>
       {menu}
     </div>

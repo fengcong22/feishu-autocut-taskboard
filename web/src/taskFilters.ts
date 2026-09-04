@@ -85,6 +85,7 @@ export function matchesTaskSearch(task: Task, search: string, language: Taskboar
   if (!needle) return true;
   return [
     task.identifier,
+    task.externalKey,
     task.title,
     task.description,
     ...task.labels,

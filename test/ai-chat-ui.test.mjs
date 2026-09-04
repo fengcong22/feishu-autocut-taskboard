@@ -134,6 +134,9 @@ test("reasoning and raw JSONL events never enter the visible activity timeline",
 });
 
 test("App wires the global panel outside project/detail branches and hides it without local capability", () => {
+  assert.match(appSource, /const AiChat = lazy\(\(\) => import\("\.\/components\/AiChat"\)/);
+  assert.match(appSource, /localAiChatAvailable && !isAllProjects && \([\s\S]*?<Suspense fallback=\{null\}>[\s\S]*?<AiChat/);
+  assert.doesNotMatch(appSource, /import \{ AiChat,/);
   assert.match(appSource, /<AiChat/);
   assert.match(appSource, /projectId=\{selectedProjectId \|\| null\}/);
   assert.match(appSource, /issueId=\{detailTaskId\}/);
@@ -176,7 +179,7 @@ test("chat renders Markdown, public thinking steps and never renders host-only f
 test("composer does not submit during IME composition and background runs keep launcher state fresh", () => {
   const composingGuard = chatSource.indexOf("event.nativeEvent.isComposing");
   const shiftEnterGuard = chatSource.indexOf('event.key === "Enter" && event.shiftKey');
-  const skillSelection = chatSource.indexOf('event.key === "Enter" && skillMention');
+  const skillSelection = chatSource.indexOf('(event.key === "Enter" || event.key === "Tab")');
   const messageSubmission = chatSource.indexOf('if (event.key === "Enter") {', skillSelection);
   assert.ok(composingGuard > 0);
   assert.ok(composingGuard < shiftEnterGuard);
@@ -198,7 +201,7 @@ test("submission stays disabled while a snapshot is loading", () => {
 test("new threads normalize inherited settings against the target project catalog", () => {
   assert.match(chatSource, /catalogProjectId/);
   assert.match(chatSource, /catalogLoadedProjectId/);
-  assert.match(chatSource, /const targetCatalog = catalogLoadedProjectId === input\.projectId[\s\S]*?getAiChatCatalog\(input\.projectId\)/);
+  assert.match(chatSource, /const targetCatalog = catalogLoadedProjectId === input\.projectId[\s\S]*?getAiChatCatalog\(input\.projectId, undefined, origin\?\.codexProjectIdentity\)/);
   assert.match(chatSource, /normalizeChatSelection\(\s*targetCatalog\.models,\s*inheritedSettings\.model,\s*inheritedSettings\.reasoningEffort/);
   assert.match(chatSource, /createAiChatThread\(\{[\s\S]*?\.\.\.settings/);
 });

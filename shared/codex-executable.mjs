@@ -13,13 +13,25 @@ function executableFile(candidate, fileExists = null) {
 }
 
 function executableOnPath(env, platform = process.platform, fileExists = null) {
-  const names = platform === "win32" ? ["codex.exe"] : ["codex"];
   for (const directory of (env.PATH || "").split(path.delimiter)) {
     if (!directory) continue;
-    for (const name of names) {
-      const candidate = executableFile(path.join(directory, name), fileExists);
-      if (candidate) return candidate;
+    if (platform === "win32") {
+      const nativeExecutable = executableFile(path.join(directory, "codex.exe"), fileExists);
+      if (nativeExecutable) return nativeExecutable;
+
+      const npmEntry = executableFile(path.join(
+        directory,
+        "node_modules",
+        "@openai",
+        "codex",
+        "bin",
+        "codex.js",
+      ), fileExists);
+      if (npmEntry) return npmEntry;
+      continue;
     }
+    const executable = executableFile(path.join(directory, "codex"), fileExists);
+    if (executable) return executable;
   }
   return null;
 }
@@ -40,7 +52,11 @@ function windowsNpmVendorExecutable(env, fileExists, arch, homeDirectory) {
   return executableFile(path.join(root, target, "vendor", triple, "bin", "codex.exe"), fileExists);
 }
 
-export function codexExecutableInApp(appPath) {
+export function codexExecutableInApp(appPath, platform = process.platform) {
+  if (platform === "win32") {
+    return path.win32.join(path.win32.dirname(appPath), "resources", "codex.exe");
+  }
+  if (platform === "linux") return "/usr/lib/chatgpt/resources/codex";
   return path.join(appPath, "Contents", "Resources", "codex");
 }
 
@@ -56,13 +72,13 @@ export function resolveCodexExecutable({
   if (typeof explicit === "string" && explicit.trim()) return explicit.trim();
 
   if (appPath) {
-    const bundled = executableFile(codexExecutableInApp(appPath));
+    const bundled = executableFile(codexExecutableInApp(appPath, platform));
     if (bundled) return bundled;
   }
 
   const installedCli = platform === "win32"
-    ? windowsNpmVendorExecutable(env, fileExists, arch, homeDirectory)
-      ?? executableOnPath(env, platform, fileExists)
+    ? executableOnPath(env, platform, fileExists)
+      ?? windowsNpmVendorExecutable(env, fileExists, arch, homeDirectory)
     : executableOnPath(env, platform, fileExists);
   if (installedCli) return installedCli;
 
@@ -71,6 +87,7 @@ export function resolveCodexExecutable({
       for (const applicationName of ["ChatGPT.app", "Codex.app"]) {
         const bundled = executableFile(codexExecutableInApp(
           path.join(applicationDirectory, applicationName),
+          platform,
         ));
         if (bundled) return bundled;
       }

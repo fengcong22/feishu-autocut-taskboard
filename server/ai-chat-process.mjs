@@ -2,9 +2,11 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
+import { signalProcessTree } from "../shared/process-tree.mjs";
 
 const VISIBLE_TEXT_LIMIT = 65_536;
 const STDERR_LIMIT = 65_536;
+const MAX_CODEX_JSONL_LINE_BYTES = 16 * 1024 * 1024;
 const SKILL_MARKER = "\uFFFC";
 const TURN_OWNER_PATH = fileURLToPath(new URL("./ai-turn-owner.mjs", import.meta.url));
 const ITEM_TYPES = new Set([
@@ -151,12 +153,13 @@ function normalizedItem(rawType, item) {
   }
 
   const message = errorMessage(item.message ?? item.error);
+  const completedNotice = rawType === "item.completed" && status === "completed";
   return {
     kind: "event",
     type: item.type,
-    role: "error",
+    role: completedNotice ? "activity" : "error",
     content: message,
-    data: baseData,
+    data: completedNotice ? { ...baseData, status: "warning" } : baseData,
   };
 }
 
@@ -335,9 +338,9 @@ export function normalizeCodexEvent(raw) {
     return {
       kind: "event",
       type: raw.type,
-      role: "error",
+      role: "activity",
       content: errorMessage(raw.message ?? raw.error),
-      data: { status: "failed" },
+      data: { status: "warning" },
     };
   }
 
@@ -360,15 +363,17 @@ export function spawnCodexTurn({
   prompt,
   env,
   onRawEvent,
-  maxLineBytes = 1_048_576,
+  maxLineBytes = MAX_CODEX_JSONL_LINE_BYTES,
 }) {
   const child = spawn(process.execPath, [TURN_OWNER_PATH, executable, JSON.stringify(args)], {
     detached: true,
     env: withoutTaskboardLauncherEnvironment(env),
     stdio: ["pipe", "pipe", "pipe", "pipe"],
+    windowsHide: true,
   });
 
-  let stdoutBuffer = Buffer.alloc(0);
+  let stdoutChunks = [];
+  let stdoutLength = 0;
   let stderrBuffer = Buffer.alloc(0);
   let settled = false;
   let fatalError = null;
@@ -382,13 +387,7 @@ export function spawnCodexTurn({
   });
 
   function terminateProcessGroup() {
-    if (Number.isInteger(child.pid)) {
-      try {
-        process.kill(-child.pid, "SIGKILL");
-        return;
-      } catch {}
-    }
-    child.kill("SIGKILL");
+    signalProcessTree(child, "SIGKILL");
   }
 
   function rejectWithDiagnostic(error) {
@@ -427,24 +426,28 @@ export function spawnCodexTurn({
       const newline = bytes.indexOf(10, offset);
       if (newline === -1) {
         const remainder = bytes.subarray(offset);
-        if (stdoutBuffer.length + remainder.length > maxLineBytes) {
+        if (stdoutLength + remainder.length > maxLineBytes) {
           rejectWithDiagnostic(new Error(`Codex JSONL line exceeded ${maxLineBytes} bytes`));
           return;
         }
-        stdoutBuffer = stdoutBuffer.length === 0
-          ? Buffer.from(remainder)
-          : Buffer.concat([stdoutBuffer, remainder]);
+        stdoutChunks.push(remainder);
+        stdoutLength += remainder.length;
         return;
       }
       const segment = bytes.subarray(offset, newline);
-      if (stdoutBuffer.length + segment.length > maxLineBytes) {
+      const lineLength = stdoutLength + segment.length;
+      if (lineLength > maxLineBytes) {
         rejectWithDiagnostic(new Error(`Codex JSONL line exceeded ${maxLineBytes} bytes`));
         return;
       }
-      const line = stdoutBuffer.length === 0
+      if (segment.length > 0) stdoutChunks.push(segment);
+      const line = stdoutChunks.length === 0
         ? segment
-        : Buffer.concat([stdoutBuffer, segment]);
-      stdoutBuffer = Buffer.alloc(0);
+        : stdoutChunks.length === 1
+          ? stdoutChunks[0]
+          : Buffer.concat(stdoutChunks, lineLength);
+      stdoutChunks = [];
+      stdoutLength = 0;
       consumeLine(line);
       offset = newline + 1;
     }
@@ -453,9 +456,12 @@ export function spawnCodexTurn({
   function finishStdout() {
     if (stdoutEnded) return;
     stdoutEnded = true;
-    if (!fatalError && stdoutBuffer.length > 0) {
-      const line = stdoutBuffer;
-      stdoutBuffer = Buffer.alloc(0);
+    if (!fatalError && stdoutLength > 0) {
+      const line = stdoutChunks.length === 1
+        ? stdoutChunks[0]
+        : Buffer.concat(stdoutChunks, stdoutLength);
+      stdoutChunks = [];
+      stdoutLength = 0;
       consumeLine(line);
     }
   }

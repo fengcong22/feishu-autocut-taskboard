@@ -6,6 +6,23 @@ const skillSource = await readFile(
   new URL("../skills/manage-taskboard/SKILL.md", import.meta.url),
   "utf8",
 );
+const cliReference = await readFile(
+  new URL("../skills/manage-taskboard/references/cli.md", import.meta.url),
+  "utf8",
+);
+
+test("the taskboard skill disambiguates companion terminology for agents", () => {
+  assert.match(skillSource, /## Terminology: local companion/i);
+  assert.match(skillSource, /device-local loopback service/i);
+  assert.match(skillSource, /Never translate as \*\*伴侣\*\*/i);
+  assert.match(skillSource, /not “companion API”/i);
+
+  assert.match(cliReference, /## Terminology: local companion/i);
+  assert.match(cliReference, /Do not use/i);
+  assert.match(cliReference, /伴侣 API/i);
+  assert.match(cliReference, /Taskboard HTTP API/i);
+  assert.match(cliReference, /local loopback service/i);
+});
 
 test("the taskboard skill coordinates safe issue execution and review handoff", () => {
   assert.match(
@@ -25,5 +42,34 @@ test("the taskboard skill coordinates safe issue execution and review handoff", 
   assert.match(
     skillSource,
     /Verify the requested operation path[\s\S]*Add a comment with the changes, verification result, outcome, and remaining risks[\s\S]*Read the issue again, then move it to `in_review` with its current `version`/i,
+  );
+});
+
+test("the taskboard skill requires complete thread bindings for claimed work", () => {
+  assert.match(
+    skillSource,
+    /This value alone is not a complete task binding/i,
+  );
+  assert.match(
+    skillSource,
+    /must store a complete `threadBinding`:[\s\S]*`threadId`[\s\S]*`codexProjectId`[\s\S]*`codexProjectKind`[\s\S]*`codexHostId`[\s\S]*`workspacePath`/i,
+  );
+  assert.match(
+    skillSource,
+    /Pass all five explicit `--binding-\*` options[\s\S]*never create a legacy binding containing only `threadId`/i,
+  );
+  assert.match(
+    skillSource,
+    /preserve its exact five saved values on every status write[\s\S]*never take over a binding owned by another conversation/i,
+  );
+
+  assert.match(cliReference, /--binding-thread-id ID/i);
+  assert.match(cliReference, /--binding-codex-project-id PROJECT_ID/i);
+  assert.match(cliReference, /--binding-codex-project-kind local\|remote/i);
+  assert.match(cliReference, /--binding-codex-host-id HOST_ID/i);
+  assert.match(cliReference, /--binding-workspace-path PATH/i);
+  assert.match(
+    cliReference,
+    /`--thread-id` records the conversation performing the mutation; it does not create a complete task binding/i,
   );
 });

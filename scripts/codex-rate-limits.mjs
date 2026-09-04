@@ -3,6 +3,7 @@ import readline from "node:readline";
 
 import { resolveCodexExecutable } from "../shared/codex-executable.mjs";
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
+import { executableCommand } from "../shared/executable-command.mjs";
 
 const REQUEST_TIMEOUT_MS = 8_000;
 
@@ -33,7 +34,8 @@ export async function readCodexQuotaStatus(model) {
 }
 
 function startAppServer() {
-  const child = spawn(resolveCodexExecutable(), ["app-server", "--stdio"], {
+  const command = executableCommand(resolveCodexExecutable(), ["app-server", "--stdio"]);
+  const child = spawn(command.executable, command.args, {
     env: withoutTaskboardLauncherEnvironment(process.env),
     stdio: ["pipe", "pipe", "ignore"],
   });

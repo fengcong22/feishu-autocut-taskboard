@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import http from "node:http";
@@ -8,6 +8,8 @@ import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+
+import { CdpPipeBrowser } from "../scripts/codex-cdp-pipe.mjs";
 
 const execFileAsync = promisify(execFile);
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -269,32 +271,56 @@ test("Taskboard fills the workspace, opens HTTPS links and revokes hostile ifram
   }));
 
   const profile = await mkdtemp(path.join(os.tmpdir(), "taskboard-fullheight-chrome-"));
-  t.after(() => rm(profile, { recursive: true, force: true }));
+  t.after(() => rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
   const url = `http://127.0.0.1:${server.address().port}/fixture`;
-  let stdout;
+  const child = spawn(chrome, [
+    "--headless=new",
+    "--disable-gpu",
+    "--no-sandbox",
+    `--user-data-dir=${profile}`,
+    "--remote-debugging-pipe",
+    "about:blank",
+  ], {
+    stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"],
+  });
+  const browser = new CdpPipeBrowser(child);
+  let session;
+  let encodedResult = "";
   try {
-    ({ stdout } = await execFileAsync(chrome, [
-      "--headless=new",
-      "--disable-gpu",
-      "--no-sandbox",
-      `--user-data-dir=${profile}`,
-      "--virtual-time-budget=12000",
-      "--dump-dom",
-      url,
-    ], { maxBuffer: 5 * 1024 * 1024, timeout: 20_000 }));
-  } catch (error) {
-    if (!String(error?.stdout ?? "").trim()) {
-      t.skip("Chrome or Chromium cannot run headless dump-dom in this environment");
-      return;
+    await browser.open();
+    const target = (await browser.targets()).find(({ type }) => type === "page");
+    assert.ok(target, "Chrome did not expose a page target");
+    session = await browser.connect(target.targetId);
+    await session.send("Page.enable");
+    await session.send("Runtime.enable");
+    const loaded = session.waitFor("Page.loadEventFired", 10_000);
+    await session.send("Page.navigate", { url });
+    await loaded;
+
+    const deadline = Date.now() + 20_000;
+    while (!encodedResult && Date.now() < deadline) {
+      const evaluation = await session.send("Runtime.evaluate", {
+        expression: 'document.getElementById("result")?.textContent || ""',
+        returnByValue: true,
+      });
+      encodedResult = evaluation.result.value;
+      if (!encodedResult) await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    throw error;
-  }
-  if (!stdout.trim()) {
-    t.skip("Chrome or Chromium cannot run headless dump-dom in this environment");
-    return;
+  } finally {
+    session?.close();
+    browser.close();
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise((resolve) => child.once("exit", resolve));
+      child.kill("SIGTERM");
+      await Promise.race([
+        exited,
+        new Promise((resolve) => setTimeout(resolve, 2_000)),
+      ]);
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await exited;
+    }
   }
 
-  const encodedResult = stdout.match(/<output id="result">([^<]+)<\/output>/)?.[1];
   assert.ok(encodedResult, "fixture did not report an injection result");
   const result = JSON.parse(Buffer.from(encodedResult, "base64").toString("utf8"));
   assert.deepEqual(result, {

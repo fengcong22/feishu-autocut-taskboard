@@ -8,7 +8,6 @@ const styles = await readFile(new URL("../web/src/styles.css", import.meta.url),
 const editorSource = await readFile(new URL("../web/src/components/TaskEditor.tsx", import.meta.url), "utf8");
 const detailSource = await readFile(new URL("../web/src/components/TaskDetail.tsx", import.meta.url), "utf8");
 const labelPickerSource = await readFile(new URL("../web/src/components/LabelPicker.tsx", import.meta.url), "utf8");
-const pendingAttachmentsSource = await readFile(new URL("../web/src/components/PendingAttachments.tsx", import.meta.url), "utf8");
 const labelsSource = await readFile(new URL("../web/src/labels.ts", import.meta.url), "utf8");
 const feishuNavigatorSource = await readFile(new URL("../web/src/components/FeishuBaseNavigator.tsx", import.meta.url), "utf8");
 const addFeishuLifecycleSource = appSource.slice(
@@ -63,10 +62,11 @@ const saveEditorSource = appSource.slice(
 test("the project switcher merges live Codex projects with persisted Taskboard projects", () => {
   assert.match(appSource, /hostContext\?\.projects \?\? \[\]/);
   assert.match(appSource, /persistedById/);
-  assert.match(appSource, /name: project\.id === GLOBAL_PROJECT_ID\s*\? text\("全局", "Global"\)\s*: persistedById\.get\(project\.id\)\?\.name \?\? project\.name/);
+  assert.match(appSource, /name: project\.id === GLOBAL_PROJECT_ID\s*\? text\("临时任务", "Temporary tasks"\)\s*: persistedById\.get\(project\.id\)\?\.name \?\? project\.name/);
   assert.match(appSource, /for \(const project of projects\) \{[\s\S]*?inCodex: false,[\s\S]*?persisted: true/);
   assert.match(appSource, /activeProjectChoices\.map\(\(project\) => \(/);
   assert.match(appSource, /historicalProjectChoices\.map\(\(project\) => \(/);
+  assert.match(appSource, /projectMenuChoices\.map\(\(project\) => \(/);
   assert.match(appSource, /createProjectRequest/);
   assert.match(apiSource, /export async function createProject/);
 });
@@ -83,9 +83,15 @@ test("each device stores an independent workspace path for every project", () =>
   assert.match(apiSource, /\/api\/device-workspaces/);
 });
 
+test("imported Codex projects persist their exact device identity", () => {
+  assert.match(appSource, /const PROJECT_CODEX_IDENTITIES_KEY = "taskboard\.projectCodexIdentities\.v1"/);
+  assert.match(appSource, /codexProjectId: project\.id,[\s\S]*?codexProjectKind: project\.projectKind,[\s\S]*?codexHostId: project\.hostId,[\s\S]*?workspacePath: project\.workspacePath/);
+  assert.match(appSource, /setProjectCodexIdentities[\s\S]*?PROJECT_CODEX_IDENTITIES_KEY/);
+});
+
 test("project selection starts from the route or recent projects and updates the route", () => {
   assert.match(appSource, /const RECENT_PROJECT_IDS_KEY = "taskboard\.recentProjectIds\.v1"/);
-  assert.match(appSource, /const initialProjectId = query\.get\("project"\) \?\? recentProjectIds\[0\] \?\? GLOBAL_PROJECT_ID/);
+  assert.match(appSource, /const initialProjectId = query\.get\("project"\) \?\? recentProjectIds\[0\] \?\? ALL_PROJECTS_ID/);
   assert.match(appSource, /const rememberProjectOpen = useCallback/);
   assert.match(appSource, /taskboardStorage\.setItem\(RECENT_PROJECT_IDS_KEY, JSON\.stringify\(next\)\)/);
   assert.match(appSource, /function changeProject\(projectId: string, preferredView\?: BoardView\)/);
@@ -217,13 +223,15 @@ test("the selected project exposes the current board surfaces", () => {
   assert.match(styles, /\.workspace-header \{[\s\S]*?border-bottom: var\(--border-hairline\) solid var\(--border\)/);
 });
 
-test("new issues stage attachments in the composer and upload them after creation", () => {
+test("new issues insert attachments into the description and upload them after creation", () => {
   assert.match(editorSource, /type="file"[\s\S]*?multiple/);
-  assert.match(editorSource, /<PendingAttachments[\s\S]*?uploadLabel=\{text\("保存后上传", "Upload after saving"\)\}/);
-  assert.match(pendingAttachmentsSource, /className="composer-attachment-list"/);
+  assert.match(editorSource, /<InlineMediaComposer[\s\S]*?allowAttachments/);
+  assert.match(editorSource, /descriptionComposerRef\.current\?\.addFiles\(event\.currentTarget\.files\)/);
+  assert.match(editorSource, /inlineMediaFiles\(descriptionSegments\)/);
   assert.match(appSource, /Promise\.allSettled/);
-  assert.match(appSource, /uploadAttachment\(saved\.id, file\)/);
-  assert.match(appSource, /附件上传失败，可在详情页重试/);
+  assert.match(appSource, /uploadAttachment\(saved\.id, file\.file, "attachment"\)/);
+  assert.match(appSource, /uploadAttachment\(saved\.id, image\.file, "inline"\)/);
+  assert.match(appSource, /resolveInlineAttachmentMarkdown\([\s\S]*?resolveInlineMediaMarkdown\(/);
 });
 
 test("the issue composer includes Linear-style labels and scheduling", () => {
@@ -238,11 +246,13 @@ test("the issue composer includes Linear-style labels and scheduling", () => {
   assert.match(editorSource, /developmentScan\.contexts/);
 });
 
-test("the current project is shown only in navigation, not in issue creation or detail properties", () => {
-  assert.doesNotMatch(editorSource, /property-project|dialog-project-icon|project\?\.name/);
+test("issue creation selects a project only from all projects and keeps the current project otherwise", () => {
+  assert.match(editorSource, /\{!task && projectOptions && \([\s\S]*?ariaLabel=\{text\("项目", "Project"\)\}/);
   assert.doesNotMatch(detailSource, /detail-property-label">项目|project-property-icon|project\.name/);
   assert.doesNotMatch(styles, /\.property-project|\.dialog-project-icon|\.project-property-icon/);
   assert.match(appSource, /createTaskRequest\(projectId, draft\)/);
+  assert.match(appSource, /projectOptions=\{!editor\.task && isAllProjects \? createTargetProjects : undefined\}/);
+  assert.match(appSource, /const targetProjectId = editorProjectId \?\? selectedProjectId;[\s\S]*?createTaskRequest\(targetProjectId, draft\)/);
   assert.match(appSource, /className="header-project-switcher"/);
 });
 
@@ -270,8 +280,8 @@ test("the collapsed Codex sidebar can be expanded immediately left of the projec
   assert.match(styles, /\.codex-sidebar-expand-button \{[\s\S]*?width: 28px;[\s\S]*?height: 28px;/);
 });
 
-test("embedded mode omits the app navigation and keeps a draggable header region", () => {
-  assert.match(appSource, /!embedded && \([\s\S]*?<aside className="app-nav"/);
+test("the app omits the old navigation and keeps the embedded draggable header region", () => {
+  assert.doesNotMatch(appSource, /<aside className="app-nav"/);
   assert.match(appSource, /<header className="workspace-header">/);
   assert.match(appSource, /ref=\{dragRegionRef\} className="workspace-drag-region"/);
   assert.match(styles, /\.workspace-drag-region \{[\s\S]*?flex: 1;[\s\S]*?align-self: stretch/);

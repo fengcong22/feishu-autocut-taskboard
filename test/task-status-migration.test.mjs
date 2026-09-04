@@ -7,7 +7,7 @@ import { test } from "node:test";
 
 import { TaskboardDatabase } from "../server/database.mjs";
 
-test("queued status migration preserves task identity and workflow fields", async () => {
+test("queued status migration preserves task identity and removes legacy workflow fields", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-status-migration-"));
   const filename = path.join(directory, "taskboard.sqlite");
   const legacy = new DatabaseSync(filename);
@@ -76,7 +76,18 @@ test("queued status migration preserves task identity and workflow fields", asyn
       name: "Original Assignee",
       avatarUrl: "assignee.png",
     });
-    assert.equal(task.workflowId, "workflow-1");
+    assert.equal(task.workflowId, undefined);
+    assert.equal(
+      database.database
+        .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'workflow_id'")
+        .get(),
+      undefined,
+    );
+    assert.ok(
+      database.database
+        .prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'workflow_workspaces'")
+        .get(),
+    );
     assert.equal(database.database.prepare("SELECT status FROM tasks WHERE id = 'task-1'").get().status, "todo");
   } finally {
     database.close();

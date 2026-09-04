@@ -2,15 +2,15 @@ import { useEffect, useState } from "react";
 import type { CSSProperties, DragEvent } from "react";
 import type { ActorIdentity, Task, TaskDraft, TaskStatus } from "../types";
 import type { TaskCardPresentation, TaskConversationItem } from "../taskConversations";
-import { useTaskboardI18n } from "../i18n";
+import { taskStatusLabel, useTaskboardI18n } from "../i18n";
 import {
   OTHER_TASK_TABS,
   type OtherTaskTab,
   type OtherTasksPanelTab,
 } from "../issueBoardStatuses";
-import { LinearIcon, LinearStatusIcon } from "./LinearIcon";
+import { LinearIcon } from "./LinearIcon";
+import { DeleteIcon, PlusIcon, RefreshIcon, StatusIcon } from "./SemanticIcons";
 import { TaskCard } from "./TaskCard";
-import { TaskboardIcon } from "./TaskboardIcon";
 // The marker remains visible during dragover even when drag payload values are protected.
 // @ts-expect-error The helper's structural contract is covered by node tests.
 import { hasUnifiedWorkflowDragType } from "../unifiedWorkflowDropGuard.mjs";
@@ -45,46 +45,105 @@ function ArchivedTaskCard({
   onRestore,
   onDelete,
 }: ArchivedTaskCardProps) {
-  const { locale, text, statusLabel } = useTaskboardI18n();
+  const { language, locale, text } = useTaskboardI18n();
+  const displayIdentifier = task.externalKey ?? task.identifier;
   return (
     <article className={`task-card task-card-sidebar archived-task-card status-${task.status}`}>
       <div className="card-topline">
-        <span className="task-identifier">ID: {task.identifier}</span>
+        <span className="task-identifier">ID: {displayIdentifier}</span>
         <span className="archived-task-date">{archivedDate(task.archivedAt, locale, text)}</span>
       </div>
       <h3>{task.title}</h3>
       <div className="archived-task-footer">
         <span className="archived-task-status">
-          <LinearStatusIcon status={task.status} />
-          {statusLabel(task.status)}
+          <StatusIcon status={task.status} size={14} />
+          {taskStatusLabel(language, task.status)}
         </span>
-        <button
-          className="archived-task-action archived-task-restore"
-          type="button"
-          disabled={busy}
-          onClick={() => onRestore(task)}
-        >
-          <LinearIcon name="recurrence" />
-          {restoring ? text("恢复中…", "Restoring…") : text("恢复", "Restore")}
-        </button>
-        <button
-          className="archived-task-action archived-task-delete"
-          type="button"
-          aria-label={text(`永久删除 ${task.identifier}`, `Permanently delete ${task.identifier}`)}
-          title={text("永久删除", "Delete permanently")}
-          disabled={busy}
-          onClick={() => onDelete(task)}
-        >
-          <LinearIcon name="trash" />
-        </button>
+        {task.source !== "jira" && (
+          <>
+            <button
+              className="archived-task-action archived-task-restore"
+              type="button"
+              disabled={busy}
+              onClick={() => onRestore(task)}
+            >
+              <RefreshIcon color="currentColor" />
+              {restoring ? text("恢复中…", "Restoring…") : text("恢复", "Restore")}
+            </button>
+            <button
+              className="archived-task-action archived-task-delete"
+              type="button"
+              aria-label={text(`永久删除 ${displayIdentifier}`, `Permanently delete ${displayIdentifier}`)}
+              title={text("永久删除", "Delete permanently")}
+              disabled={busy}
+              onClick={() => onDelete(task)}
+            >
+              <DeleteIcon color="currentColor" />
+            </button>
+          </>
+        )}
       </div>
     </article>
+  );
+}
+
+interface ArchivedTasksColumnProps {
+  tasks: Task[];
+  hasActiveFilters: boolean;
+  restoringTaskId: string | null;
+  deletingTaskId: string | null;
+  onRestore: (task: Task) => void;
+  onDelete: (task: Task) => void;
+}
+
+export function ArchivedTasksColumn({
+  tasks,
+  hasActiveFilters,
+  restoringTaskId,
+  deletingTaskId,
+  onRestore,
+  onDelete,
+}: ArchivedTasksColumnProps) {
+  const { text } = useTaskboardI18n();
+  return (
+    <section className="board-column status-archived" aria-labelledby="column-archived">
+      <header className="column-header">
+        <div className="column-heading">
+          <span className="column-status-icon">
+            <DeleteIcon color="var(--column-status-color)" size={14} />
+          </span>
+          <h2 id="column-archived">
+            {text("已归档", "Archived")}{tasks.length > 0 ? ` ${tasks.length}` : ""}
+          </h2>
+        </div>
+      </header>
+      <div className="column-list">
+        {tasks.map((task) => (
+          <ArchivedTaskCard
+            key={task.id}
+            task={task}
+            busy={restoringTaskId !== null || deletingTaskId !== null}
+            restoring={restoringTaskId === task.id}
+            onRestore={onRestore}
+            onDelete={onDelete}
+          />
+        ))}
+        {tasks.length === 0 && (
+          <div className="column-empty">
+            {hasActiveFilters
+              ? text("当前筛选下无匹配议题", "No issues match the current filters")
+              : text("没有已归档议题。", "There are no archived issues.")}
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
 
 interface OtherTasksPanelProps {
   open: boolean;
   activeTab: OtherTasksPanelTab;
+  tabs?: readonly OtherTaskTab[];
   tasksByStatus: Record<TaskStatus, Task[]>;
   ordinaryTasks?: Task[];
   archivedTasks: Task[];
@@ -98,11 +157,15 @@ interface OtherTasksPanelProps {
   settlingTaskId: string | null;
   contextMenuTaskId: string | null;
   availableLabels: string[];
+  projectNames?: Record<string, string>;
   currentUser: ActorIdentity;
+  showCover: boolean;
+  showBody: boolean;
+  onCreateLabel: (label: string, projectId?: string) => Promise<void>;
   restoringTaskId: string | null;
   deletingTaskId: string | null;
   onTabChange: (tab: OtherTasksPanelTab) => void;
-  onCreate: (status: Exclude<OtherTaskTab, "archived">) => void;
+  onCreate?: (status: Exclude<OtherTaskTab, "archived">) => void;
   onRestore: (task: Task) => void;
   onDelete: (task: Task) => void;
   onEdit: (task: Task) => void;
@@ -118,6 +181,7 @@ interface OtherTasksPanelProps {
 export function OtherTasksPanel({
   open,
   activeTab,
+  tabs: configuredTabs,
   tasksByStatus,
   ordinaryTasks,
   archivedTasks,
@@ -131,7 +195,11 @@ export function OtherTasksPanel({
   settlingTaskId,
   contextMenuTaskId,
   availableLabels,
+  projectNames,
   currentUser,
+  showCover,
+  showBody,
+  onCreateLabel,
   restoringTaskId,
   deletingTaskId,
   onTabChange,
@@ -147,26 +215,28 @@ export function OtherTasksPanel({
   onDrop,
   onOpenConversation,
 }: OtherTasksPanelProps) {
-  const { text, statusLabel } = useTaskboardI18n();
+  const { language, text } = useTaskboardI18n();
   const resolvedActiveTab = activeTab === "ordinary" && ordinaryTasks === undefined
     ? "backlog"
     : activeTab;
   const ordinary = resolvedActiveTab === "ordinary";
   const archived = resolvedActiveTab === "archived";
-  const taskStatusTab = !ordinary && !archived ? resolvedActiveTab : null;
+  const taskStatusTab = !ordinary && !archived ? resolvedActiveTab as TaskStatus : null;
   const activeLabel = ordinary
     ? text("普通任务", "Ordinary issues")
     : archived
       ? text("已归档", "Archived")
-      : statusLabel(resolvedActiveTab);
+      : taskStatusTab
+        ? taskStatusLabel(language, taskStatusTab)
+        : "";
   const tasks = ordinary
     ? ordinaryTasks ?? []
     : archived
       ? archivedTasks
-      : tasksByStatus[resolvedActiveTab];
+      : taskStatusTab ? tasksByStatus[taskStatusTab] : [];
   const tabs: readonly OtherTasksPanelTab[] = ordinaryTasks === undefined
-    ? OTHER_TASK_TABS
-    : ["ordinary", ...OTHER_TASK_TABS];
+    ? configuredTabs ?? OTHER_TASK_TABS
+    : ["ordinary", ...(configuredTabs ?? OTHER_TASK_TABS)];
   const [dropBeforeTaskId, setDropBeforeTaskId] = useState<string | null | undefined>();
   const taskIndexes = new Map(tasks.map((task, index) => [task.id, index]));
   const remainingTasks = tasks.filter((task) => task.id !== draggedTaskId);
@@ -233,14 +303,17 @@ export function OtherTasksPanel({
         className="other-tasks-tabs"
         role="tablist"
         aria-label={text("其他任务状态", "Other issue statuses")}
-        style={{ "--other-tasks-tab-count": tabs.length } as CSSProperties}
+        style={{
+          "--other-tasks-tab-count": tabs.length,
+          "--other-task-tab-count": tabs.length,
+        } as CSSProperties}
       >
         {tabs.map((tab) => {
           const label = tab === "ordinary"
             ? text("普通任务", "Ordinary issues")
             : tab === "archived"
               ? text("已归档", "Archived")
-              : statusLabel(tab);
+              : taskStatusLabel(language, tab);
           const count = tab === "ordinary"
             ? ordinaryTasks?.length ?? 0
             : tab === "archived"
@@ -268,7 +341,7 @@ export function OtherTasksPanel({
         })}
       </div>
 
-      {taskStatusTab && (
+      {taskStatusTab && onCreate && (
         <button
           className="other-tasks-add"
           type="button"
@@ -276,7 +349,7 @@ export function OtherTasksPanel({
           title={text(`添加到${activeLabel}`, `Add to ${activeLabel}`)}
           onClick={() => onCreate(taskStatusTab)}
         >
-          <TaskboardIcon name="sidebarAdd" />
+          <PlusIcon color="currentColor" size={11} />
         </button>
       )}
 
@@ -332,7 +405,11 @@ export function OtherTasksPanel({
               dragEnabled={!ordinary}
               dragSourceSurface="other-tasks-panel"
               availableLabels={availableLabels}
+              projectName={projectNames?.[task.projectId]}
               currentUser={currentUser}
+              showCover={showCover}
+              showBody={showBody}
+              onCreateLabel={(label) => onCreateLabel(label, task.projectId)}
               onEdit={onEdit}
               onUpdate={onUpdate}
               onContextMenu={onContextMenu}
@@ -344,7 +421,11 @@ export function OtherTasksPanel({
         })}
         {tasks.length === 0 && (
           <div className="other-tasks-empty">
-            <LinearIcon name={hasActiveFilters ? "search" : archived ? "trash" : "panel"} />
+            {hasActiveFilters
+              ? <LinearIcon name="search" />
+              : archived
+                ? <DeleteIcon color="currentColor" />
+                : <LinearIcon name="panel" />}
             <strong>{hasActiveFilters
               ? text("当前筛选下无匹配议题", "No issues match the current filters")
               : text("暂无议题", "No issues")}</strong>

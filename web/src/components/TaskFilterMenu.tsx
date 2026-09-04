@@ -30,7 +30,8 @@ import {
   type TaskPriority,
   type TaskStatus,
 } from "../types";
-import { LinearIcon, LinearPriorityIcon, LinearStatusIcon } from "./LinearIcon";
+import { LinearIcon } from "./LinearIcon";
+import { LabelIcon, PriorityIcon, StatusIcon } from "./SemanticIcons";
 import { TaskboardIcon } from "./TaskboardIcon";
 
 type SubmenuName = "statuses" | "priorities" | "labels";
@@ -147,7 +148,7 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange }: Tas
     keywords: status,
     count: countFor("statuses", (task) => task.status === status),
     selected: filters.statuses.includes(status),
-    icon: <span className={`filter-status-icon status-${status}`}><LinearStatusIcon status={status} /></span>,
+    icon: <span className="filter-status-icon"><StatusIcon status={status} color="currentColor" /></span>,
     toggle: () => toggleStatus(status),
   })), [filters, language, search, statusLabel, tasks, text]);
 
@@ -158,7 +159,7 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange }: Tas
     keywords: priority,
     count: countFor("priorities", (task) => task.priority === priority),
     selected: filters.priorities.includes(priority),
-    icon: <LinearPriorityIcon priority={priority} />,
+    icon: <PriorityIcon priority={priority} />,
     toggle: () => togglePriority(priority),
   })), [filters, language, search, tasks, text]);
 
@@ -182,8 +183,8 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange }: Tas
     {
       id: "statuses" as const,
       label: text("状态", "Status"),
-      keywords: "status workflow",
-      icon: <LinearStatusIcon status="todo" />,
+      keywords: "status state",
+      icon: <StatusIcon status="todo" color="currentColor" />,
       summary: joinSummary(
         filters.statuses.map((status) => statusLabel(status)),
         text("状态", "statuses"),
@@ -194,7 +195,7 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange }: Tas
       id: "priorities" as const,
       label: text("优先级", "Priority"),
       keywords: "priority urgent high medium low",
-      icon: <LinearIcon name="priority" />,
+      icon: <PriorityIcon color="currentColor" />,
       summary: joinSummary(
         filters.priorities.map((priority) => taskPriorityLabel(language, priority)),
         text("优先级", "priorities"),
@@ -205,7 +206,7 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange }: Tas
       id: "labels" as const,
       label: text("标签", "Labels"),
       keywords: "label tag",
-      icon: <LinearIcon name="label" style={{ color: "inherit" }} />,
+      icon: <LabelIcon color="currentColor" />,
       summary: joinSummary(
         filters.labels.map((label) => labelDisplayName(label, language)),
         text("标签", "labels"),

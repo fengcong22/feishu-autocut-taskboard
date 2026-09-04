@@ -6,7 +6,7 @@ import vm from "node:vm";
 import { parseTaskboardAutomationHostRequest } from "../shared/taskboard-automation.mjs";
 
 const sourceUrl = new URL("../inject/codex-taskboard.user.js", import.meta.url);
-const source = (await readFile(sourceUrl, "utf8")).replace(/\r\n/g, "\n");
+const source = (await readFile(sourceUrl, "utf8")).replaceAll("\r\n", "\n");
 const webStyles = await readFile(new URL("../web/src/styles.css", import.meta.url), "utf8");
 const webApp = await readFile(new URL("../web/src/App.tsx", import.meta.url), "utf8");
 const embeddedHost = await readFile(new URL("../web/src/embeddedHost.mjs", import.meta.url), "utf8");
@@ -36,9 +36,10 @@ test("embedded page uses the launcher URL inside an opaque sandbox", () => {
 });
 
 test("entry clones the native Plugins row and the page covers the complete Codex workspace", () => {
-  assert.match(source, /const PLUGIN_LABELS = \["插件", "plugins"\]/);
-  assert.match(source, /if \(siblings\.length >= 3\) return plugin;/);
-  assert.match(source, /return directButtons\.length >= 3/);
+  assert.match(source, /const PLUGIN_LABELS = \["插件", "plugins", "外掛程式", "プラグイン"\]/);
+  assert.match(source, /if \(plugin\?\.parentElement\) return plugin;/);
+  assert.match(source, /button\.getAttribute\(OWNED_ATTRIBUTE\) !== "true"/);
+  assert.match(source, /rect\.bottom <= sectionTop/);
   assert.match(source, /const button = reference\.cloneNode\(true\)/);
   assert.match(source, /reference\.after\(entry\)/);
   assert.match(source, /document\.querySelector\("\.app-shell-main-content-frame"\)/);
@@ -51,6 +52,82 @@ test("entry clones the native Plugins row and the page covers the complete Codex
   assert.doesNotMatch(source, /codex-taskboard-overlay/);
   assert.doesNotMatch(source, /codex-taskboard-toolbar/);
   assert.doesNotMatch(source, /aria-modal/);
+});
+
+test("entry recognizes known Plugins labels and structurally anchors an unenumerated locale", () => {
+  const normalizedLabelSource = source.slice(
+    source.indexOf("function normalizedLabel"),
+    source.indexOf("\n\n  function hostLanguage"),
+  );
+  const referenceSource = source.slice(
+    source.indexOf("function buttonMatches"),
+    source.indexOf("\n\n  function replaceEntryIcon"),
+  );
+  let currentButtons;
+  let currentSection;
+  const scroll = {
+    querySelector: (selector) => selector === "[data-app-action-sidebar-section]" ? currentSection : null,
+    querySelectorAll: (selector) => selector === "button" ? currentButtons : [],
+  };
+  const findReferenceButton = vm.runInNewContext(`(() => {
+    const PLUGIN_LABELS = ["插件", "plugins", "外掛程式", "プラグイン"];
+    const OWNED_ATTRIBUTE = "data-codex-taskboard-owned";
+    ${normalizedLabelSource}
+    ${referenceSource}
+    return findReferenceButton;
+  })()`, {
+    document: { querySelector: () => scroll },
+  });
+
+  for (const textContent of ["插件", "外掛程式", "プラグイン", "Plugins"]) {
+    const currentButton = {
+      textContent,
+      getAttribute: () => null,
+      parentElement: {},
+    };
+    currentButtons = [currentButton];
+    currentSection = null;
+    assert.equal(findReferenceButton(), currentButton);
+  }
+
+  const topButton = (textContent, top, owned = false) => ({
+    textContent,
+    getAttribute: (name) => name === "data-codex-taskboard-owned" && owned ? "true" : null,
+    getBoundingClientRect: () => ({ top, bottom: top + 30, height: 30 }),
+    parentElement: {},
+  });
+  const unenumeratedPlugin = topButton("Приклучоци", 160);
+  currentButtons = [
+    topButton("Барања за повлекување", 100),
+    topButton("Локации", 120),
+    topButton("Закажано", 140),
+    unenumeratedPlugin,
+    topButton("Taskboard", 180, true),
+  ];
+  currentSection = { getBoundingClientRect: () => ({ top: 200 }) };
+  assert.equal(findReferenceButton(), unenumeratedPlugin);
+
+  const languageDocument = { documentElement: { lang: "" } };
+  const languageSource = source.slice(
+    source.indexOf("function hostLanguage"),
+    source.indexOf("\n\n  function hostError"),
+  );
+  const hostText = vm.runInNewContext(`(() => {
+    ${languageSource}
+    return hostText;
+  })()`, {
+    document: languageDocument,
+    navigator: { language: "en-US" },
+  });
+
+  for (const language of ["zh", "zh-CN", "zh-TW", "zh-HK"]) {
+    languageDocument.documentElement.lang = language;
+    assert.equal(hostText("任务面板", "Taskboard"), "任务面板");
+  }
+  for (const language of ["en-US", "ja-JP", "de-DE"]) {
+    languageDocument.documentElement.lang = language;
+    assert.equal(hostText("任务面板", "Taskboard"), "Taskboard");
+  }
 });
 
 test("opening Taskboard suppresses native selection and contextual header until close", () => {
@@ -169,14 +246,15 @@ test("opaque iframe messages require the current document capability", () => {
   assert.match(source, /postMessage\(message, frameOrigin === "null" \? "\*" : frameOrigin\)/);
 });
 
-test("packaged HTTPS links are opened by the authenticated host instead of a sandbox popup", () => {
+test("HTTP and HTTPS links are opened by the authenticated host instead of a sandbox popup", () => {
   assert.match(embeddedHost, /a\[target="_blank"\]/);
-  assert.match(embeddedHost, /url\.protocol !== "https:"/);
+  assert.match(embeddedHost, /url\.protocol !== "http:" && url\.protocol !== "https:"/);
   assert.match(embeddedHost, /event\.preventDefault\(\)/);
   assert.match(embeddedHost, /type: "taskboard:open-external"/);
   assert.match(embeddedHost, /challenge: activeFrameChallenge/);
   assert.match(source, /message\.type === "taskboard:open-external"/);
   assert.match(source, /requestHost\("open-external", \{ url: url\.href \}\)/);
+  assert.match(source, /url\.protocol !== "http:" && url\.protocol !== "https:"/);
 });
 
 test("the iframe automation contract is forwarded through the fixed host binding", () => {
@@ -186,13 +264,17 @@ test("the iframe automation contract is forwarded through the fixed host binding
   assert.match(source, /operation: payload\.operation/);
   assert.match(source, /taskboardProjectId: payload\.taskboardProjectId/);
   assert.match(source, /codexProjectId: payload\.codexProjectId/);
+  assert.match(source, /codexProjectKind: payload\.codexProjectKind/);
+  assert.match(source, /codexHostId: payload\.codexHostId/);
   assert.match(source, /workspacePath: payload\.workspacePath/);
+  assert.match(source, /remoteProjects: payload\.remoteProjects/);
   assert.match(source, /skillPath: payload\.skillPath/);
   assert.match(source, /model: payload\.model/);
   assert.match(source, /reasoningEffort: payload\.reasoningEffort/);
   assert.match(source, /type: "taskboard:automation-response"/);
   assert.match(source, /requestId,\s*ok: true,\s*item: response\.item/);
   assert.match(source, /items: response\.items/);
+  assert.match(source, /policy: response\.policy/);
   assert.match(source, /requestId,\s*ok: false,\s*error:/);
   assert.match(source, /type: HOST_REQUEST_MESSAGE/);
   assert.match(source, /capability: HOST_CAPABILITY/);
@@ -211,8 +293,11 @@ test("complete App automation payloads cross the injected forwarder into the cur
     requestId: "request-1",
     taskboardProjectId: "local",
     codexProjectId: "codex-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
     projectName: "Local",
     workspacePath: "/tmp/local-project",
+    remoteProjects: [],
     skillPath: "/tmp/manage-taskboard/SKILL.md",
     automationId: "automation-1",
     enabledByUser: true,
@@ -247,48 +332,99 @@ test("only a loopback Taskboard iframe can request native automation", () => {
   );
 });
 
-test("issues open an unsent native Codex composer in the exact workspace with the task instruction", () => {
-  assert.match(source, /function createThreadForTask\(payload\)/);
-  assert.match(source, /\[data-app-action-sidebar-select-project\]/);
-  assert.match(source, /data-codex-composer/);
-  assert.match(source, /type: "electron-set-active-workspace-root"/);
-  assert.match(source, /root: workspacePath/);
-  assert.doesNotMatch(source, /prefillPrompt: prompt/);
-  assert.match(source, /requestHostTaskComposerPrefill\(\{/);
-  assert.match(source, /requestHost\("prefill-task-composer"/);
-  assert.match(source, /function waitForPreparedComposer\(identifier\)/);
-  assert.match(source, /requestHostTaskComposerPrefill\(\{ instruction \}\)/);
-  assert.match(source, /normalizedLabel\(editor\.textContent\)\.includes\(normalizedLabel\(identifier\)\)/);
-  assert.doesNotMatch(source, /submit\.click\(\)/);
-  assert.match(source, /type: "taskboard:thread-prepared"/);
-  assert.doesNotMatch(source, /function waitForCreatedThread/);
-  assert.doesNotMatch(source, /type: "taskboard:thread-created"/);
-  assert.doesNotMatch(webApp, /taskboard:thread-created/);
-  assert.match(
-    webApp,
-    /const instruction = `e-taskboard 处理任务面板任务 \$\{task\.identifier\}，并同步进度状态。`/,
+test("issues open an unsent native Codex composer in the confirmed project", () => {
+  const createThreadSource = source.slice(
+    source.indexOf("async function createThreadForTask"),
+    source.indexOf("function buildAutomationHostPayload"),
   );
-  assert.doesNotMatch(webApp, /const prompt =/);
-  assert.doesNotMatch(webApp, /skillName: "manage-taskboard"/);
-  assert.match(webApp, /instruction,/);
+  assert.match(source, /async function createThreadForTask\(payload\)/);
+  assert.match(source, /async function nativeProjectContext\(\)/);
+  assert.match(source, /async function activeNativeWorkspaceRoots\(\)/);
+  assert.match(source, /requestNativeFetch\("active-workspace-roots", \{\}\)/);
+  assert.match(source, /available: Array\.isArray\(roots\)/);
+  assert.match(source, /function normalizeNativeRootPath\(value\)/);
+  assert.match(source, /async function canonicalNativeRootPaths\(roots\)/);
+  assert.match(source, /requestNativeFetch\("workspace-root-options", \{\s*hostId: "local",\s*canonicalizeRoots: roots,/);
+  assert.match(source, /async function resolveNativeProject\(requestedProjectId, workspacePath\)/);
+  assert.match(source, /let project = context\.projects\.find\(\(candidate\) => candidate\.id === requestedProjectId\) \?\? null/);
+  assert.match(source, /if \(!project && normalizedWorkspacePath\)/);
+  assert.match(source, /const targetRoot = normalizedWorkspacePath \? workspacePath : project\?\.rootPaths\[0\]/);
+  assert.match(source, /async function waitForNativeProject\(targetRoot, expectedProjectId\)/);
+  const waitStart = source.indexOf("async function waitForNativeProject");
+  const waitSource = source.slice(waitStart, source.indexOf("async function createThreadForTask", waitStart));
+  assert.match(waitSource, /selectedNativeProjectId\(\)/);
+  assert.match(waitSource, /activeNativeWorkspaceRoots\(\)/);
+  assert.match(waitSource, /if \(projectId && projectId === expectedProjectId\)/);
+  assert.match(waitSource, /if \(!activeWorkspace\.available\) return projectId/);
+  assert.match(waitSource, /canonicalNativeRootPaths\(\[\s*targetRoot,\s*\.\.\.activeWorkspace\.roots,/);
+  assert.match(waitSource, /canonicalActiveRoots\.some\(\(root\) => root === canonicalTargetRoot\)/);
+  assert.match(
+    source,
+    /bridge\.sendMessageFromView\(\{\s*type: "electron-add-new-workspace-root-option",\s*root: targetRoot,/,
+  );
+  assert.match(source, /await waitForNativeProject\(targetRoot, projectId\)/);
+  assert.match(
+    createThreadSource,
+    /if \(!projectless && codexProjectKind === "remote"\) \{[\s\S]*?codexHostId = typeof payload\?\.codexHostId[\s\S]*?codexProjectWorkspacePath[\s\S]*?await waitForRemoteProject\(requestedProjectId, codexHostId, codexProjectWorkspacePath\);/,
+  );
+  assert.match(source, /const focusComposerNonce = crypto\.randomUUID\(\)/);
+  assert.match(createThreadSource, /type: "navigate-to-route",\s*path: "\/",\s*state: \{\s*focusComposerNonce,\s*prefillPrompt: instruction,/);
+  assert.match(createThreadSource, /type: "taskboard:thread-prepared", payload: \{ taskId \}/);
+  assert.doesNotMatch(createThreadSource, /start-task-conversation|previousThreadId|threadId:/);
+  assert.match(webApp, /title: task\.title,/);
+  assert.match(webApp, /instruction: embeddedInstruction,/);
   assert.match(webApp, /type: "taskboard:create-thread"/);
-  assert.match(webApp, /type: "taskboard:open-thread", payload: \{ threadId \}/);
+  assert.match(webApp, /codexProjectWorkspacePath: codexProjectContext\?\.workspacePath/);
+  assert.match(webApp, /workspacePath,/);
 });
 
 test("the standalone web page opens linked Codex tasks through the app deep link", () => {
-  assert.match(webApp, /window\.location\.assign\(`codex:\/\/threads\/\$\{encodeURIComponent\(threadId\.trim\(\)\)\}`\)/);
+  assert.match(webApp, /window\.location\.assign\(`codex:\/\/threads\/\$\{encodeURIComponent\(binding\.threadId\.trim\(\)\)\}`\)/);
 });
 
 test("the injected app opens an existing local Codex task instead of a new composer", () => {
+  const openThreadStart = source.indexOf("async function openThread");
   const openThreadSource = source.slice(
-    source.indexOf("async function openThread"),
-    source.indexOf("function projectRowById"),
+    openThreadStart,
+    source.indexOf("async function nativeProjectContext", openThreadStart),
   );
   assert.match(openThreadSource, /if \(row\?\.isConnected\) \{\s*row\.click\?\.\(\);\s*return;/);
   assert.match(openThreadSource, /await dispatchHostMessage\(\{\s*type: "navigate-to-route",\s*path: routeForThread\(normalizedThreadId\)/);
   assert.match(source, /return `\/local\/\$\{encodeURIComponent\(threadId\)\}`/);
   assert.doesNotMatch(source, /return `\/thread\/\$\{encodeURIComponent\(threadId\)\}`/);
   assert.doesNotMatch(openThreadSource, /focusComposerNonce/);
+  assert.match(webApp, /payload: \{ threadId, legacyLocal: true \}/);
+  assert.doesNotMatch(webApp, /payload: \{ threadId, legacyLocal: true, [^}]*codexProject/);
+});
+
+test("remote Codex tasks wait for the exact project and host without a local route fallback", () => {
+  const remoteProjectSource = source.slice(
+    source.indexOf("async function waitForRemoteProject"),
+    source.indexOf("async function waitForRemoteThreadRow"),
+  );
+  const openThreadSource = source.slice(
+    source.indexOf("async function openThread"),
+    source.indexOf("async function nativeProjectContext"),
+  );
+  const remoteOpenSource = openThreadSource.slice(
+    openThreadSource.indexOf("if (remoteProject)"),
+    openThreadSource.indexOf("\n    lastNativeThreadId = normalizedThreadId;"),
+  );
+  assert.match(remoteProjectSource, /if \(!projectId \|\| !hostId \|\| hostId === "local"\)/);
+  assert.match(remoteProjectSource, /row = projectRowById\(projectId\)/);
+  assert.match(remoteProjectSource, /selectedNativeProjectId\(\)/);
+  assert.match(remoteProjectSource, /readCodexProjectMetadata\(\)/);
+  assert.match(remoteProjectSource, /selectedProjectId === projectId/);
+  assert.match(remoteProjectSource, /selectedProject\?\.projectKind === "remote"/);
+  assert.match(remoteProjectSource, /selectedProject\.hostId === hostId/);
+  assert.match(remoteProjectSource, /!workspacePath \|\| selectedProject\.workspacePath === workspacePath/);
+  assert.match(remoteOpenSource, /waitForRemoteThreadRow\(normalizedThreadId, projectId\)/);
+  assert.match(remoteOpenSource, /type: "taskboard:thread-open-error"/);
+  assert.doesNotMatch(remoteOpenSource, /routeForThread/);
+  assert.match(webApp, /openThread\(conversation\.threadBinding\)/);
+  assert.match(webApp, /onOpenThread=\{openThread\}/);
+  assert.match(webApp, /project\.id === binding\.codexProjectId[\s\S]*?project\.hostId === binding\.codexHostId[\s\S]*?project\.workspacePath === binding\.workspacePath/);
+  assert.match(webApp, /message\.type === "taskboard:thread-open-error"/);
 });
 
 test("host navigation follows Codex's renderer message bus", () => {
@@ -297,15 +433,102 @@ test("host navigation follows Codex's renderer message bus", () => {
   assert.doesNotMatch(source, /new CustomEvent\("codex-message-from-view"/);
 });
 
-test("the standalone web page opens unlinked issues as prefilled empty Codex tasks", () => {
-  assert.match(webApp, /const query = new URLSearchParams\(\)/);
-  assert.match(webApp, /query\.set\("path", workspacePath\)/);
-  assert.match(webApp, /query\.set\("prompt", instruction\)/);
-  assert.match(webApp, /window\.location\.assign\(`codex:\/\/new\?/);
+test("the standalone web page always opens a project-scoped Codex composer", () => {
+  assert.doesNotMatch(webApp, /standalone && task\.threadBinding[\s\S]*?openThread\(task\.threadBinding\)/);
+  assert.doesNotMatch(webApp, /standalone && task\.legacyLocalThreadId[\s\S]*?openLegacyLocalThread\(task\.legacyLocalThreadId\)/);
+  assert.match(webApp, /new URL\("codex:\/\/threads\/new"\)/);
+  assert.match(webApp, /deepLink\.searchParams\.set\("path", workspacePath\)/);
+  assert.match(webApp, /deepLink\.searchParams\.set\("prompt", embeddedInstruction\)/);
+});
+
+test("native fetch preserves successful null bodies and returns undefined when unavailable", async () => {
+  const functionSource = source.slice(
+    source.indexOf("function requestNativeFetch"),
+    source.indexOf("\n\n  async function selectedNativeProjectId"),
+  );
+  const loadRequestNativeFetch = (window) => vm.runInNewContext(`(${functionSource})`, {
+    crypto: { randomUUID: () => "request-id" },
+    window,
+  });
+  const responseWindow = (status, bodyJsonString) => {
+    let onMessage;
+    return {
+      electronBridge: {
+        sendMessageFromView(message) {
+          onMessage({
+            data: {
+              type: "fetch-response",
+              requestId: message.requestId,
+              status,
+              bodyJsonString,
+            },
+          });
+        },
+      },
+      setTimeout,
+      clearTimeout,
+      addEventListener(_type, listener) { onMessage = listener; },
+      removeEventListener() {},
+    };
+  };
+
+  assert.equal(await loadRequestNativeFetch({})("get-global-state", {}), undefined);
+  assert.equal(
+    await loadRequestNativeFetch(responseWindow(200, "null"))("get-global-state", {}),
+    null,
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      await loadRequestNativeFetch(responseWindow(200, '{"value":null}'))("get-global-state", {}),
+    )),
+    { value: null },
+  );
+  assert.equal(
+    await loadRequestNativeFetch(responseWindow(500, '{"value":{}}'))("get-global-state", {}),
+    undefined,
+  );
+  assert.equal(
+    await loadRequestNativeFetch(responseWindow(200, "{"))("get-global-state", {}),
+    undefined,
+  );
+
+  let expire;
+  const timeoutWindow = {
+    electronBridge: { sendMessageFromView() {} },
+    setTimeout(callback) { expire = callback; return 1; },
+    clearTimeout() {},
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const timeoutRequest = loadRequestNativeFetch(timeoutWindow)("get-global-state", {});
+  expire();
+  assert.equal(await timeoutRequest, undefined);
+
+  const throwingWindow = {
+    electronBridge: { sendMessageFromView() { throw new Error("unavailable"); } },
+    setTimeout,
+    clearTimeout,
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  assert.equal(
+    await loadRequestNativeFetch(throwingWindow)("get-global-state", {}),
+    undefined,
+  );
 });
 
 test("host context captures all Codex projects even when the sidebar section is collapsed", () => {
-  assert.match(source, /function readCodexProjects\(\)/);
+  assert.match(source, /async function readCodexProjectMetadata\(\)/);
+  assert.match(source, /await window\.electronBridge\?\.getInitialSidebarBootstrap\?\.\(\)/);
+  assert.match(source, /requestNativeFetch\("get-global-state", \{ key: "local-projects" \}\)/);
+  assert.match(source, /requestNativeFetch\("get-global-state", \{ key: "remote-projects" \}\)/);
+  assert.match(source, /currentLocalProjects === undefined\s*\? entries\.get\("local-projects"\)\s*: currentLocalProjects\?\.value/);
+  assert.match(source, /currentRemoteProjects === undefined\s*\? entries\.get\("remote-projects"\)\s*: currentRemoteProjects\?\.value/);
+  assert.match(source, /entries\.get\("local-projects"\)/);
+  assert.match(source, /entries\.get\("remote-projects"\)/);
+  assert.match(source, /projectKind: "remote"/);
+  assert.match(source, /workspacePath,[\s\S]*?hostId/);
+  assert.match(source, /function readCodexProjects\(metadata = codexProjectMetadata\)/);
   assert.match(source, /\[data-app-action-sidebar-project-row\]/);
   assert.match(source, /data-app-action-sidebar-project-id/);
   assert.match(source, /function findProjectsSection\(\)/);
@@ -319,6 +542,388 @@ test("host context captures all Codex projects even when the sidebar section is 
   assert.match(source, /const threadId = currentThreadId \|\| lastNativeThreadId \|\| normalizeThreadId\(threadIdFromLocation\(\)\)/);
   assert.match(source, /replace\(\/\^\(\?:local\|cloud\):\/i, ""\)/);
   assert.match(source, /function findTasksSection\(\)/);
+});
+
+test("Codex bootstrap metadata resolves local roots and SSH remote roots asynchronously", async () => {
+  const functionSource = source.slice(
+    source.indexOf("async function readCodexProjectMetadata"),
+    source.indexOf("\n\n  async function activeNativeWorkspaceRoots"),
+  );
+  const readCodexProjectMetadata = vm.runInNewContext(`(${functionSource})`, {
+    requestNativeFetch: async () => undefined,
+    window: {
+      electronBridge: {
+        getInitialSidebarBootstrap: async () => ({
+          globalStateEntries: [
+            {
+              key: "local-projects",
+              value: {
+                local: { rootPaths: ["/Users/example/project"] },
+              },
+            },
+            {
+              key: "remote-projects",
+              value: [{
+                id: "remote-project",
+                hostId: "remote-ssh-discovered:example",
+                remotePath: "/srv/example/project",
+              }],
+            },
+          ],
+        }),
+      },
+    },
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify([...(await readCodexProjectMetadata()).entries()])),
+    [
+      ["local", {
+        projectKind: "local",
+        hostId: "local",
+        workspacePath: "/Users/example/project",
+      }],
+      ["remote-project", {
+        projectKind: "remote",
+        workspacePath: "/srv/example/project",
+        hostId: "remote-ssh-discovered:example",
+        name: "remote-project",
+      }],
+    ],
+  );
+});
+
+test("Codex project metadata prefers the live global state over the startup bootstrap", async () => {
+  const functionSource = source.slice(
+    source.indexOf("async function readCodexProjectMetadata"),
+    source.indexOf("\n\n  async function activeNativeWorkspaceRoots"),
+  );
+  const readCodexProjectMetadata = vm.runInNewContext(`(${functionSource})`, {
+    requestNativeFetch: async (_path, body) => ({
+      value: body.key === "local-projects"
+        ? { live: { rootPaths: ["/Users/example/live"] } }
+        : [{
+          id: "live-remote",
+          hostId: "remote-ssh-discovered:live",
+          remotePath: "/srv/live",
+          label: "Live Remote",
+        }],
+    }),
+    window: {
+      electronBridge: {
+        getInitialSidebarBootstrap: async () => ({
+          globalStateEntries: [
+            {
+              key: "local-projects",
+              value: { stale: { rootPaths: ["/Users/example/stale"] } },
+            },
+            {
+              key: "remote-projects",
+              value: [{
+                id: "stale-remote",
+                hostId: "remote-ssh-discovered:stale",
+                remotePath: "/srv/stale",
+              }],
+            },
+          ],
+        }),
+      },
+    },
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify([...(await readCodexProjectMetadata()).entries()])),
+    [
+      ["live", {
+        projectKind: "local",
+        hostId: "local",
+        workspacePath: "/Users/example/live",
+      }],
+      ["live-remote", {
+        projectKind: "remote",
+        workspacePath: "/srv/live",
+        hostId: "remote-ssh-discovered:live",
+        name: "Live Remote",
+      }],
+    ],
+  );
+});
+
+test("successful empty Codex project state does not revive startup metadata", async () => {
+  const functionSource = source.slice(
+    source.indexOf("async function readCodexProjectMetadata"),
+    source.indexOf("\n\n  async function activeNativeWorkspaceRoots"),
+  );
+  const bootstrap = {
+    globalStateEntries: [
+      {
+        key: "local-projects",
+        value: { stale: { rootPaths: ["/Users/example/stale"] } },
+      },
+      {
+        key: "remote-projects",
+        value: [{
+          id: "stale-remote",
+          hostId: "remote-ssh-discovered:stale",
+          remotePath: "/srv/stale",
+        }],
+      },
+    ],
+  };
+  const loadMetadata = (requestNativeFetch) => vm.runInNewContext(`(${functionSource})`, {
+    requestNativeFetch,
+    window: {
+      electronBridge: { getInitialSidebarBootstrap: async () => bootstrap },
+    },
+  });
+
+  for (const requestNativeFetch of [
+    async () => null,
+    async () => ({ value: null }),
+    async (_path, body) => ({ value: body.key === "local-projects" ? {} : [] }),
+  ]) {
+    assert.deepEqual(
+      JSON.parse(JSON.stringify([...(await loadMetadata(requestNativeFetch)()).entries()])),
+      [],
+    );
+  }
+});
+
+test("new Codex conversations resolve projects added after startup", async () => {
+  const functionSource = source.slice(
+    source.indexOf("async function nativeProjectContext"),
+    source.indexOf("\n\n  async function resolveNativeProject"),
+  );
+  const nativeProjectContext = vm.runInNewContext(`(${functionSource})`, {
+    requestNativeFetch: async () => ({
+      value: {
+        "live-project": { rootPaths: ["/Users/example/live"] },
+      },
+    }),
+    window: {
+      electronBridge: {
+        getInitialSidebarBootstrap: async () => ({
+          globalStateEntries: [{
+            key: "local-projects",
+            value: { stale: { rootPaths: ["/Users/example/stale"] } },
+          }],
+        }),
+      },
+    },
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify((await nativeProjectContext()).projects)),
+    [{ id: "live-project", rootPaths: ["/Users/example/live"] }],
+  );
+});
+
+test("new Codex conversations only use startup projects when the live request is unavailable", async () => {
+  const functionSource = source.slice(
+    source.indexOf("async function nativeProjectContext"),
+    source.indexOf("\n\n  async function resolveNativeProject"),
+  );
+  const bootstrap = {
+    globalStateEntries: [{
+      key: "local-projects",
+      value: { stale: { rootPaths: ["/Users/example/stale"] } },
+    }],
+  };
+  const loadContext = (response) => vm.runInNewContext(`(${functionSource})`, {
+    requestNativeFetch: async () => response,
+    window: {
+      electronBridge: { getInitialSidebarBootstrap: async () => bootstrap },
+    },
+  });
+
+  for (const response of [null, { value: null }, { value: {} }, { value: [] }]) {
+    assert.deepEqual(
+      JSON.parse(JSON.stringify((await loadContext(response)()).projects)),
+      [],
+    );
+  }
+  assert.deepEqual(
+    JSON.parse(JSON.stringify((await loadContext(undefined)()).projects)),
+    [{ id: "stale", rootPaths: ["/Users/example/stale"] }],
+  );
+});
+
+test("native root canonicalization follows the filesystem's case sensitivity", async () => {
+  const start = source.indexOf("function normalizeNativeRootPath");
+  const functionSource = source.slice(
+    start,
+    source.indexOf("\n\n  function readCodexProjects", start),
+  );
+  const roots = [
+    "/private/tmp/LOCAL344-default/Project",
+    "/private/tmp/local344-default/project",
+    "/Volumes/LOCAL344CASE/Project",
+    "/Volumes/LOCAL344CASE/project",
+  ];
+  const loadCanonicalizer = (requestNativeFetch) => vm.runInNewContext(`(() => {
+    ${functionSource}
+    return { normalizeNativeRootPath, canonicalNativeRootPaths };
+  })()`, { requestNativeFetch });
+  const calls = [];
+  const canonicalizer = loadCanonicalizer(async (path, body) => {
+    calls.push({ path, body: JSON.parse(JSON.stringify(body)) });
+    return {
+      canonicalPathByRoot: {
+        [roots[0]]: roots[0],
+        [roots[1]]: roots[0],
+        [roots[2]]: roots[2],
+        [roots[3]]: roots[3],
+      },
+    };
+  });
+  const canonicalRoots = await canonicalizer.canonicalNativeRootPaths(roots);
+
+  assert.equal(canonicalRoots[0], canonicalRoots[1]);
+  assert.notEqual(canonicalRoots[2], canonicalRoots[3]);
+  assert.notEqual(
+    canonicalizer.normalizeNativeRootPath(roots[2]),
+    canonicalizer.normalizeNativeRootPath(roots[3]),
+  );
+  assert.deepEqual(calls, [{
+    path: "workspace-root-options",
+    body: { hostId: "local", canonicalizeRoots: roots },
+  }]);
+
+  const unavailable = loadCanonicalizer(async () => undefined);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(await unavailable.canonicalNativeRootPaths([roots[2], roots[3]]))),
+    [roots[2], roots[3]],
+  );
+  const missingMapping = loadCanonicalizer(async () => ({
+    canonicalPathByRoot: { [roots[0]]: "/private/tmp/LOCAL344-default/Project" },
+  }));
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(await missingMapping.canonicalNativeRootPaths([roots[0], roots[1]]))),
+    [roots[0], roots[1]],
+  );
+});
+
+test("native project resolution gives the explicit project ID priority over path candidates", async () => {
+  const functionSource = source.slice(
+    source.indexOf("async function resolveNativeProject"),
+    source.indexOf("\n\n  async function ensureProjectRows"),
+  );
+  let canonicalCalls = 0;
+  const resolveNativeProject = vm.runInNewContext(`(${functionSource})`, {
+    nativeProjectContext: async () => ({
+      projects: [
+        { id: "wrong", rootPaths: ["/Volumes/LOCAL344CASE/project"] },
+        { id: "expected", rootPaths: ["/Volumes/LOCAL344CASE/Project"] },
+      ],
+    }),
+    normalizeNativeRootPath: (value) => String(value || "").replace(/\/+$/, ""),
+    canonicalNativeRootPaths: async () => { canonicalCalls += 1; return []; },
+  });
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      await resolveNativeProject("expected", "/Volumes/LOCAL344CASE/project"),
+    )),
+    { projectId: "expected", targetRoot: "/Volumes/LOCAL344CASE/project" },
+  );
+  assert.equal(canonicalCalls, 0);
+});
+
+test("native project confirmation composes exact IDs, root availability, and canonical roots", async () => {
+  const normalizeStart = source.indexOf("function normalizeNativeRootPath");
+  const canonicalSource = source.slice(
+    normalizeStart,
+    source.indexOf("\n\n  function readCodexProjects", normalizeStart),
+  );
+  const waitStart = source.indexOf("async function waitForNativeProject");
+  const waitSource = source.slice(
+    waitStart,
+    source.indexOf("\n\n  async function createThreadForTask", waitStart),
+  );
+  const loadWait = ({ projectId, activeWorkspace, canonicalPathByRoot }) => {
+    let now = 0;
+    const canonicalCalls = [];
+    const api = vm.runInNewContext(`(() => {
+      ${canonicalSource}
+      ${waitSource}
+      return { waitForNativeProject };
+    })()`, {
+      Date: { now: () => now },
+      activeNativeWorkspaceRoots: async () => activeWorkspace,
+      hostText: (_chinese, english) => english,
+      requestNativeFetch: async (path, body) => {
+        canonicalCalls.push({ path, body: JSON.parse(JSON.stringify(body)) });
+        return canonicalPathByRoot === undefined ? undefined : { canonicalPathByRoot };
+      },
+      selectedNativeProjectId: async () => projectId,
+      window: {
+        setTimeout(resolve) { now = 8_001; resolve(); },
+      },
+    });
+    return { waitForNativeProject: api.waitForNativeProject, canonicalCalls };
+  };
+
+  const unavailable = loadWait({
+    projectId: "expected",
+    activeWorkspace: { available: false, roots: [] },
+  });
+  assert.equal(
+    await unavailable.waitForNativeProject("/Volumes/LOCAL344CASE/Project", "expected"),
+    "expected",
+  );
+  assert.deepEqual(unavailable.canonicalCalls, []);
+
+  const defaultTarget = "/private/tmp/LOCAL344-default/Project";
+  const defaultActive = "/private/tmp/local344-default/project";
+  const canonicalMatch = loadWait({
+    projectId: "expected",
+    activeWorkspace: { available: true, roots: [defaultActive] },
+    canonicalPathByRoot: {
+      [defaultTarget]: defaultTarget,
+      [defaultActive]: defaultTarget,
+    },
+  });
+  assert.equal(
+    await canonicalMatch.waitForNativeProject(defaultTarget, "expected"),
+    "expected",
+  );
+  assert.deepEqual(canonicalMatch.canonicalCalls, [{
+    path: "workspace-root-options",
+    body: { hostId: "local", canonicalizeRoots: [defaultTarget, defaultActive] },
+  }]);
+
+  const emptyRoots = loadWait({
+    projectId: "expected",
+    activeWorkspace: { available: true, roots: [] },
+    canonicalPathByRoot: {},
+  });
+  await assert.rejects(
+    emptyRoots.waitForNativeProject("/Volumes/LOCAL344CASE/Project", "expected"),
+  );
+
+  const sensitiveTarget = "/Volumes/LOCAL344CASE/Project";
+  const sensitiveOther = "/Volumes/LOCAL344CASE/project";
+  const mismatch = loadWait({
+    projectId: "expected",
+    activeWorkspace: { available: true, roots: [sensitiveOther] },
+    canonicalPathByRoot: {
+      [sensitiveTarget]: sensitiveTarget,
+      [sensitiveOther]: sensitiveOther,
+    },
+  });
+  await assert.rejects(mismatch.waitForNativeProject(sensitiveTarget, "expected"));
+
+  const wrongProject = loadWait({
+    projectId: "wrong",
+    activeWorkspace: { available: true, roots: [defaultTarget] },
+    canonicalPathByRoot: { [defaultTarget]: defaultTarget },
+  });
+  await assert.rejects(wrongProject.waitForNativeProject(defaultTarget, "expected"));
+  assert.deepEqual(wrongProject.canonicalCalls, []);
+});
+
+test("SSH task project selection uses its stable ID and local project IDs use bootstrap keys", () => {
+  assert.match(source, /row = projectRowById\(projectId\)/);
+  assert.doesNotMatch(source, /projectRowForTask|projectRowByLabel/);
+  assert.match(source, /Object\.entries\(localProjects\)/);
+  assert.match(source, /\[\{ \.\.\.project, id \}\]/);
 });
 
 test("cleanup removes observers, listeners, timers and owned DOM", () => {

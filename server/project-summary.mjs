@@ -1,3 +1,4 @@
+import { signalProcessTree } from "../shared/process-tree.mjs";
 import { spawnCodexTurn } from "./ai-chat-process.mjs";
 import { ApiError } from "./database.mjs";
 
@@ -13,16 +14,6 @@ const STATUS_LABELS = {
   canceled: "取消",
 };
 
-function signalProcessGroup(child, signal) {
-  if (Number.isInteger(child?.pid)) {
-    try {
-      process.kill(-child.pid, signal);
-      return;
-    } catch {}
-  }
-  child?.kill(signal);
-}
-
 function isDue(summary) {
   if (!summary.attemptedAt) return true;
   return Date.now() - new Date(summary.attemptedAt).getTime() >= DAY_MS;
@@ -33,7 +24,11 @@ function buildPrompt(project, tasks) {
     STATUS_LABELS[status],
     tasks.filter((task) => task.status === status).length,
   ]));
-  const issues = tasks.map((task) => ({
+  const recentCutoff = Date.now() - 7 * DAY_MS;
+  const issues = tasks.filter((task) => (
+    (task.status !== "done" && task.status !== "canceled")
+    || new Date(task.activityUpdatedAt).getTime() >= recentCutoff
+  )).map((task) => ({
     id: task.identifier,
     title: task.title,
     status: STATUS_LABELS[task.status],
@@ -113,6 +108,7 @@ export class ProjectSummaryService {
           "--json",
           "--color",
           "never",
+          "--skip-git-repo-check",
           "-C",
           this.workspacePath,
           "-s",
@@ -157,7 +153,7 @@ export class ProjectSummaryService {
     this.closed = true;
     clearInterval(this.timer);
     const active = [...this.active.values()];
-    for (const entry of active) signalProcessGroup(entry.child, "SIGTERM");
+    for (const entry of active) signalProcessTree(entry.child, "SIGTERM");
     await Promise.allSettled(active.map((entry) => entry.promise));
   }
 }

@@ -139,6 +139,9 @@ export interface UnifiedWorkflowBoardProps {
   filters?: TaskFilters;
   availableLabels: string[];
   currentUser: ActorIdentity;
+  showCover: boolean;
+  showBody: boolean;
+  onCreateLabel: (label: string) => Promise<void>;
   draggedTaskId: string | null;
   draggedTaskHeight: number;
   movingTaskId: string | null;
@@ -151,7 +154,7 @@ export interface UnifiedWorkflowBoardProps {
   searchScope?: "activeView" | "allStages";
   onOpenTask: (task: Task, stage: UnifiedWorkflowStage) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
-  onComplete: (task: Task) => void;
+  onComplete: (task: Task) => Promise<void>;
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
   onDragStart: (task: Task, height: number) => void;
   onDragEnd: () => void;
@@ -444,6 +447,9 @@ function UnifiedWorkflowColumn({
   hasActiveFilters,
   availableLabels,
   currentUser,
+  showCover,
+  showBody,
+  onCreateLabel,
   draggedTaskId,
   draggedTaskHeight,
   movingTaskId,
@@ -486,6 +492,9 @@ function UnifiedWorkflowColumn({
   hasActiveFilters: boolean;
   availableLabels: string[];
   currentUser: ActorIdentity;
+  showCover: boolean;
+  showBody: boolean;
+  onCreateLabel: (label: string) => Promise<void>;
   draggedTaskId: string | null;
   draggedTaskHeight: number;
   movingTaskId: string | null;
@@ -494,7 +503,7 @@ function UnifiedWorkflowColumn({
   dropTarget: TaskStatus | null;
   onOpenTask: (task: Task, stage: UnifiedWorkflowStage) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
-  onComplete: (task: Task) => void;
+  onComplete: (task: Task) => Promise<void>;
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
   onDragStart: (task: Task, height: number) => void;
   onDragEnd: () => void;
@@ -676,6 +685,9 @@ function UnifiedWorkflowColumn({
                 dragEnabled={!readOnly}
                 availableLabels={availableLabels}
                 currentUser={currentUser}
+                showCover={showCover}
+                showBody={showBody}
+                onCreateLabel={onCreateLabel}
                 onEdit={(task) => onOpenTask(task, definition.id)}
                 onUpdate={onUpdate}
                 onComplete={!readOnly ? onComplete : undefined}
@@ -721,6 +733,9 @@ export function UnifiedWorkflowBoard({
   filters,
   availableLabels,
   currentUser,
+  showCover,
+  showBody,
+  onCreateLabel,
   draggedTaskId,
   draggedTaskHeight,
   movingTaskId,
@@ -1345,9 +1360,12 @@ export function UnifiedWorkflowBoard({
               uploadLoading={uploadLoading}
               uploadError={uploadError}
               hasActiveFilters={hasActiveFilters || Boolean(search.trim())}
-              availableLabels={availableLabels}
-              currentUser={currentUser}
-              draggedTaskId={draggedTaskId}
+                availableLabels={availableLabels}
+                currentUser={currentUser}
+                showCover={showCover}
+                showBody={showBody}
+                onCreateLabel={onCreateLabel}
+                draggedTaskId={draggedTaskId}
               draggedTaskHeight={draggedTaskHeight}
               movingTaskId={movingTaskId}
               settlingTaskId={settlingTaskId}

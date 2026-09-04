@@ -2,7 +2,12 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { once } from "node:events";
+import { createReadStream, createWriteStream } from "node:fs";
+import { chmod, mkdir, readFile, rename, stat, unlink, utimes, writeFile } from "node:fs/promises";
+import os from "node:os";
+import { createInterface } from "node:readline";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -32,7 +37,9 @@ const projectRoot = path.resolve(path.dirname(injectorPath), "..");
 const defaultCodexDebuggingPort = 9229;
 const independentCodexProfilePath = process.env.CODEX_TASKBOARD_CODEX_PROFILE
   ? path.resolve(process.env.CODEX_TASKBOARD_CODEX_PROFILE)
-  : "/private/tmp/codex-taskboard-independent-profile-v2";
+  : process.platform === "linux"
+    ? path.join(os.tmpdir(), "codex-taskboard-independent-profile-v2")
+    : "/private/tmp/codex-taskboard-independent-profile-v2";
 const sourceCodexProfilePath = process.env.CODEX_TASKBOARD_CODEX_SOURCE_PROFILE
   ? path.resolve(process.env.CODEX_TASKBOARD_CODEX_SOURCE_PROFILE)
   : null;
@@ -42,7 +49,7 @@ const taskboardDataDirectory = process.env.CODEX_TASKBOARD_DATA_DIR
   : path.join(projectRoot, ".data");
 const taskboardRuntimeFile = process.env.CODEX_TASKBOARD_RUNTIME_FILE
   ? path.resolve(process.env.CODEX_TASKBOARD_RUNTIME_FILE)
-  : null;
+  : path.join(taskboardDataDirectory, "launcher-runtime.json");
 const taskboardListenFd = process.env.CODEX_TASKBOARD_LISTEN_FD === undefined
   ? null
   : Number(process.env.CODEX_TASKBOARD_LISTEN_FD);
@@ -76,6 +83,7 @@ const hostRequestMessage = "__codexTaskboardHostRequestV1";
 const hostResponseMessage = "__codexTaskboardHostResponseV1";
 const hostHeartbeatMessage = "__codexTaskboardHostHeartbeatV1";
 const hostStartupTokenName = "__codexTaskboardHostStartupTokenV1";
+const codexNotificationBindingName = "__codexTaskboardCodexNotificationV1";
 const hostCapability = randomUUID();
 const injectionSourceHashName = "__CODEX_TASKBOARD_SOURCE_HASH__";
 const injectionScriptIdentifierName = "__CODEX_TASKBOARD_SCRIPT_IDENTIFIER__";
@@ -85,14 +93,33 @@ const codexAutomationMethods = new Set([
   "automation-update",
 ]);
 let codexAutomationRequestSequence = 0;
+let codexAppServerRequestSequence = 0;
+const taskConversationOperations = new Map();
+const taskConversationFailureTtlMs = 120_000;
 const quotaPolicyTimers = new Map();
 const quotaPolicyRecords = new Map();
 const quotaPolicyQueues = new Map();
 const quotaPolicyCdps = new Set();
 const restoredQuotaPolicyCdps = new WeakSet();
 const quotaPolicyRestorePromises = new WeakMap();
+const remoteAutomationDecisionWaiters = new Map();
 let quotaPoliciesLoadPromise = null;
 let quotaPoliciesWritePromise = Promise.resolve();
+const taskConversationAppServerTimeoutMs = 30_000;
+const remoteAutomationTurnTimeoutMs = 30 * 60_000;
+
+function stableCodexUserId(account) {
+  const email = account?.account?.type === "chatgpt"
+    && typeof account.account.email === "string"
+    ? account.account.email.trim().toLowerCase()
+    : "";
+  if (!email) return "";
+  const digest = createHash("sha256")
+    .update("codex-taskboard-user\0")
+    .update(email)
+    .digest("hex");
+  return `codex-user-${digest}`;
+}
 
 function parseArgs(argv) {
   const options = {
@@ -108,7 +135,7 @@ function parseArgs(argv) {
     startupToken: null,
     daemon: false,
     screenshot: null,
-    appPath: "/Applications/ChatGPT.app",
+    appPath: process.platform === "linux" ? "/usr/bin/chatgpt" : "/Applications/ChatGPT.app",
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -135,6 +162,8 @@ function parseArgs(argv) {
     else if (arg === "--app-path") options.appPath = path.resolve(argv[++index]);
     else throw new Error(`Unknown option: ${arg}`);
   }
+
+  if (process.platform === "linux" && options.launch) options.cdpPipe = true;
 
   if (!Number.isInteger(options.port) || options.port < 1 || options.port > 65535) {
     throw new Error("--port must be an integer between 1 and 65535");
@@ -181,10 +210,12 @@ async function isTaskboardReachable() {
   }
 }
 
-async function waitUntilReachable(url, timeoutMs) {
+async function waitUntilReachable(url, timeoutMs, shouldStop = () => false) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    if (shouldStop()) throw new Error(`Stopped waiting for ${url}`);
     if (await isReachable(url)) return;
+    if (shouldStop()) throw new Error(`Stopped waiting for ${url}`);
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(`Timed out waiting for ${url}`);
@@ -199,18 +230,42 @@ async function waitUntilTaskboardReachable(timeoutMs) {
   throw new Error(`Timed out waiting for authenticated ${taskboardHealthUrl}`);
 }
 
-function startTaskboard({ detached }) {
-  const stdio = taskboardListenFd === null
-    ? (detached ? "ignore" : "inherit")
+function startTaskboard({ detached, onCodexAppServerRequest }) {
+  const baseStdio = taskboardListenFd === null
+    ? Array(3).fill(detached ? "ignore" : "inherit")
     : Array.from(
       { length: taskboardListenFd + 1 },
       (_, fd) => (fd === taskboardListenFd ? "inherit" : (fd < 3 && !detached ? "inherit" : "ignore")),
     );
-  return spawn(process.execPath, [path.join(projectRoot, "server", "index.mjs")], {
+  const child = spawn(process.execPath, [path.join(projectRoot, "server", "index.mjs")], {
     cwd: projectRoot,
     detached,
-    stdio,
+    stdio: [...baseStdio, "ipc"],
   });
+  child.on("message", (message) => {
+    if (message?.type !== "taskboard:codex-app-server-request") return;
+    void Promise.resolve(onCodexAppServerRequest(message)).then(
+      (result) => {
+        if (!child.connected) return;
+        child.send({
+          type: "taskboard:codex-app-server-response",
+          requestId: message.requestId,
+          hostId: message.hostId,
+          result,
+        });
+      },
+      (error) => {
+        if (!child.connected) return;
+        child.send({
+          type: "taskboard:codex-app-server-response",
+          requestId: message.requestId,
+          hostId: message.hostId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+    );
+  });
+  return child;
 }
 
 async function publishTaskboardRuntime() {
@@ -286,6 +341,10 @@ async function importCodexBrowserProfile() {
 }
 
 function codexExecutablePath(appPath) {
+  if (process.platform === "linux") {
+    return appPath === "/usr/bin/chatgpt" ? "/usr/lib/chatgpt/ChatGPT" : appPath;
+  }
+  if (process.platform !== "darwin") return appPath;
   return path.join(
     appPath,
     "Contents",
@@ -294,10 +353,120 @@ function codexExecutablePath(appPath) {
   );
 }
 
-function launchCodex(appPath, port) {
-  return spawn(
-    codexExecutablePath(appPath),
+function codexAppBundleBuild(appPath) {
+  if (process.platform !== "darwin") return null;
+  const result = spawnSync(
+    "/usr/bin/plutil",
     [
+      "-extract",
+      "CFBundleVersion",
+      "raw",
+      "-o",
+      "-",
+      path.join(appPath, "Contents", "Info.plist"),
+    ],
+    {
+      encoding: "utf8",
+      env: withoutTaskboardLauncherEnvironment(process.env),
+      stdio: ["ignore", "pipe", "ignore"],
+    },
+  );
+  if (result.status !== 0) return null;
+  return result.stdout.trim() || null;
+}
+
+function codexAppProcesses(appPath) {
+  const processes = spawnSync("/bin/ps", ["-ww", "-axo", "pid=,command="], {
+    encoding: "utf8",
+    env: withoutTaskboardLauncherEnvironment(process.env),
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  if (processes.status !== 0) throw new Error("Unable to inspect the launched Codex process");
+
+  const executable = codexExecutablePath(appPath);
+  const matches = [];
+  for (const line of processes.stdout.split("\n")) {
+    const match = line.match(/^\s*(\d+)\s+(.+)$/);
+    if (
+      match
+      && (match[2] === executable || match[2].startsWith(`${executable} `))
+    ) {
+      matches.push({ pid: Number(match[1]), command: match[2] });
+    }
+  }
+  return matches;
+}
+
+function codexUpdateReplacementProcess(appPath, exitedPid, previousBuild) {
+  if (process.platform !== "darwin" || !previousBuild) return null;
+  const build = codexAppBundleBuild(appPath);
+  if (!build || build === previousBuild) return null;
+
+  const candidates = codexAppProcesses(appPath)
+    .filter((record) => record.pid !== exitedPid);
+  if (candidates.length !== 1) return null;
+
+  const [candidate] = candidates;
+  const profileArgument = `--user-data-dir=${independentCodexProfilePath}`;
+  if (
+    candidate.command.includes(` ${profileArgument}`)
+    || / --remote-debugging-port(?:=|\s|$)/.test(candidate.command)
+  ) return null;
+  return { build, process: candidate };
+}
+
+function managedCodexProcesses(appPath) {
+  const profileArgument = `--user-data-dir=${independentCodexProfilePath}`;
+  return codexAppProcesses(appPath).filter((record) => (
+    record.command.includes(` ${profileArgument} `)
+  ));
+}
+
+function managedCodexProcess(appPath) {
+  const processes = managedCodexProcesses(appPath);
+  if (processes.length > 1) throw new Error("Multiple managed Codex processes are running");
+  return processes[0] ?? null;
+}
+
+function codexProcessDebuggingPort(record) {
+  const match = record.command.match(/ --remote-debugging-port=(\d+)(?: |$)/);
+  if (!match) return null;
+  const port = Number(match[1]);
+  return Number.isInteger(port) && port > 0 && port <= 65_535 ? port : null;
+}
+
+function managedCodexUsesPort(record, port) {
+  return record.command.includes(` --remote-debugging-port=${port} `);
+}
+
+function isManagedCodexRunning(record) {
+  const result = spawnSync(
+    "/bin/ps",
+    ["-ww", "-p", String(record.pid), "-o", "command="],
+    {
+      encoding: "utf8",
+      env: withoutTaskboardLauncherEnvironment(process.env),
+    },
+  );
+  return result.status === 0 && result.stdout.trimEnd() === record.command;
+}
+
+async function launchCodexWithLaunchServices(appPath, port, shouldStop = () => false) {
+  const existing = managedCodexProcess(appPath);
+  if (existing && managedCodexUsesPort(existing, port)) return existing;
+  if (existing) await stopManagedCodex(existing);
+  if (shouldStop()) throw new Error("Managed Codex launch stopped");
+  if (await isReachable(`http://127.0.0.1:${port}/json/version`)) {
+    throw new Error(`Codex CDP port ${port} is already in use`);
+  }
+  if (shouldStop()) throw new Error("Managed Codex launch stopped");
+
+  const launcher = spawn(
+    "/usr/bin/open",
+    [
+      "-a",
+      appPath,
+      "--args",
       `--user-data-dir=${independentCodexProfilePath}`,
       "--remote-debugging-address=127.0.0.1",
       `--remote-debugging-port=${port}`,
@@ -308,20 +477,104 @@ function launchCodex(appPath, port) {
       stdio: "ignore",
     },
   );
+  await new Promise((resolve, reject) => {
+    launcher.once("error", reject);
+    launcher.once("exit", (code, signal) => {
+      if (code === 0) resolve();
+      else reject(new Error(`LaunchServices failed to start Codex (${signal || code})`));
+    });
+  });
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const launched = managedCodexProcess(appPath);
+    if (launched && managedCodexUsesPort(launched, port)) return launched;
+    if (launched) throw new Error("LaunchServices started Codex on an unexpected CDP port");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("LaunchServices did not start the managed Codex process");
+}
+
+async function stopManagedCodex(record) {
+  if (!isManagedCodexRunning(record)) return;
+  try {
+    process.kill(record.pid, "SIGTERM");
+  } catch (error) {
+    if (error.code === "ESRCH") return;
+    throw error;
+  }
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    if (!isManagedCodexRunning(record)) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (!isManagedCodexRunning(record)) return;
+  try {
+    process.kill(record.pid, "SIGKILL");
+  } catch (error) {
+    if (error.code !== "ESRCH") throw error;
+  }
+  const killDeadline = Date.now() + 1_000;
+  while (Date.now() < killDeadline) {
+    if (!isManagedCodexRunning(record)) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (isManagedCodexRunning(record)) {
+    throw new Error("Unable to stop the managed Codex process");
+  }
+}
+
+function activateCodexApp(pid) {
+  if (process.platform !== "darwin") return;
+  const activation = spawnSync("/usr/bin/osascript", [
+    "-l",
+    "JavaScript",
+    "-e",
+    `ObjC.import("AppKit"); const app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(${pid}); if (!app || !app.activateWithOptions(1)) throw new Error("Unable to activate Codex");`,
+  ], {
+    env: withoutTaskboardLauncherEnvironment(process.env),
+    stdio: "ignore",
+  });
+  if (activation.status !== 0) throw new Error("Unable to activate the Codex app");
+}
+
+function managedCodexSpawnFailure(executable, args, error) {
+  const diagnosticArguments = args.map((argument) => (
+    argument.startsWith("--user-data-dir=")
+      ? "--user-data-dir=<taskboard-profile>"
+      : argument
+  ));
+  const details = [
+    typeof error?.code === "string" ? `code=${error.code}` : null,
+    error?.errno !== undefined ? `errno=${error.errno}` : null,
+    typeof error?.syscall === "string" ? `syscall=${JSON.stringify(error.syscall)}` : null,
+    `message=${JSON.stringify(error instanceof Error ? error.message : String(error))}`,
+  ].filter(Boolean);
+  const failure = new Error(
+    `Managed Codex spawn failed: executable=${JSON.stringify(executable)}; `
+      + `arguments=${JSON.stringify(diagnosticArguments)}; ${details.join("; ")}`,
+    { cause: error },
+  );
+  failure.managedCodexSpawnFailure = true;
+  return failure;
 }
 
 async function launchCodexWithPipe(appPath) {
-  const child = spawn(
-    codexExecutablePath(appPath),
-    [
-      `--user-data-dir=${independentCodexProfilePath}`,
-      "--remote-debugging-pipe",
-    ],
-    {
+  const executable = codexExecutablePath(appPath);
+  const args = [
+    `--user-data-dir=${independentCodexProfilePath}`,
+    "--remote-debugging-pipe",
+  ];
+  let child;
+  try {
+    child = spawn(executable, args, {
       env: withoutTaskboardLauncherEnvironment(process.env),
       stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"],
-    },
-  );
+    });
+    if (!Number.isInteger(child.pid)) await once(child, "spawn");
+  } catch (error) {
+    throw managedCodexSpawnFailure(executable, args, error);
+  }
   const browser = new CdpPipeBrowser(child);
   try {
     await browser.open();
@@ -440,6 +693,7 @@ class CdpConnection {
   }
 
   close() {
+    this.closed = true;
     this.socket.close();
   }
 }
@@ -742,19 +996,69 @@ async function loadTaskboardFrameViaCdp(cdp, frameName, frameCapability) {
   throw new Error("Timed out waiting for the isolated Taskboard frame");
 }
 
-async function openExternalUrl(request) {
+async function openWithDefaultApplication(target) {
   await new Promise((resolve, reject) => {
-    const child = spawn("/usr/bin/open", [request.url], {
-      detached: true,
-      env: withoutTaskboardLauncherEnvironment(process.env),
-      stdio: "ignore",
-    });
+    const child = spawn(
+      process.platform === "win32"
+        ? "explorer.exe"
+        : process.platform === "linux" ? "xdg-open" : "/usr/bin/open",
+      [target],
+      {
+        detached: true,
+        env: withoutTaskboardLauncherEnvironment(process.env),
+        stdio: "ignore",
+      },
+    );
     child.once("error", reject);
     child.once("spawn", () => {
       child.unref();
       resolve();
     });
   });
+}
+
+async function revealAttachmentInFinder(attachmentPath, directory) {
+  if (process.platform === "linux") {
+    await openWithDefaultApplication(directory);
+    return;
+  }
+  try {
+    await new Promise((resolve, reject) => {
+      const child = spawn("/usr/bin/open", ["-R", attachmentPath], {
+        env: withoutTaskboardLauncherEnvironment(process.env),
+        stdio: "ignore",
+      });
+      child.once("error", reject);
+      child.once("close", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error("Finder could not reveal the attachment"));
+      });
+    });
+  } catch {
+    await openWithDefaultApplication(directory);
+  }
+}
+
+async function openExternalUrl(request) {
+  await openWithDefaultApplication(request.url);
+  return { opened: true };
+}
+
+async function openAttachment(request) {
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/attachments/${encodeURIComponent(request.attachmentId)}/content`,
+    { cache: "no-store" },
+  );
+  if (!response.ok) throw new Error(`Attachment content returned HTTP ${response.status}`);
+  const directory = path.join(
+    taskboardDataDirectory,
+    "opened-attachments",
+    request.attachmentId,
+  );
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const attachmentPath = path.join(directory, request.filename);
+  await writeFile(attachmentPath, Buffer.from(await response.arrayBuffer()), { mode: 0o600 });
+  await revealAttachmentInFinder(attachmentPath, directory);
   return { opened: true };
 }
 
@@ -844,16 +1148,617 @@ async function requestCodexAutomationViaCdp(cdp, executionContextId, method, par
   }
 }
 
+async function requestCodexAppServerViaCdp(
+  cdp,
+  executionContextId,
+  hostId,
+  method,
+  params,
+  timeoutMs = taskConversationAppServerTimeoutMs,
+) {
+  const requestId = [
+    "taskboard-thread",
+    process.pid,
+    Date.now().toString(36),
+    (++codexAppServerRequestSequence).toString(36),
+  ].join("-");
+  const evaluation = await cdp.send("Runtime.evaluate", {
+    expression: `(() => new Promise((resolve) => {
+      const requestId = ${JSON.stringify(requestId)};
+      const bridge = window.electronBridge;
+      if (!bridge || typeof bridge.sendMessageFromView !== "function") {
+        resolve({ ok: false, error: "Codex App Server bridge is unavailable" });
+        return;
+      }
+      let settled = false;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeout);
+        window.removeEventListener("message", onMessage, true);
+        resolve(result);
+      };
+      const onMessage = (event) => {
+        const message = event.data;
+        if (
+          !message
+          || typeof message !== "object"
+          || message.type !== "mcp-response"
+          || message.hostId !== ${JSON.stringify(hostId)}
+          || message.message?.id !== requestId
+        ) return;
+        event.stopImmediatePropagation();
+        if (message.message.error) {
+          finish({
+            ok: false,
+            error: message.message.error.message || "Codex App Server request failed",
+          });
+          return;
+        }
+        finish({ ok: true, result: message.message.result });
+      };
+      const timeout = window.setTimeout(
+        () => finish({ ok: false, error: "Codex App Server request timed out" }),
+        ${JSON.stringify(timeoutMs)},
+      );
+      window.addEventListener("message", onMessage, true);
+      Promise.resolve(bridge.sendMessageFromView({
+        type: "mcp-request",
+        hostId: ${JSON.stringify(hostId)},
+        request: {
+          id: requestId,
+          method: ${JSON.stringify(method)},
+          params: ${JSON.stringify(params)},
+        },
+        priority: "interactive",
+        source: "taskboard_thread_create",
+        timeoutMs: ${JSON.stringify(timeoutMs)},
+        expiresAtMs: Date.now() + ${JSON.stringify(timeoutMs)},
+      })).catch((error) => {
+        finish({
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }))()`,
+    ...(Number.isInteger(executionContextId) ? { contextId: executionContextId } : {}),
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  if (evaluation.exceptionDetails) {
+    throw new Error(
+      evaluation.exceptionDetails.exception?.description
+      || "Codex App Server request failed",
+    );
+  }
+  const response = evaluation.result.value;
+  if (!response?.ok) throw new Error(response?.error || "Codex App Server request failed");
+  return response.result;
+}
+
+async function taskboardRequest(pathname, { method = "GET", body } = {}) {
+  const response = await fetch(`${taskboardBaseUrl}${pathname}`, {
+    method,
+    cache: "no-store",
+    headers: {
+      accept: "application/json",
+      "x-taskboard-client": "taskctl",
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const text = await response.text();
+  let payload = {};
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      throw new Error(`Taskboard returned invalid JSON for ${method} ${pathname}`);
+    }
+  }
+  if (!response.ok) {
+    throw new Error(
+      payload?.error?.message || `Taskboard returned HTTP ${response.status} for ${method} ${pathname}`,
+    );
+  }
+  return payload;
+}
+
+function normalizeRemoteWorkspace(value) {
+  const workspacePath = String(value || "").trim().replaceAll("\\", "/").replace(/\/+$/, "");
+  return /^[A-Za-z]:/.test(workspacePath)
+    ? `${workspacePath[0].toLowerCase()}${workspacePath.slice(1)}`
+    : workspacePath;
+}
+
+function remoteAutomationTarget(request, task) {
+  const workspacePath = task.developmentContext?.type === "worktree"
+    ? task.developmentContext.path
+    : request.workspacePath;
+  const matches = (request.remoteProjects ?? []).filter((project) => (
+    project.codexProjectKind === "remote"
+    && project.codexHostId === request.codexHostId
+    && normalizeRemoteWorkspace(project.workspacePath) === normalizeRemoteWorkspace(workspacePath)
+    && (
+      task.developmentContext?.type === "worktree"
+      || project.codexProjectId === request.codexProjectId
+    )
+  ));
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function eligibleRemoteAutomationTask(task) {
+  const remoteBinding = task?.threadBinding?.codexProjectKind === "remote"
+    && task.threadId === task.threadBinding.threadId;
+  return task?.status === "todo"
+    && task.archivedAt === null
+    && ((!task.threadId && !task.threadBinding) || remoteBinding)
+    && (task.relations?.blockedBy ?? []).every((dependency) => dependency.status === "done");
+}
+
+function remoteAutomationSnapshot(task, comments, attachments) {
+  return JSON.stringify({
+    task: {
+      version: task.version,
+      projectId: task.projectId,
+      title: task.title,
+      description: task.description,
+      developmentContext: task.developmentContext,
+      blockedBy: (task.relations?.blockedBy ?? []).map((dependency) => [
+        dependency.id,
+        dependency.status,
+      ]),
+    },
+    comments: comments.map((comment) => [
+      comment.id,
+      comment.version,
+      comment.body,
+      (comment.attachments ?? []).map((attachment) => [
+        attachment.id,
+        attachment.filename,
+        attachment.contentType,
+        attachment.size,
+      ]),
+    ]),
+    attachments: attachments.map((attachment) => [
+      attachment.id,
+      attachment.filename,
+      attachment.contentType,
+      attachment.size,
+    ]),
+  });
+}
+
+function remoteAutomationPrompt(task, comments, attachments, target) {
+  const commentText = comments.length > 0
+    ? comments.map((comment) => (
+      `- ${comment.authorName} (${comment.createdAt}):\n${comment.body}`
+    )).join("\n\n")
+    : "（无）";
+  const attachmentItems = [
+    ...attachments,
+    ...comments.flatMap((comment) => comment.attachments ?? []),
+  ];
+  const attachmentText = attachmentItems.length > 0
+    ? attachmentItems.map((attachment) => (
+      `- ${attachment.filename} (${attachment.contentType}, ${attachment.size} bytes)`
+    )).join("\n")
+    : "（无）";
+  const developmentContext = task.developmentContext
+    ? JSON.stringify(task.developmentContext)
+    : "（项目根目录）";
+  return [
+    `处理 Taskboard 议题 ${task.identifier}：${task.title}`,
+    "",
+    `远程工作目录：${target.workspacePath}`,
+    `开发上下文：${developmentContext}`,
+    "",
+    "完整描述：",
+    task.description || "（无）",
+    "",
+    "全部评论：",
+    commentText,
+    "",
+    "附件：",
+    attachmentText,
+    "",
+    "你只负责在当前远程项目和工作目录内完成实现与直接验证。不要运行 taskctl，也不要访问或修改 Taskboard。完成后返回改动、验证结果、执行结果和剩余限制。",
+  ].join("\n");
+}
+
+function waitForRemoteAutomationDecision(hostId, threadId) {
+  const key = `${hostId}\0${threadId}`;
+  let cancel;
+  const promise = new Promise((resolve, reject) => {
+    const finish = (error, answer) => {
+      clearTimeout(timer);
+      remoteAutomationDecisionWaiters.delete(key);
+      if (error) reject(error);
+      else resolve(answer);
+    };
+    const timer = setTimeout(
+      () => finish(new Error("Codex 自动认领判断超时")),
+      remoteAutomationTurnTimeoutMs,
+    );
+    timer.unref();
+    remoteAutomationDecisionWaiters.set(key, { finish });
+    cancel = () => {
+      clearTimeout(timer);
+      remoteAutomationDecisionWaiters.delete(key);
+    };
+  });
+  return { promise, cancel };
+}
+
+function handleRemoteAutomationDecisionNotification(notification) {
+  const params = notification.params;
+  const waiter = remoteAutomationDecisionWaiters.get(
+    `${notification.hostId}\0${params?.threadId}`,
+  );
+  if (!waiter) return;
+  if (notification.method !== "turn/completed") return;
+  if (params.turn?.status !== "completed") {
+    waiter.finish(new Error(params.turn?.error?.message || "Codex 自动认领判断失败"));
+    return;
+  }
+  const answer = [...params.turn.items].reverse()
+    .find((item) => item.type === "agentMessage")?.text?.trim() || "";
+  waiter.finish(null, answer);
+}
+
+async function remoteAutomationCanStart(cdp, request, task, comments) {
+  const latestComment = comments.at(-1);
+  const started = await requestCodexAppServerViaCdp(
+    cdp,
+    undefined,
+    request.codexHostId,
+    "thread/start",
+    {
+      ephemeral: true,
+      model: request.model,
+      cwd: request.workspacePath,
+      runtimeWorkspaceRoots: [request.workspacePath],
+      approvalPolicy: "never",
+      sandbox: "read-only",
+    },
+  );
+  const threadId = started?.thread?.id;
+  if (typeof threadId !== "string" || !threadId || started.thread.ephemeral !== true) {
+    throw new Error("Codex 未创建临时自动认领判断线程");
+  }
+
+  const completion = waitForRemoteAutomationDecision(request.codexHostId, threadId);
+  let turnStarted;
+  try {
+    turnStarted = await requestCodexAppServerViaCdp(
+      cdp,
+      undefined,
+      request.codexHostId,
+      "turn/start",
+      {
+        threadId,
+        input: [{
+          type: "text",
+          text: [
+            "你是 Codex Taskboard 自动认领 Agent。只判断下面的议题当前是否允许开始。",
+            "根据完整描述和最新评论做语义判断：若任一处明确要求等待、暂不执行或当前不应开始，decision 为 wait；否则 decision 为 start。不要调用工具，不要解释。",
+            JSON.stringify({
+              identifier: task.identifier,
+              title: task.title,
+              description: task.description,
+              latestComment: latestComment
+                ? {
+                    authorName: latestComment.authorName,
+                    createdAt: latestComment.createdAt,
+                    body: latestComment.body,
+                  }
+                : null,
+            }),
+          ].join("\n\n"),
+        }],
+        effort: request.reasoningEffort,
+        outputSchema: {
+          type: "object",
+          properties: {
+            decision: { type: "string", enum: ["start", "wait"] },
+          },
+          required: ["decision"],
+          additionalProperties: false,
+        },
+      },
+    );
+  } catch (error) {
+    completion.cancel();
+    throw error;
+  }
+  const turnId = turnStarted?.turn?.id;
+  if (typeof turnId !== "string" || !turnId) {
+    completion.cancel();
+    throw new Error("Codex 未返回自动认领判断 turn");
+  }
+  const answer = await completion.promise;
+  let decision;
+  try {
+    decision = JSON.parse(answer).decision;
+  } catch {}
+  if (decision !== "start" && decision !== "wait") {
+    throw new Error("Codex 未返回有效的自动认领判断");
+  }
+  return decision === "start";
+}
+
+async function runRemoteTaskboardAutomation(record) {
+  const { request, version } = record;
+  if (
+    !request.enabledByUser
+    || request.codexProjectKind !== "remote"
+    || quotaPolicyRecords.get(request.taskboardProjectId)?.version !== version
+  ) return;
+
+  const listed = await taskboardRequest(
+    `/api/tasks?projectId=${encodeURIComponent(request.taskboardProjectId)}&status=todo`,
+  );
+  const listedTask = listed.tasks?.find(eligibleRemoteAutomationTask);
+  if (!listedTask) return;
+
+  const taskPath = `/api/tasks/${encodeURIComponent(listedTask.id)}`;
+  const commentsPath = `${taskPath}/comments`;
+  const attachmentsPath = `${taskPath}/attachments`;
+  const [{ task }, { comments }, { attachments }] = await Promise.all([
+    taskboardRequest(taskPath),
+    taskboardRequest(commentsPath),
+    taskboardRequest(attachmentsPath),
+  ]);
+  if (!eligibleRemoteAutomationTask(task) || task.projectId !== request.taskboardProjectId) return;
+  const cdp = currentQuotaPolicyCdp();
+  if (!(await remoteAutomationCanStart(cdp, request, task, comments))) return;
+  const existingBinding = task.threadBinding?.codexProjectKind === "remote"
+    ? task.threadBinding
+    : null;
+  const target = existingBinding ?? remoteAutomationTarget(request, task);
+  if (!target) {
+    await taskboardRequest(commentsPath, {
+      method: "POST",
+      body: { body: "自动认领未开始：目标 SSH 工作目录没有唯一的已登记 Codex 项目映射。" },
+    });
+    return;
+  }
+  const snapshot = remoteAutomationSnapshot(task, comments, attachments);
+  const started = await requestCodexAppServerViaCdp(
+    cdp,
+    undefined,
+    target.codexHostId,
+    existingBinding ? "thread/resume" : "thread/start",
+    {
+      ...(existingBinding ? { threadId: existingBinding.threadId } : {}),
+      model: request.model,
+      cwd: target.workspacePath,
+      runtimeWorkspaceRoots: [target.workspacePath],
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+    },
+  );
+  const threadId = started?.thread?.id;
+  if (
+    typeof threadId !== "string"
+    || !threadId
+    || normalizeRemoteWorkspace(started.thread.cwd) !== normalizeRemoteWorkspace(target.workspacePath)
+  ) {
+    throw new Error(`Codex did not ${existingBinding ? "resume" : "create"} the automation thread in the selected SSH workspace`);
+  }
+
+  const refreshed = await Promise.all([
+    taskboardRequest(taskPath),
+    taskboardRequest(commentsPath),
+    taskboardRequest(attachmentsPath),
+  ]);
+  const refreshedTask = refreshed[0].task;
+  const refreshedComments = refreshed[1].comments;
+  const refreshedAttachments = refreshed[2].attachments;
+  const refreshedTarget = refreshedTask.threadBinding?.codexProjectKind === "remote"
+    ? refreshedTask.threadBinding
+    : remoteAutomationTarget(request, refreshedTask);
+  if (
+    !eligibleRemoteAutomationTask(refreshedTask)
+    || remoteAutomationSnapshot(refreshedTask, refreshedComments, refreshedAttachments) !== snapshot
+    || refreshedTarget?.codexProjectId !== target.codexProjectId
+    || refreshedTarget?.codexProjectKind !== target.codexProjectKind
+    || refreshedTarget?.codexHostId !== target.codexHostId
+    || refreshedTarget?.workspacePath !== target.workspacePath
+    || refreshedTarget?.threadId !== target.threadId
+  ) return;
+
+  const threadBinding = existingBinding ?? {
+    threadId,
+    codexProjectId: target.codexProjectId,
+    codexProjectKind: "remote",
+    codexHostId: target.codexHostId,
+    workspacePath: target.workspacePath,
+  };
+  let ownedTask = (
+    await taskboardRequest(`${taskPath}/move`, {
+      method: "POST",
+      body: {
+        version: refreshedTask.version,
+        status: "in_progress",
+        threadId,
+        threadBinding,
+      },
+    })
+  ).task;
+
+  try {
+    const turnStarted = await requestCodexAppServerViaCdp(
+      cdp,
+      undefined,
+      target.codexHostId,
+      "turn/start",
+      {
+        threadId,
+        input: [{
+          type: "text",
+          text: remoteAutomationPrompt(
+            refreshedTask,
+            refreshedComments,
+            refreshedAttachments,
+            target,
+          ),
+        }],
+        effort: request.reasoningEffort,
+      },
+    );
+    const turnId = turnStarted?.turn?.id;
+    if (typeof turnId !== "string" || !turnId) {
+      throw new Error("Codex did not return the remote automation turn id");
+    }
+
+    const deadline = Date.now() + remoteAutomationTurnTimeoutMs;
+    let finalText = "";
+    while (Date.now() < deadline) {
+      let read;
+      try {
+        read = await requestCodexAppServerViaCdp(
+          cdp,
+          undefined,
+          target.codexHostId,
+          "thread/read",
+          { threadId, includeTurns: true },
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("rollout") || !message.includes("is empty")) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+        continue;
+      }
+      const turn = read?.thread?.turns?.find((candidate) => candidate.id === turnId);
+      if (turn?.status === "completed") {
+        finalText = [...turn.items].reverse().find((item) => item.type === "agentMessage")?.text?.trim() || "";
+        if (!finalText) throw new Error("Codex completed without a final result");
+        break;
+      }
+      if (turn?.status === "failed" || turn?.status === "interrupted") {
+        throw new Error(turn.error?.message || `Codex remote turn ${turn.status}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+    }
+    if (!finalText) throw new Error("Codex remote automation turn timed out");
+
+    await taskboardRequest(commentsPath, {
+      method: "POST",
+      body: {
+        body: [
+          "自动认领远程执行完成。",
+          `- Codex host：${target.codexHostId}`,
+          `- 远程目录：${target.workspacePath}`,
+          `- 远程 thread：${threadId}`,
+          "",
+          finalText,
+        ].join("\n").slice(0, 100_000),
+        threadId,
+        threadBinding,
+      },
+    });
+    ownedTask = (
+      await taskboardRequest(`${taskPath}/move`, {
+        method: "POST",
+        body: {
+          version: ownedTask.version,
+          status: "in_review",
+          threadId,
+          threadBinding,
+        },
+      })
+    ).task;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await taskboardRequest(commentsPath, {
+      method: "POST",
+      body: {
+        body: `自动认领远程执行失败：${message}`.slice(0, 100_000),
+        threadId,
+        threadBinding,
+      },
+    });
+    await taskboardRequest(`${taskPath}/move`, {
+      method: "POST",
+      body: {
+        version: ownedTask.version,
+        status: "blocked",
+        threadId,
+        threadBinding,
+      },
+    });
+  }
+}
+
+function remoteAutomationItem(request, status, nextRunAt) {
+  return {
+    id: request.automationId || `taskboard-${request.taskboardProjectId}`,
+    status,
+    model: request.model,
+    reasoningEffort: request.reasoningEffort,
+    rrule: `RRULE:FREQ=MINUTELY;INTERVAL=${request.intervalMinutes}`,
+    nextRunAt: status === "ACTIVE" ? nextRunAt : null,
+  };
+}
+
 async function applyTaskboardAutomationPolicy(
   request,
   rpc,
   stillCurrent = () => true,
-  { explicit = false, previousQuotaState } = {},
+  { explicit = false, previousQuotaState, remoteNextRunAt } = {},
 ) {
-  const quota = request.quotaAware
+  const todoResponse = request.enabledByUser
+    ? await fetch(
+      `${taskboardBaseUrl}/api/tasks?projectId=${encodeURIComponent(request.taskboardProjectId)}&status=todo`,
+      { cache: "no-store" },
+    )
+    : null;
+  if (todoResponse && !todoResponse.ok) {
+    throw new Error(`Taskboard todo check returned HTTP ${todoResponse.status}`);
+  }
+  const todoPayload = todoResponse ? await todoResponse.json() : null;
+  if (todoPayload && !Array.isArray(todoPayload.tasks)) {
+    throw new Error("Taskboard todo check returned invalid JSON");
+  }
+  const hasTodo = todoPayload ? todoPayload.tasks.length > 0 : null;
+  const quota = request.quotaAware && hasTodo !== false
     ? await readCodexQuotaStatus(request.model)
     : null;
   if (!stillCurrent()) return { quota, stale: true };
+  if (request.codexProjectKind === "remote") {
+    const currentStatus = request.enabledByUser
+      && (!request.quotaAware || previousQuotaState === "available")
+      ? "ACTIVE"
+      : "PAUSED";
+    const currentItem = remoteAutomationItem(request, currentStatus, remoteNextRunAt);
+    const operation = taskboardAutomationPolicyOperation(request, {
+      explicit,
+      hasTodo,
+      previousQuotaState,
+      quotaState: quota?.state,
+      currentStatus,
+    });
+    const status = operation === "pause" ? "PAUSED" : "ACTIVE";
+    const existingNextRunAt = Number(remoteNextRunAt);
+    const nextRunAt = status === "ACTIVE"
+      ? (
+        Number.isFinite(existingNextRunAt) && existingNextRunAt > Date.now()
+          ? existingNextRunAt
+          : Date.now() + request.intervalMinutes * 60_000
+      )
+      : null;
+    const item = operation === "list"
+      ? currentItem
+      : remoteAutomationItem(request, status, nextRunAt);
+    return {
+      item,
+      items: [item],
+      operation,
+      hasTodo,
+      ...(quota ? { quota } : {}),
+    };
+  }
   let listed = null;
   let currentItem;
   if (!explicit && request.enabledByUser) {
@@ -867,6 +1772,7 @@ async function applyTaskboardAutomationPolicy(
   }
   const operation = taskboardAutomationPolicyOperation(request, {
     explicit,
+    hasTodo,
     previousQuotaState,
     quotaState: quota?.state,
     currentStatus: currentItem?.status,
@@ -875,17 +1781,20 @@ async function applyTaskboardAutomationPolicy(
     ? { item: currentItem, items: listed.items }
     : await reconcileTaskboardAutomation({ ...request, operation }, rpc);
   if (result?.error === "not-found") {
-    return { operation, ...(quota ? { quota } : {}) };
+    return { operation, hasTodo, ...(quota ? { quota } : {}) };
   }
-  return { ...result, operation, ...(quota ? { quota } : {}) };
+  return { ...result, operation, hasTodo, ...(quota ? { quota } : {}) };
 }
 
 function storedAutomationPolicy(request) {
   return {
     taskboardProjectId: request.taskboardProjectId,
     codexProjectId: request.codexProjectId,
+    codexProjectKind: request.codexProjectKind,
+    codexHostId: request.codexHostId,
     projectName: request.projectName,
     workspacePath: request.workspacePath,
+    remoteProjects: request.remoteProjects ?? [],
     skillPath: request.skillPath,
     ...(request.automationId ? { automationId: request.automationId } : {}),
     enabledByUser: request.enabledByUser,
@@ -898,7 +1807,7 @@ function storedAutomationPolicy(request) {
 
 function restoredAutomationPolicy(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const { quota, ...stored } = value;
+  const { nextRunAt, quota, ...stored } = value;
   const request = parseTaskboardAutomationHostRequest({
     ...stored,
     id: "restored-policy",
@@ -906,7 +1815,13 @@ function restoredAutomationPolicy(value) {
     requestId: "restored-policy",
     operation: "apply-policy",
   });
-  return request ? { request, ...(quota ? { quota } : {}) } : null;
+  return request
+    ? {
+      request,
+      ...(quota ? { quota } : {}),
+      ...(Number.isFinite(nextRunAt) ? { nextRunAt } : {}),
+    }
+    : null;
 }
 
 async function ensureQuotaPoliciesLoaded() {
@@ -938,6 +1853,7 @@ function persistQuotaPolicies() {
       {
         ...storedAutomationPolicy(record.request),
         ...(record.quota ? { quota: record.quota } : {}),
+        ...(Number.isFinite(record.nextRunAt) ? { nextRunAt: record.nextRunAt } : {}),
       },
     ]),
   );
@@ -976,11 +1892,14 @@ function scheduleQuotaPolicyCheck(record, result) {
   const previous = quotaPolicyTimers.get(key);
   if (previous) clearTimeout(previous);
   quotaPolicyTimers.delete(key);
-  if (!request.enabledByUser || !request.quotaAware) return;
+  if (!request.enabledByUser) return;
 
   const nextRunAt = Number(result.item?.nextRunAt);
   const nextRunDelay = Number.isFinite(nextRunAt) && nextRunAt > Date.now()
-    ? Math.max(1_000, nextRunAt - Date.now() - 15_000)
+    ? Math.max(
+      1_000,
+      nextRunAt - Date.now() - (request.codexProjectKind === "remote" ? 0 : 15_000),
+    )
     : 60_000;
   const resetDelay = result.quota?.state === "blocked"
     && Number.isFinite(result.quota.resetsAt)
@@ -989,6 +1908,9 @@ function scheduleQuotaPolicyCheck(record, result) {
   const timer = setTimeout(async () => {
     if (quotaPolicyRecords.get(key)?.version !== version) return;
     try {
+      if (request.codexProjectKind === "remote" && result.item?.status === "ACTIVE") {
+        await runRemoteTaskboardAutomation(record);
+      }
       await enqueueCurrentQuotaPolicy(key);
     } catch (error) {
       console.error(`Taskboard quota policy check failed: ${error.message}`);
@@ -1017,18 +1939,30 @@ function enqueueQuotaPolicyMutation(record, rpc, { explicit = false } = {}) {
         {
           explicit,
           previousQuotaState: current.quota?.state,
+          remoteNextRunAt: current.nextRunAt,
         },
       );
       if (result.stale) return result;
-      if (!explicit && result.operation === "list" && result.item?.status === "PAUSED") {
+      if (result.hasTodo === false && result.operation === "pause") {
+        current.version += 1;
+        current.request = { ...current.request, enabledByUser: false };
+      } else if (!explicit && result.operation === "list" && result.item?.status === "PAUSED") {
         current.version += 1;
         current.request = { ...current.request, enabledByUser: false };
       }
       if (result.item?.id) {
         current.request = { ...current.request, automationId: result.item.id };
       }
+      if (current.request.codexProjectKind === "remote") {
+        const nextRunAt = Number(result.item?.nextRunAt);
+        if (result.item?.status === "ACTIVE" && Number.isFinite(nextRunAt)) {
+          current.nextRunAt = nextRunAt;
+        } else {
+          delete current.nextRunAt;
+        }
+      }
       if (current.request.quotaAware && result.quota) current.quota = result.quota;
-      else delete current.quota;
+      else if (!current.request.quotaAware) delete current.quota;
       await persistQuotaPolicies();
       scheduleQuotaPolicyCheck(current, result);
       return result;
@@ -1051,7 +1985,13 @@ async function updateAndApplyQuotaPolicy(request, rpc) {
   quotaPolicyRecords.set(request.taskboardProjectId, record);
   try {
     await persistQuotaPolicies();
-    return await enqueueQuotaPolicyMutation(record, rpc, { explicit: true });
+    const result = await enqueueQuotaPolicyMutation(record, rpc, { explicit: true });
+    const current = quotaPolicyRecords.get(request.taskboardProjectId);
+    return {
+      ...result,
+      policy: storedAutomationPolicy(current.request),
+      ...(current.quota ? { quota: current.quota } : {}),
+    };
   } catch (error) {
     if (quotaPolicyRecords.get(request.taskboardProjectId)?.version === record.version) {
       if (previous) quotaPolicyRecords.set(request.taskboardProjectId, previous);
@@ -1062,10 +2002,28 @@ async function updateAndApplyQuotaPolicy(request, rpc) {
   }
 }
 
-async function reconcileStoredAutomationPolicy(projectId, rpc) {
+async function reconcileStoredAutomationPolicy(request, rpc) {
   await ensureQuotaPoliciesLoaded();
+  const projectId = request.taskboardProjectId;
   const record = quotaPolicyRecords.get(projectId);
   if (!record) return null;
+  if (
+    record.request.codexProjectId !== request.codexProjectId
+    || record.request.codexProjectKind !== request.codexProjectKind
+    || record.request.codexHostId !== request.codexHostId
+    || record.request.workspacePath !== request.workspacePath
+    || JSON.stringify(record.request.remoteProjects ?? []) !== JSON.stringify(request.remoteProjects ?? [])
+  ) {
+    return updateAndApplyQuotaPolicy({
+      ...request,
+      automationId: record.request.automationId,
+      enabledByUser: record.request.enabledByUser,
+      quotaAware: record.request.quotaAware,
+      intervalMinutes: record.request.intervalMinutes,
+      model: record.request.model,
+      reasoningEffort: record.request.reasoningEffort,
+    }, rpc);
+  }
   const result = await enqueueQuotaPolicyMutation(record, rpc);
   const current = quotaPolicyRecords.get(projectId);
   return {
@@ -1098,7 +2056,7 @@ async function restoreQuotaPolicies(cdp) {
   const restoring = (async () => {
     await ensureQuotaPoliciesLoaded();
     for (const [projectId, record] of quotaPolicyRecords) {
-      if (record.request.enabledByUser && record.request.quotaAware) {
+      if (record.request.enabledByUser) {
         await enqueueCurrentQuotaPolicy(projectId);
       }
     }
@@ -1112,57 +2070,215 @@ async function restoreQuotaPolicies(cdp) {
   }
 }
 
-async function prefillTaskComposerViaCdp(cdp, executionContextId, request) {
-  const { instruction } = request;
+async function startTaskConversationViaCdp(cdp, executionContextId, request) {
+  const {
+    codexHostId,
+    instruction,
+    previousThreadId,
+    projectless,
+    targetRoot,
+    title,
+  } = request;
+  const normalizeWorkspaceRoot = (value) => {
+    const root = String(value || "").trim();
+    if (!root) return "";
+    const windowsPath = /^[A-Za-z]:[\\/]/.test(root) || root.includes("\\");
+    const normalizedSlashes = windowsPath ? root.replace(/\\/g, "/") : root;
+    const withoutTrailingSlash = normalizedSlashes.replace(/\/+$/, "")
+      || (normalizedSlashes.startsWith("/") ? "/" : normalizedSlashes);
+    if (!windowsPath || !/^[A-Za-z]:/.test(withoutTrailingSlash)) return withoutTrailingSlash;
+    return `${withoutTrailingSlash[0].toLowerCase()}${withoutTrailingSlash.slice(1)}`;
+  };
+  const normalizedTargetRoot = normalizeWorkspaceRoot(targetRoot);
   const deadline = Date.now() + 8_000;
+  let submitted = false;
   while (Date.now() < deadline) {
     const prepared = await cdp.send("Runtime.evaluate", {
       expression: `(() => {
-        const instruction = ${JSON.stringify(instruction)};
-        const editor = Array.from(document.querySelectorAll(
-          '[data-codex-composer="true"][contenteditable="true"]'
+        const root = Array.from(document.querySelectorAll(
+          '[data-codex-composer-root][data-composer-placement="home"]'
         )).find((candidate) => candidate.getClientRects().length > 0);
-        if (!editor) return { ready: false };
-        if ((editor.textContent || "").includes(instruction)) {
-          return { ready: true, matches: true };
-        }
+        const conversationId = root
+          ?.querySelector('[data-above-composer-conversation-id]')
+          ?.getAttribute('data-above-composer-conversation-id')
+          ?.trim() || "";
+        const editor = Array.from(root?.querySelectorAll(
+          '[data-codex-composer="true"][contenteditable="true"]'
+        ) || []).find((candidate) => candidate.getClientRects().length > 0);
+        if (
+          !root
+          || conversationId
+          || !editor
+          || (editor.innerText || "") !== ${JSON.stringify(instruction)}
+        ) return false;
         editor.focus();
-        const selection = window.getSelection();
-        const range = document.createRange();
-        range.selectNodeContents(editor);
-        selection?.removeAllRanges();
-        selection?.addRange(range);
-        return { ready: true, matches: false };
+        return true;
       })()`,
       contextId: executionContextId,
       returnByValue: true,
     });
-    if (!prepared.result.value?.ready) {
+    if (prepared.result.value !== true) {
       await new Promise((resolve) => setTimeout(resolve, 80));
       continue;
     }
-    if (prepared.result.value.matches) return { prefilled: true };
-
-    await cdp.send("Input.insertText", { text: instruction });
+    await cdp.send("Input.dispatchKeyEvent", {
+      type: "keyDown",
+      key: "Enter",
+      code: "Enter",
+      windowsVirtualKeyCode: 13,
+      nativeVirtualKeyCode: 13,
+    });
+    await cdp.send("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key: "Enter",
+      code: "Enter",
+      windowsVirtualKeyCode: 13,
+      nativeVirtualKeyCode: 13,
+    });
+    submitted = true;
     break;
   }
+  if (!submitted) throw new Error("Codex new conversation composer did not become ready");
 
-  while (Date.now() < deadline) {
-    const verified = await cdp.send("Runtime.evaluate", {
-      expression: `(() => {
-        const instruction = ${JSON.stringify(instruction)};
-        const editor = Array.from(document.querySelectorAll(
-          '[data-codex-composer="true"][contenteditable="true"]'
-        )).find((candidate) => candidate.getClientRects().length > 0);
-        return Boolean(editor && (editor.textContent || "").includes(instruction));
-      })()`,
-      contextId: executionContextId,
-      returnByValue: true,
-    });
-    if (verified.result.value === true) return { prefilled: true };
-    await new Promise((resolve) => setTimeout(resolve, 80));
+  const threadDeadline = Date.now() + 12_000;
+  let discoveredThreadId = "";
+  try {
+    while (Date.now() < threadDeadline) {
+      const started = await cdp.send("Runtime.evaluate", {
+        expression: `(() => {
+          const root = Array.from(document.querySelectorAll(
+            '[data-codex-composer-root][data-composer-placement="thread"]'
+          )).find((candidate) => candidate.getClientRects().length > 0);
+          const threadId = root
+            ?.querySelector('[data-above-composer-conversation-id]')
+            ?.getAttribute('data-above-composer-conversation-id')
+            ?.trim() || "";
+          return threadId.replace(/^(?:local|cloud):/i, "");
+        })()`,
+        contextId: executionContextId,
+        returnByValue: true,
+      });
+      const threadId = typeof started.result.value === "string" ? started.result.value : "";
+      if (threadId && threadId !== previousThreadId) {
+        discoveredThreadId = threadId;
+        const readyDeadline = Date.now() + 10_000;
+        let ready = false;
+        while (Date.now() < readyDeadline) {
+          try {
+            const result = await requestCodexAppServerViaCdp(
+              cdp,
+              executionContextId,
+              codexHostId,
+              "thread/read",
+              { threadId, includeTurns: false },
+              10_000,
+            );
+            if (
+              result?.thread?.id === threadId
+              && (
+                projectless
+                || normalizeWorkspaceRoot(result.thread.cwd) === normalizedTargetRoot
+              )
+            ) {
+              ready = true;
+              break;
+            }
+          } catch {}
+          await new Promise((resolve) => setTimeout(resolve, 80));
+        }
+        if (!ready) {
+          throw new Error(projectless
+            ? "Codex did not confirm the projectless task conversation"
+            : "Codex did not confirm the task conversation workspace root");
+        }
+
+        try {
+          await requestCodexAppServerViaCdp(
+            cdp,
+            executionContextId,
+            codexHostId,
+            "thread/name/set",
+            { threadId, name: title },
+            10_000,
+          );
+        } catch (error) {
+          const message = error instanceof Error
+            ? error.message.toLowerCase()
+            : String(error).toLowerCase();
+          if (!message.includes("rollout") || !message.includes("is empty")) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          await requestCodexAppServerViaCdp(
+            cdp,
+            executionContextId,
+            codexHostId,
+            "thread/name/set",
+            { threadId, name: title },
+            10_000,
+          );
+        }
+
+        const titleDeadline = Date.now() + 10_000;
+        while (Date.now() < titleDeadline) {
+          try {
+            const result = await requestCodexAppServerViaCdp(
+              cdp,
+              executionContextId,
+              codexHostId,
+              "thread/read",
+              { threadId, includeTurns: false },
+              10_000,
+            );
+            if (result?.thread?.id === threadId && result.thread.name === title) {
+              return { threadId, title };
+            }
+          } catch {}
+          await new Promise((resolve) => setTimeout(resolve, 80));
+        }
+        throw new Error("Codex did not confirm the task conversation title");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 80));
+    }
+    throw new Error("Timed out while starting the Codex conversation");
+  } catch (error) {
+    if (error && typeof error === "object") {
+      if (discoveredThreadId) error.threadId = discoveredThreadId;
+      else if (submitted) error.uncertain = true;
+    }
+    throw error;
   }
-  throw new Error("Timed out while writing the issue instruction into the Codex composer");
+}
+
+function getOrStartTaskConversation(cdp, executionContextId, request) {
+  const existing = taskConversationOperations.get(request.taskId);
+  if (existing) return existing.promise;
+
+  const operation = { promise: null };
+  const promise = Promise.resolve().then(() => (
+    startTaskConversationViaCdp(cdp, executionContextId, request)
+  ));
+  operation.promise = promise;
+  taskConversationOperations.set(request.taskId, operation);
+  const clearSettledOperation = () => {
+    if (taskConversationOperations.get(request.taskId) === operation) {
+      taskConversationOperations.delete(request.taskId);
+    }
+  };
+  const retainCreatedOrUncertainFailure = (error) => {
+    if (!(
+      error
+      && typeof error === "object"
+      && (typeof error.threadId === "string" || error.uncertain === true)
+    )) {
+      clearSettledOperation();
+      return;
+    }
+    const timer = setTimeout(() => {
+      clearSettledOperation();
+    }, taskConversationFailureTtlMs);
+    timer.unref?.();
+  };
+  void promise.then(clearSettledOperation, retainCreatedOrUncertainFailure);
+  return promise;
 }
 
 async function sendHostResponse(cdp, executionContextId, response) {
@@ -1177,23 +2293,66 @@ async function sendHostResponse(cdp, executionContextId, response) {
   });
 }
 
-function installTaskboardHostBinding(cdp, supervisor, startupToken) {
+function installTaskboardHostBinding(
+  cdp,
+  supervisor,
+  startupToken,
+  onCodexAppServerNotification,
+  onCodexAppServerReady,
+) {
   let activeContextId = null;
   let installInFlight = null;
 
   cdp.on("Runtime.bindingCalled", async (params) => {
-    if (params.name !== hostBindingName) return;
     if (params.executionContextId !== activeContextId) return;
+    if (params.name === codexNotificationBindingName) {
+      try {
+        const notification = JSON.parse(params.payload);
+        if (
+          notification
+          && typeof notification.hostId === "string"
+          && typeof notification.method === "string"
+        ) onCodexAppServerNotification(cdp, notification);
+      } catch {}
+      return;
+    }
+    if (params.name !== hostBindingName) return;
     await handleHostBindingPayload(params, {
       isAuthorizedContext: (executionContextId) => executionContextId === activeContextId,
       parseAutomationRequest: parseTaskboardAutomationHostRequest,
       ensure: () => supervisor.ensure({ force: true }),
+      readCurrentUser: async () => {
+        let account = await requestCodexAppServerViaCdp(
+          cdp,
+          undefined,
+          "local",
+          "account/read",
+          { refreshToken: false },
+        );
+        if (
+          account?.account?.type === "chatgpt"
+          && (
+            typeof account.account.email !== "string"
+            || !account.account.email.trim()
+          )
+        ) {
+          account = await requestCodexAppServerViaCdp(
+            cdp,
+            undefined,
+            "local",
+            "account/read",
+            { refreshToken: true },
+          );
+        }
+        return { userId: stableCodexUserId(account) };
+      },
       loadFrame: (request) => loadTaskboardFrameViaCdp(
         cdp,
         request.frameName,
         request.frameCapability,
       ),
       openExternal: openExternalUrl,
+      openAttachment,
       runAutomation: (request) => (
         (async () => {
           const rpc = (method, body) => requestCodexAutomationViaCdp(
@@ -1204,18 +2363,22 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
           );
           if (request.operation === "list") {
             const stored = await reconcileStoredAutomationPolicy(
-              request.taskboardProjectId,
+              request,
               rpc,
             );
-            return stored ?? reconcileTaskboardAutomation(request, rpc);
+            return stored ?? (
+              request.codexProjectKind === "remote"
+                ? { items: [] }
+                : reconcileTaskboardAutomation(request, rpc)
+            );
           }
           return request.operation === "apply-policy"
             ? updateAndApplyQuotaPolicy(request, rpc)
             : reconcileTaskboardAutomation(request, rpc);
         })()
       ),
-      prefill: (request) => (
-        prefillTaskComposerViaCdp(cdp, undefined, request)
+      startConversation: (request) => (
+        getOrStartTaskConversation(cdp, undefined, request)
       ),
       sendResponse: (executionContextId, response) => (
         sendHostResponse(cdp, executionContextId, response)
@@ -1236,6 +2399,10 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
         name: hostBindingName,
         executionContextId: activeContextId,
       });
+      await cdp.send("Runtime.addBinding", {
+        name: codexNotificationBindingName,
+        executionContextId: activeContextId,
+      });
       await cdp.send("Runtime.evaluate", {
         contextId: activeContextId,
         expression: `(() => {
@@ -1245,10 +2412,24 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
           window.addEventListener("message", (event) => {
             const message = event.data;
             if (
+              !message
+              || typeof message !== "object"
+            ) return;
+            if (
+              message.type === "mcp-notification"
+              && typeof message.hostId === "string"
+              && typeof message.method === "string"
+            ) {
+              globalThis[${JSON.stringify(codexNotificationBindingName)}](JSON.stringify({
+                hostId: message.hostId,
+                method: message.method,
+                params: message.params
+              }));
+              return;
+            }
+            if (
               event.source !== window
               || event.origin !== window.location.origin
-              || !message
-              || typeof message !== "object"
               || message.type !== ${JSON.stringify(hostRequestMessage)}
               || message.capability !== capability
             ) return;
@@ -1257,6 +2438,7 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
         })()`,
         returnByValue: true,
       });
+      onCodexAppServerReady(cdp);
       await restoreQuotaPolicies(cdp);
       return activeContextId;
     })();
@@ -1268,17 +2450,32 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
   }
 
   async function publishHeartbeat() {
-    const executionContextId = await install();
-    await cdp.send("Runtime.evaluate", {
-      contextId: executionContextId,
-      expression: `window.postMessage({
-        type: ${JSON.stringify(hostHeartbeatMessage)},
-        capability: ${JSON.stringify(hostCapability)},
-        at: Date.now(),
-        startupToken: ${JSON.stringify(startupToken)}
-      }, window.location.origin)`,
-      returnByValue: true,
-    });
+    let timeout;
+    try {
+      await Promise.race([
+        (async () => {
+          const executionContextId = await install();
+          await cdp.send("Runtime.evaluate", {
+            contextId: executionContextId,
+            expression: `window.postMessage({
+              type: ${JSON.stringify(hostHeartbeatMessage)},
+              capability: ${JSON.stringify(hostCapability)},
+              at: Date.now(),
+              startupToken: ${JSON.stringify(startupToken)}
+            }, window.location.origin)`,
+            returnByValue: true,
+          });
+        })(),
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => {
+            cdp.close();
+            reject(new Error("Timed out publishing the Taskboard host heartbeat"));
+          }, 3_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   return { install, publishHeartbeat };
@@ -1356,11 +2553,20 @@ async function injectTarget(
   supervisor,
   attachExisting,
   startupToken,
+  onCodexAppServerNotification,
+  onCodexAppServerReady,
+  onCodexAppServerUnavailable,
 ) {
   const cdp = await runtime.connect(target);
   let retained = false;
   const hostBridge = keepAlive
-    ? installTaskboardHostBinding(cdp, supervisor, startupToken)
+    ? installTaskboardHostBinding(
+        cdp,
+        supervisor,
+        startupToken,
+        onCodexAppServerNotification,
+        onCodexAppServerReady,
+      )
     : null;
   cdp.hostBridge = hostBridge;
   try {
@@ -1392,16 +2598,23 @@ async function injectTarget(
         await hostBridge.publishHeartbeat();
       });
       await hostBridge.publishHeartbeat();
+      if (shouldOpen && !reconciled.shouldRemainOpen) {
+        await cdp.send("Runtime.evaluate", {
+          expression: "window.__codexTaskboardInjection__?.open()",
+          returnByValue: true,
+        });
+      }
+      const shouldRemainOpen = shouldOpen || reconciled.shouldRemainOpen;
       const status = await waitForInjectionStatus(
         cdp,
-        reconciled.shouldRemainOpen,
+        shouldRemainOpen,
         sourceHash,
         15_000,
       );
       const frameLoaded = status.frameUrl
         ? await waitForFrame(cdp, status.frameUrl, 15_000)
         : false;
-      if (reconciled.shouldRemainOpen && (!status.frameReady || !frameLoaded)) {
+      if (shouldRemainOpen && (!status.frameReady || !frameLoaded)) {
         throw new Error("Taskboard frame did not report ready in the Codex renderer");
       }
       retained = true;
@@ -1451,6 +2664,7 @@ async function injectTarget(
     return { result, connection: retained ? cdp : null };
   } finally {
     if (!retained) {
+      onCodexAppServerUnavailable(cdp);
       unregisterQuotaPolicyCdp(cdp);
       cdp.close();
     }
@@ -1468,6 +2682,9 @@ async function injectAll(
   supervisor,
   attachExisting,
   startupToken,
+  onCodexAppServerNotification,
+  onCodexAppServerReady,
+  onCodexAppServerUnavailable,
 ) {
   const targets = await runtime.targets();
   if (targets.length === 0) {
@@ -1478,6 +2695,7 @@ async function injectAll(
   const activeIds = new Set(targets.map((target) => target.id));
   for (const [id, connection] of injectedTargets) {
     if (!activeIds.has(id) || connection.closed) {
+      onCodexAppServerUnavailable(connection);
       unregisterQuotaPolicyCdp(connection);
       connection.close();
       injectedTargets.delete(id);
@@ -1499,6 +2717,9 @@ async function injectAll(
       supervisor,
       attachExisting,
       startupToken,
+      onCodexAppServerNotification,
+      onCodexAppServerReady,
+      onCodexAppServerUnavailable,
     );
     if (connection) injectedTargets.set(target.id, connection);
     results.push({ targetId: target.id, title: target.title, url: target.url, ...result });
@@ -1520,10 +2741,32 @@ ${runtimeSource}`,
   };
 }
 
+async function resolveRunnableCodexExecutable(appPath) {
+  const executable = resolveCodexExecutable({ appPath });
+  if (process.platform !== "win32" || !executable.toLowerCase().includes("\\windowsapps\\")) {
+    return executable;
+  }
+
+  const source = await stat(executable);
+  const cacheDirectory = path.join(taskboardDataDirectory, "codex-runtime");
+  const cachedExecutable = path.join(cacheDirectory, "codex.exe");
+  try {
+    const cached = await stat(cachedExecutable);
+    if (cached.size === source.size && cached.mtimeMs === source.mtimeMs) {
+      return cachedExecutable;
+    }
+  } catch {}
+
+  await mkdir(cacheDirectory, { recursive: true });
+  await pipeline(createReadStream(executable), createWriteStream(cachedExecutable));
+  await utimes(cachedExecutable, source.atime, source.mtime);
+  return cachedExecutable;
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   options.startupToken ??= taskboardInstanceToken;
-  process.env.CODEX_EXECUTABLE = resolveCodexExecutable({ appPath: options.appPath });
+  process.env.CODEX_EXECUTABLE = await resolveRunnableCodexExecutable(options.appPath);
   const cdpVersionUrl = `http://127.0.0.1:${options.port}/json/version`;
 
   if (options.daemon) {
@@ -1567,8 +2810,37 @@ async function main() {
   }
 
   let codexProcess = null;
+  let managedCodex = null;
+  let pendingCodexLaunch = null;
   let cdpRuntime = null;
+  let codexAppPid = null;
+  let managedCodexBuild = null;
+  let exitedManagedCodex = null;
+  let nativeCodexBrowser = false;
+  let runtimePublishPromise = null;
   const injectedTargets = new Map();
+  const remoteCodexConnections = new Map();
+  const routableCodexConnections = new Set();
+  const codexRendererWaiters = new Set();
+  const waitForCodexRenderer = () => new Promise((resolve) => {
+    codexRendererWaiters.add(resolve);
+  });
+  const wakeCodexRendererRequests = () => {
+    for (const resolve of codexRendererWaiters) resolve();
+    codexRendererWaiters.clear();
+  };
+  const registerRoutableCodexConnection = (connection) => {
+    routableCodexConnections.add(connection);
+    wakeCodexRendererRequests();
+  };
+  const unregisterRoutableCodexConnection = (connection) => {
+    routableCodexConnections.delete(connection);
+    for (const [hostId, current] of remoteCodexConnections) {
+      if (current === connection) remoteCodexConnections.delete(hostId);
+    }
+  };
+  let taskboardChild = null;
+  let idleAfterNormalExit = false;
   let openRequestGeneration = options.open ? 1 : 0;
   let openedRequestGeneration = 0;
   const hasOpenPending = () => openedRequestGeneration < openRequestGeneration;
@@ -1576,12 +2848,31 @@ async function main() {
     openRequestGeneration += 1;
     console.log(JSON.stringify({ openTaskboardSignalQueued: true }));
   };
+  let openControl = null;
   const requestTaskboardOpen = async () => {
     const generation = openRequestGeneration;
     if (generation <= openedRequestGeneration) return true;
     const connection = injectedTargets.values().next().value;
-    if (!connection) return false;
+    if (!nativeCodexBrowser && !connection) return false;
     try {
+      if (nativeCodexBrowser) {
+        const deepLink = new URL("codex://threads/new");
+        deepLink.searchParams.set("browserUrl", taskboardPageUrl);
+        await new Promise((resolve, reject) => {
+          const child = spawn("/usr/bin/open", [deepLink.toString()], {
+            env: withoutTaskboardLauncherEnvironment(process.env),
+            stdio: "ignore",
+          });
+          child.once("error", reject);
+          child.once("close", (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`LaunchServices could not open Taskboard (${code})`));
+          });
+        });
+        openedRequestGeneration = Math.max(openedRequestGeneration, generation);
+        console.log(JSON.stringify({ openedTaskboardInExistingCodex: true }));
+        return true;
+      }
       const evaluation = await connection.send("Runtime.evaluate", {
         expression: `(() => {
           const taskboard = window.__codexTaskboardInjection__;
@@ -1595,6 +2886,7 @@ async function main() {
         throw new Error("Taskboard injection is not ready");
       }
       await connection.send("Page.bringToFront");
+      activateCodexApp(codexAppPid);
       openedRequestGeneration = Math.max(openedRequestGeneration, generation);
       return true;
     } catch (error) {
@@ -1602,10 +2894,6 @@ async function main() {
       return false;
     }
   };
-  if (options.watch) {
-    process.on("SIGUSR2", queueTaskboardOpen);
-    console.log(JSON.stringify({ openTaskboardSignalReady: true }));
-  }
   let stopping = false;
   let wakeStop;
   const stopRequested = new Promise((resolve) => {
@@ -1614,14 +2902,84 @@ async function main() {
   const requestStop = () => {
     if (stopping) return;
     stopping = true;
+    wakeCodexRendererRequests();
     wakeStop();
+    cleanup().catch((error) => {
+      console.error(`Cleanup failed: ${error.message}`);
+    });
   };
+  if (options.watch) {
+    if (process.platform === "win32") {
+      openControl = createInterface({ input: process.stdin, terminal: false });
+      openControl.on("line", (line) => {
+        if (line.trim() === "open") queueTaskboardOpen();
+        else if (line.trim() === "stop") requestStop();
+      });
+    } else {
+      process.on("SIGUSR2", queueTaskboardOpen);
+    }
+    console.log(JSON.stringify({ openTaskboardSignalReady: true }));
+  }
   const detached = !options.watch;
+  const codexConnectionForHost = async (hostId) => {
+    while (!stopping) {
+      for (const connection of routableCodexConnections) {
+        if (connection.closed) routableCodexConnections.delete(connection);
+      }
+      const current = remoteCodexConnections.get(hostId);
+      if (current && routableCodexConnections.has(current)) {
+        return current;
+      }
+      const connection = routableCodexConnections.values().next().value;
+      if (connection) {
+        remoteCodexConnections.set(hostId, connection);
+        return connection;
+      }
+      await waitForCodexRenderer();
+    }
+    throw new Error("Codex renderer stopped before the remote request was sent");
+  };
+  const handleCodexAppServerRequest = async (message) => {
+    if (
+      typeof message.requestId !== "string"
+      || typeof message.hostId !== "string"
+      || typeof message.method !== "string"
+    ) throw new Error("Invalid Codex host request");
+    const connection = await codexConnectionForHost(message.hostId);
+    return requestCodexAppServerViaCdp(
+      connection,
+      undefined,
+      message.hostId,
+      message.method,
+      message.params,
+    );
+  };
+  const forwardCodexAppServerNotification = (cdp, notification) => {
+    handleRemoteAutomationDecisionNotification(notification);
+    if (remoteCodexConnections.get(notification.hostId) !== cdp) return;
+    if (!taskboardChild?.connected) return;
+    taskboardChild.send({
+      type: "taskboard:codex-app-server-notification",
+      hostId: notification.hostId,
+      method: notification.method,
+      params: notification.params,
+    });
+  };
   const supervisor = createTaskboardSupervisor({
     detached,
     isReachable: isTaskboardReachable,
     waitUntilReachable: waitUntilTaskboardReachable,
-    start: () => startTaskboard({ detached }),
+    start: () => {
+      const child = startTaskboard({
+        detached,
+        onCodexAppServerRequest: handleCodexAppServerRequest,
+      });
+      taskboardChild = child;
+      child.once("exit", () => {
+        if (taskboardChild === child) taskboardChild = null;
+      });
+      return child;
+    },
     onProcessError: (error) => {
       console.error(`Taskboard process error: ${error.message}`);
     },
@@ -1630,19 +2988,177 @@ async function main() {
     },
   });
 
+  const publishRuntime = async () => {
+    const pending = publishTaskboardRuntime();
+    runtimePublishPromise = pending;
+    try {
+      await pending;
+    } finally {
+      if (runtimePublishPromise === pending) runtimePublishPromise = null;
+    }
+  };
+
+  const startManagedCodex = async () => {
+    if (stopping) return false;
+    if (!options.cdpPipe) {
+      const runningCodex = codexAppProcesses(options.appPath);
+      let debuggingCodexFound = false;
+      for (const record of runningCodex) {
+        const port = codexProcessDebuggingPort(record);
+        if (!port) continue;
+        debuggingCodexFound = true;
+        if (!(await isReachable(`http://127.0.0.1:${port}/json/version`))) continue;
+        try {
+          if ((await codexTargets(port)).length === 0) continue;
+        } catch {
+          continue;
+        }
+        cdpRuntime = tcpCdpRuntime(port);
+        codexAppPid = record.pid;
+        options.attachExisting = true;
+        console.log(JSON.stringify({ reusedCodexPid: record.pid, cdpPort: port }));
+        return true;
+      }
+      if (runningCodex.length > 0) {
+        if (debuggingCodexFound) return false;
+        nativeCodexBrowser = true;
+        return false;
+      }
+    }
+    if (options.launch) {
+      await importCodexBrowserProfile();
+      if (stopping) return false;
+    }
+    if (options.cdpPipe) {
+      const launchPromise = (async () => {
+        const launched = await launchCodexWithPipe(options.appPath);
+        codexProcess = launched.child;
+        cdpRuntime = pipeCdpRuntime(launched.browser);
+      })();
+      pendingCodexLaunch = launchPromise;
+      try {
+        await launchPromise;
+      } catch (error) {
+        if (!stopping) throw error;
+      } finally {
+        if (pendingCodexLaunch === launchPromise) pendingCodexLaunch = null;
+      }
+      return true;
+    }
+    const launchPromise = launchCodexWithLaunchServices(
+      options.appPath,
+      options.port,
+      () => stopping,
+    );
+    pendingCodexLaunch = launchPromise;
+    try {
+      managedCodex = await launchPromise;
+      codexAppPid = managedCodex.pid;
+      if (process.platform === "darwin" && options.watch) {
+        managedCodexBuild = codexAppBundleBuild(options.appPath);
+      }
+    } catch (error) {
+      if (!stopping) throw error;
+    } finally {
+      if (pendingCodexLaunch === launchPromise) pendingCodexLaunch = null;
+    }
+    if (stopping) return false;
+    try {
+      await waitUntilReachable(cdpVersionUrl, 30_000, () => stopping);
+    } catch (error) {
+      if (stopping) return false;
+      throw error;
+    }
+    if (!stopping) cdpRuntime = tcpCdpRuntime(options.port);
+    return !stopping;
+  };
+
+  const recoverManagedCodexAfterUpdate = async () => {
+    if (!exitedManagedCodex) return false;
+    const updateReplacement = codexUpdateReplacementProcess(
+      options.appPath,
+      exitedManagedCodex.pid,
+      exitedManagedCodex.build,
+    );
+    if (!updateReplacement) return false;
+
+    const previousManagedCodex = exitedManagedCodex;
+    exitedManagedCodex = null;
+    try {
+      await stopManagedCodex(updateReplacement.process);
+      managedCodex = null;
+      managedCodexBuild = null;
+      codexAppPid = null;
+      nativeCodexBrowser = false;
+      if (!(await startManagedCodex())) {
+        throw new Error("Managed Codex did not restart after the app update");
+      }
+      idleAfterNormalExit = false;
+      console.log(JSON.stringify({
+        restartedCodexAfterUpdate: true,
+        previousPid: previousManagedCodex.pid,
+        replacementPid: updateReplacement.process.pid,
+        managedPid: codexAppPid,
+        previousBuild: previousManagedCodex.build,
+        build: managedCodexBuild,
+        cdpPort: options.port,
+      }));
+    } catch (restartError) {
+      cdpRuntime?.close();
+      cdpRuntime = null;
+      managedCodex = null;
+      managedCodexBuild = null;
+      codexAppPid = null;
+      nativeCodexBrowser = false;
+      idleAfterNormalExit = true;
+      console.error(`Waiting for Codex after update recovery failed: ${restartError.message}`);
+    }
+    return true;
+  };
+
   let cleanupPromise = null;
   const cleanup = () => {
     if (cleanupPromise) return cleanupPromise;
     cleanupPromise = (async () => {
       injectedTargets.forEach((connection) => {
+        unregisterRoutableCodexConnection(connection);
         unregisterQuotaPolicyCdp(connection);
         connection.close();
       });
       injectedTargets.clear();
       cdpRuntime?.close();
       cdpRuntime = null;
+      const supervisorCleanupPromise = supervisor.stop();
+      const runtimeCleanupPromise = (async () => {
+        const pendingRuntimePublish = runtimePublishPromise;
+        if (pendingRuntimePublish) {
+          try {
+            await pendingRuntimePublish;
+          } catch (_) {}
+        }
+        await removeTaskboardRuntime();
+      })();
+      supervisorCleanupPromise.catch(() => {});
+      runtimeCleanupPromise.catch(() => {});
+      const launchPromise = pendingCodexLaunch;
+      if (launchPromise) {
+        try {
+          await launchPromise;
+        } catch (_) {}
+        cdpRuntime?.close();
+        cdpRuntime = null;
+      }
       const launchedCodex = codexProcess;
+      let launchedManagedCodex = managedCodex;
+      if (!launchedManagedCodex && !options.cdpPipe) {
+        const discovered = managedCodexProcess(options.appPath);
+        if (discovered && managedCodexUsesPort(discovered, options.port)) {
+          launchedManagedCodex = discovered;
+        }
+      }
       codexProcess = null;
+      managedCodex = null;
+      if (launchedManagedCodex) await stopManagedCodex(launchedManagedCodex);
       if (
         launchedCodex
         && launchedCodex.exitCode === null
@@ -1664,12 +3180,16 @@ async function main() {
           ]);
         }
       }
-      await supervisor.stop();
-      await removeTaskboardRuntime();
+      await Promise.all([supervisorCleanupPromise, runtimeCleanupPromise]);
     })();
     return cleanupPromise;
   };
+  if (options.watch) {
+    process.once("SIGINT", requestStop);
+    process.once("SIGTERM", requestStop);
+  }
   try {
+    if (stopping) return;
     let cdpReachable = false;
     if (!options.cdpPipe) {
       cdpReachable = await isReachable(cdpVersionUrl);
@@ -1681,62 +3201,94 @@ async function main() {
         throw new Error(`Codex CDP is not listening on 127.0.0.1:${options.port}`);
       }
     }
+    if (stopping) return;
 
     await supervisor.ensure({ force: true });
-    await publishTaskboardRuntime();
-    if (options.launch) await importCodexBrowserProfile();
+    if (stopping) return;
+    await publishRuntime();
+    if (stopping) return;
 
-    if (options.cdpPipe) {
-      const launched = await launchCodexWithPipe(options.appPath);
-      codexProcess = launched.child;
-      cdpRuntime = pipeCdpRuntime(launched.browser);
-    } else if (!cdpReachable) {
-      codexProcess = launchCodex(options.appPath, options.port);
-      await waitUntilReachable(cdpVersionUrl, 30_000);
-      cdpRuntime = tcpCdpRuntime(options.port);
+    if (options.cdpPipe || !cdpReachable) {
+      const launchRequestGeneration = openRequestGeneration;
+      try {
+        idleAfterNormalExit = !(await startManagedCodex()) && !nativeCodexBrowser;
+      } catch (error) {
+        if (!options.watch || error?.managedCodexSpawnFailure !== true) throw error;
+        openedRequestGeneration = Math.max(
+          openedRequestGeneration,
+          launchRequestGeneration,
+        );
+        idleAfterNormalExit = true;
+        console.error(`Waiting for Codex launch: ${error.message}`);
+      }
     } else {
+      if (options.launch) {
+        const runningCodex = codexAppProcesses(options.appPath)
+          .find((record) => codexProcessDebuggingPort(record) === options.port);
+        if (!runningCodex || (await codexTargets(options.port)).length === 0) {
+          throw new Error(`Codex CDP port ${options.port} belongs to another process`);
+        }
+        managedCodex = managedCodexProcesses(options.appPath)
+          .find((record) => record.pid === runningCodex.pid) ?? null;
+        codexAppPid = runningCodex.pid;
+        if (process.platform === "darwin" && options.watch && managedCodex) {
+          managedCodexBuild = codexAppBundleBuild(options.appPath);
+        }
+        if (!managedCodex) {
+          options.attachExisting = true;
+          console.log(JSON.stringify({ reusedCodexPid: runningCodex.pid, cdpPort: options.port }));
+        }
+      } else {
+        codexAppPid = codexAppProcesses(options.appPath)
+          .find((record) => codexProcessDebuggingPort(record) === options.port)?.pid ?? null;
+      }
       cdpRuntime = tcpCdpRuntime(options.port);
     }
+    if (stopping) return;
 
     const { source, sourceHash } = await currentInjectionSource();
+    if (stopping) return;
     let firstResults = [];
     const firstOpenGeneration = openRequestGeneration;
     const shouldOpenFirstTarget = firstOpenGeneration > openedRequestGeneration;
-    try {
-      firstResults = await injectAll(
-        cdpRuntime,
-        source,
-        sourceHash,
-        shouldOpenFirstTarget,
-        options.screenshot,
-        injectedTargets,
-        options.watch,
-        supervisor,
-        options.attachExisting,
-        options.startupToken,
-      );
-    } catch (error) {
-      if (!options.watch) throw error;
-      console.error(`Waiting for Codex renderer: ${error.message}`);
+    if (!idleAfterNormalExit && !nativeCodexBrowser) {
+      try {
+        firstResults = await injectAll(
+          cdpRuntime,
+          source,
+          sourceHash,
+          shouldOpenFirstTarget,
+          options.screenshot,
+          injectedTargets,
+          options.watch,
+          supervisor,
+          options.attachExisting,
+          options.startupToken,
+          forwardCodexAppServerNotification,
+          registerRoutableCodexConnection,
+          unregisterRoutableCodexConnection,
+        );
+      } catch (error) {
+        if (!options.watch) throw error;
+        console.error(`Waiting for Codex renderer: ${error.message}`);
+      }
     }
+    if (stopping) return;
     if (firstResults.length > 0) {
       if (shouldOpenFirstTarget) {
         openedRequestGeneration = Math.max(openedRequestGeneration, firstOpenGeneration);
+        activateCodexApp(codexAppPid);
       }
       console.log(JSON.stringify({ injected: firstResults }, null, 2));
     }
-    if (hasOpenPending() && injectedTargets.size > 0) {
+    if (hasOpenPending()) {
       await requestTaskboardOpen();
     }
-    let idleAfterNormalExit = false;
-
     if (!options.watch) {
-      codexProcess?.unref();
+      if (options.cdpPipe) codexProcess?.unref();
       return;
     }
 
-    process.once("SIGINT", requestStop);
-    process.once("SIGTERM", requestStop);
     while (!stopping) {
       await Promise.race([
         new Promise((resolve) => setTimeout(resolve, 2_000)),
@@ -1745,7 +3297,7 @@ async function main() {
       if (stopping) break;
       try {
         const service = await supervisor.ensure();
-        if (service.restarted) await publishTaskboardRuntime();
+        if (service.restarted && !stopping) await publishRuntime();
       } catch (error) {
         console.error(`Waiting for Taskboard service: ${error.message}`);
       }
@@ -1755,16 +3307,41 @@ async function main() {
           await connection.hostBridge?.publishHeartbeat();
         } catch (_) {}
       }
-      if (idleAfterNormalExit) {
-        if (!hasOpenPending()) continue;
-        try {
-          const launched = await launchCodexWithPipe(options.appPath);
-          codexProcess = launched.child;
-          cdpRuntime = pipeCdpRuntime(launched.browser);
-          idleAfterNormalExit = false;
-        } catch (restartError) {
-          console.error(`Waiting to restart Codex: ${restartError.message}`);
+      if (nativeCodexBrowser) {
+        if (codexAppProcesses(options.appPath).length === 0) {
+          nativeCodexBrowser = false;
+          idleAfterNormalExit = true;
+          console.error(
+            "Waiting for Codex after exit; open Codex Taskboard again to restart it.",
+          );
           continue;
+        }
+        if (hasOpenPending()) await requestTaskboardOpen();
+        continue;
+      }
+      if (idleAfterNormalExit) {
+        if (await recoverManagedCodexAfterUpdate()) {
+          if (idleAfterNormalExit) continue;
+        } else {
+          if (!hasOpenPending()) continue;
+          const launchRequestGeneration = openRequestGeneration;
+          try {
+            if (!(await startManagedCodex())) {
+              if (nativeCodexBrowser) await requestTaskboardOpen();
+              continue;
+            }
+            exitedManagedCodex = null;
+            idleAfterNormalExit = false;
+          } catch (restartError) {
+            if (restartError?.managedCodexSpawnFailure === true) {
+              openedRequestGeneration = Math.max(
+                openedRequestGeneration,
+                launchRequestGeneration,
+              );
+            }
+            console.error(`Waiting to restart Codex: ${restartError.message}`);
+            continue;
+          }
         }
       }
       try {
@@ -1779,11 +3356,14 @@ async function main() {
           supervisor,
           options.attachExisting,
           options.startupToken,
+          forwardCodexAppServerNotification,
+          registerRoutableCodexConnection,
+          unregisterRoutableCodexConnection,
         );
         if (results.length > 0) {
           console.log(JSON.stringify({ injected: results }, null, 2));
         }
-        if (hasOpenPending() && injectedTargets.size > 0) {
+        if (hasOpenPending()) {
           await requestTaskboardOpen();
         }
       } catch (error) {
@@ -1802,6 +3382,7 @@ async function main() {
           }
           if (launchedCodex?.exitCode === 0) {
             injectedTargets.forEach((connection) => {
+              unregisterRoutableCodexConnection(connection);
               unregisterQuotaPolicyCdp(connection);
               connection.close();
             });
@@ -1815,42 +3396,66 @@ async function main() {
             );
             continue;
           }
-          throw error;
+          if (
+            !launchedCodex
+            || (launchedCodex.exitCode === null && launchedCodex.signalCode === null)
+          ) {
+            throw error;
+          }
         }
-        const launchedCodexExited = codexProcess
-          && (codexProcess.exitCode !== null || codexProcess.signalCode !== null);
+        const launchedCodexExited = options.cdpPipe
+          ? codexProcess
+            && (codexProcess.exitCode !== null || codexProcess.signalCode !== null)
+          : codexAppPid && !codexAppProcesses(options.appPath)
+            .some((record) => record.pid === codexAppPid);
         if (launchedCodexExited) {
+          const exitedCodexPid = codexAppPid;
+          exitedManagedCodex = managedCodex?.pid === exitedCodexPid && managedCodexBuild
+            ? { pid: exitedCodexPid, build: managedCodexBuild }
+            : null;
           injectedTargets.forEach((connection) => {
+            unregisterRoutableCodexConnection(connection);
             unregisterQuotaPolicyCdp(connection);
             connection.close();
           });
           injectedTargets.clear();
           cdpRuntime?.close();
           cdpRuntime = null;
-          const exitCode = codexProcess.exitCode;
-          codexProcess = null;
-          if (exitCode === 0) {
-            idleAfterNormalExit = true;
-            console.error(
-              "Waiting for Codex after normal exit; open Codex Taskboard again to restart it.",
-            );
+          if (options.cdpPipe) {
+            const exitCode = codexProcess.exitCode;
+            codexProcess = null;
+            if (exitCode === 0) {
+              idleAfterNormalExit = true;
+              console.error(
+                "Waiting for Codex after normal exit; open Codex Taskboard again to restart it.",
+              );
+              continue;
+            }
+            console.error("Codex exited unexpectedly; restarting it for the taskboard launcher.");
+            const launchRequestGeneration = openRequestGeneration;
+            try {
+              await startManagedCodex();
+              if (options.open) openRequestGeneration += 1;
+            } catch (restartError) {
+              if (restartError?.managedCodexSpawnFailure === true) {
+                openedRequestGeneration = Math.max(
+                  openedRequestGeneration,
+                  launchRequestGeneration,
+                );
+                idleAfterNormalExit = true;
+              }
+              console.error(`Waiting to restart Codex: ${restartError.message}`);
+            }
             continue;
           }
-          console.error("Codex exited unexpectedly; restarting it for the taskboard launcher.");
-          try {
-            if (options.cdpPipe) {
-              const launched = await launchCodexWithPipe(options.appPath);
-              codexProcess = launched.child;
-              cdpRuntime = pipeCdpRuntime(launched.browser);
-            } else {
-              codexProcess = launchCodex(options.appPath, options.port);
-              await waitUntilReachable(cdpVersionUrl, 30_000);
-              cdpRuntime = tcpCdpRuntime(options.port);
-            }
-            if (options.open) openRequestGeneration += 1;
-          } catch (restartError) {
-            console.error(`Waiting to restart Codex: ${restartError.message}`);
-          }
+          if (await recoverManagedCodexAfterUpdate()) continue;
+          managedCodex = null;
+          managedCodexBuild = null;
+          codexAppPid = null;
+          idleAfterNormalExit = true;
+          console.error(
+            "Waiting for Codex after exit; open Codex Taskboard again to restart it.",
+          );
           continue;
         }
         console.error(`Waiting for Codex renderer: ${error.message}`);
@@ -1860,7 +3465,8 @@ async function main() {
     if (options.watch) {
       process.removeListener("SIGINT", requestStop);
       process.removeListener("SIGTERM", requestStop);
-      process.removeListener("SIGUSR2", queueTaskboardOpen);
+      if (process.platform === "win32") openControl?.close();
+      else process.removeListener("SIGUSR2", queueTaskboardOpen);
       await cleanup();
     }
   }

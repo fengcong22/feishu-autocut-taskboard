@@ -243,7 +243,7 @@ test("source workflow freeze rejects invalid Feishu subject project boundaries",
   }
 });
 
-test("project association counts include relations on either side without double counting", async () => {
+test("project association counts include same-project relations on either side without double counting", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-relation-count-"));
   const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
   try {
@@ -257,11 +257,11 @@ test("project association counts include relations on either side without double
     database.database.prepare(`INSERT INTO tasks
       (id, identifier, project_id, title, status, priority, labels, sort_order, version, created_at, updated_at)
       VALUES (?, ?, ?, 'Task', 'todo', 'none', '[]', 1000, 1, ?, ?)`
-    ).run("right-task", "RIGHT-1", "temp-right", timestamp, timestamp);
+    ).run("right-task", "RIGHT-1", "temp-left", timestamp, timestamp);
     database.database.prepare("INSERT INTO task_relations (relation_type, source_task_id, target_task_id, created_at) VALUES ('related', ?, ?, ?)")
       .run("left-task", "right-task", timestamp);
     assert.equal(database.getProjectAssociationCounts("temp-left").relations, 1);
-    assert.equal(database.getProjectAssociationCounts("temp-right").relations, 1);
+    assert.equal(database.getProjectAssociationCounts("temp-right").relations, 0);
   } finally {
     database.close();
     await rm(directory, { recursive: true, force: true });

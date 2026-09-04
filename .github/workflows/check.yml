@@ -3,9 +3,12 @@ name: Check
 on:
   pull_request:
   push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -13,7 +16,187 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  main-check-scope:
+    name: Select main Check scope
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run_full: ${{ steps.scope.outputs.run_full }}
+    steps:
+      - name: Reuse successful PR Check for the exact tested merge tree
+        id: scope
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          API_VERSION_HEADER="X-GitHub-Api-Version: 2026-03-10"
+          ATTESTATION_SCHEMA="codex-taskboard.pr-check-tree.v1"
+          printf 'run_full=true\n' > "$GITHUB_OUTPUT"
+
+          if ! MAIN_COMMIT="$(gh api \
+            --header "$API_VERSION_HEADER" \
+            "repos/$GITHUB_REPOSITORY/git/commits/$GITHUB_SHA")"; then
+            echo "无法读取 main 提交；运行完整 Check。"
+            exit 0
+          fi
+          if [[ "$(jq -r '.parents | length' <<< "$MAIN_COMMIT")" != "2" ]]; then
+            echo "main 提交不是标准二父 merge；运行完整 Check。"
+            exit 0
+          fi
+
+          MAIN_TREE_SHA="$(jq -r '.tree.sha // empty' <<< "$MAIN_COMMIT")"
+          BASE_SHA="$(jq -r '.parents[0].sha // empty' <<< "$MAIN_COMMIT")"
+          PR_HEAD_SHA="$(jq -r '.parents[1].sha // empty' <<< "$MAIN_COMMIT")"
+          if [[ -z "$MAIN_TREE_SHA" || -z "$BASE_SHA" || -z "$PR_HEAD_SHA" ]]; then
+            echo "main merge 元数据不完整；运行完整 Check。"
+            exit 0
+          fi
+
+          CHECK_WORKFLOW_PATH=".github/workflows/check.yml"
+          if ! PR_COMPARE="$(gh api \
+            --header "$API_VERSION_HEADER" \
+            "repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$PR_HEAD_SHA?per_page=100&page=1")"; then
+            echo "无法比较 PR base/head；运行完整 Check。"
+            exit 0
+          fi
+          if ! jq -e \
+            --arg base "$BASE_SHA" \
+            --arg head "$PR_HEAD_SHA" \
+            '(.base_commit.sha == $base) and
+             ((.total_commits | type) == "number") and
+             (.total_commits > 0) and
+             (.total_commits <= 100) and
+             ((.total_commits | floor) == .total_commits) and
+             ((.commits | type) == "array") and
+             ((.commits | length) == .total_commits) and
+             all(.commits[]; (.sha | type) == "string") and
+             (.commits[-1].sha == $head) and
+             ((.files | type) == "array") and
+             ((.files | length) < 300) and
+             all(.files[];
+               ((.filename | type) == "string") and
+               ((has("previous_filename") | not) or
+                ((.previous_filename | type) == "string")))' \
+            <<< "$PR_COMPARE" >/dev/null; then
+            echo "PR compare 结果分页、不完整或无法唯一证明 base/head；运行完整 Check。"
+            exit 0
+          fi
+          if jq -e \
+            --arg workflow "$CHECK_WORKFLOW_PATH" \
+            'any(.files[];
+               .filename == $workflow or .previous_filename == $workflow)' \
+            <<< "$PR_COMPARE" >/dev/null; then
+            echo "PR 修改了 $CHECK_WORKFLOW_PATH；运行完整 Check。"
+            exit 0
+          fi
+
+          if ! PR_RUNS="$(gh api \
+            --header "$API_VERSION_HEADER" \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/check.yml/runs?event=pull_request&head_sha=$PR_HEAD_SHA&per_page=1")"; then
+            echo "无法读取 exact-head PR Check；运行完整 Check。"
+            exit 0
+          fi
+          PR_RUN_ID="$(jq -r '.workflow_runs[0].id // empty' <<< "$PR_RUNS")"
+          PR_RUN_EVENT="$(jq -r '.workflow_runs[0].event // empty' <<< "$PR_RUNS")"
+          PR_RUN_STATUS="$(jq -r '.workflow_runs[0].status // empty' <<< "$PR_RUNS")"
+          PR_RUN_HEAD_SHA="$(jq -r '.workflow_runs[0].head_sha // empty' <<< "$PR_RUNS")"
+          PR_RUN_CONCLUSION="$(jq -r '.workflow_runs[0].conclusion // empty' <<< "$PR_RUNS")"
+          if [[ -z "$PR_RUN_ID" || "$PR_RUN_EVENT" != "pull_request" || \
+                "$PR_RUN_STATUS" != "completed" || "$PR_RUN_HEAD_SHA" != "$PR_HEAD_SHA" || \
+                "$PR_RUN_CONCLUSION" != "success" ]]; then
+            echo "最新的 exact-head PR Check 未成功完成；运行完整 Check。"
+            exit 0
+          fi
+
+          if ! ARTIFACTS="$(gh api \
+            --header "$API_VERSION_HEADER" \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$PR_RUN_ID/artifacts?per_page=100")"; then
+            echo "无法读取 PR Check 的 tested-tree 证据；运行完整 Check。"
+            exit 0
+          fi
+          ATTESTATION_NAME="pr-check-tree-$PR_HEAD_SHA"
+          ATTESTATION_ARTIFACT="$(jq -c \
+            --arg name "$ATTESTATION_NAME" \
+            '[.artifacts[]? | select(.name == $name and .expired == false)] | if length == 1 then .[0] else empty end' \
+            <<< "$ARTIFACTS")"
+          if [[ -z "$ATTESTATION_ARTIFACT" ]]; then
+            echo "找不到唯一且未过期的 tested-tree 证据；运行完整 Check。"
+            exit 0
+          fi
+          ATTESTATION_ARTIFACT_ID="$(jq -r '.id // empty' <<< "$ATTESTATION_ARTIFACT")"
+          if [[ -z "$ATTESTATION_ARTIFACT_ID" ]]; then
+            echo "tested-tree 证据缺少 artifact id；运行完整 Check。"
+            exit 0
+          fi
+
+          ATTESTATION_ZIP="$RUNNER_TEMP/pr-check-tree.zip"
+          ATTESTATION_PATH="$RUNNER_TEMP/pr-check-tree.json"
+          if ! gh api \
+            --header "$API_VERSION_HEADER" \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts/$ATTESTATION_ARTIFACT_ID/zip" \
+            > "$ATTESTATION_ZIP"; then
+            echo "无法下载 tested-tree 证据；运行完整 Check。"
+            exit 0
+          fi
+          mapfile -t ATTESTATION_FILES < <(unzip -Z1 "$ATTESTATION_ZIP")
+          if [[ "${#ATTESTATION_FILES[@]}" != "1" || "${ATTESTATION_FILES[0]}" != "pr-check-tree.json" ]]; then
+            echo "tested-tree 证据归档结构无效；运行完整 Check。"
+            exit 0
+          fi
+          if ! unzip -p "$ATTESTATION_ZIP" pr-check-tree.json > "$ATTESTATION_PATH"; then
+            echo "无法读取 tested-tree 证据；运行完整 Check。"
+            exit 0
+          fi
+          if ! jq -e \
+            --arg schema "$ATTESTATION_SCHEMA" \
+            --arg base "$BASE_SHA" \
+            --arg head "$PR_HEAD_SHA" \
+            '.schema == $schema and .base_sha == $base and .head_sha == $head and
+             (.checked_sha | type == "string" and length > 0) and
+             (.checked_tree | type == "string" and length > 0)' \
+            "$ATTESTATION_PATH" >/dev/null; then
+            echo "tested-tree 证据与 main merge 的 base/head 不一致；运行完整 Check。"
+            exit 0
+          fi
+          CHECKED_SHA="$(jq -r '.checked_sha' "$ATTESTATION_PATH")"
+          ATTESTED_TREE_SHA="$(jq -r '.checked_tree' "$ATTESTATION_PATH")"
+          if [[ ! "$CHECKED_SHA" =~ ^[0-9a-f]{40,64}$ || ! "$ATTESTED_TREE_SHA" =~ ^[0-9a-f]{40,64}$ ]]; then
+            echo "tested-tree 证据中的 Git 对象 id 无效；运行完整 Check。"
+            exit 0
+          fi
+
+          if ! CHECKED_COMMIT="$(gh api \
+            --header "$API_VERSION_HEADER" \
+            "repos/$GITHUB_REPOSITORY/git/commits/$CHECKED_SHA")"; then
+            echo "无法读取 PR Check 实际 checkout 的 merge 提交；运行完整 Check。"
+            exit 0
+          fi
+          if ! jq -e \
+            --arg tree "$MAIN_TREE_SHA" \
+            --arg base "$BASE_SHA" \
+            --arg head "$PR_HEAD_SHA" \
+            '.tree.sha == $tree and
+             (.parents | length) == 2 and
+             .parents[0].sha == $base and
+             .parents[1].sha == $head' \
+            <<< "$CHECKED_COMMIT" >/dev/null; then
+            echo "PR Check 的 tested merge 与最终 main merge 不同；运行完整 Check。"
+            exit 0
+          fi
+          CHECKED_TREE_SHA="$(jq -r '.tree.sha // empty' <<< "$CHECKED_COMMIT")"
+          if [[ "$ATTESTED_TREE_SHA" != "$CHECKED_TREE_SHA" || "$CHECKED_TREE_SHA" != "$MAIN_TREE_SHA" ]]; then
+            echo "tested-tree 证据、GitHub merge commit 与 main tree 不一致；运行完整 Check。"
+            exit 0
+          fi
+
+          echo "复用 PR Check run $PR_RUN_ID 对 merge $CHECKED_SHA / tree $MAIN_TREE_SHA 的成功结果。"
+          printf 'run_full=false\n' > "$GITHUB_OUTPUT"
+
   check:
+    needs: main-check-scope
+    if: ${{ !cancelled() && (github.event_name != 'push' || needs['main-check-scope'].outputs.run_full != 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -26,9 +209,39 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      - name: Record tested PR merge tree
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg schema "codex-taskboard.pr-check-tree.v1" \
+            --arg base_sha "$PR_BASE_SHA" \
+            --arg head_sha "$PR_HEAD_SHA" \
+            --arg checked_sha "$GITHUB_SHA" \
+            --arg checked_tree "$(git rev-parse 'HEAD^{tree}')" \
+            '{
+              schema: $schema,
+              base_sha: $base_sha,
+              head_sha: $head_sha,
+              checked_sha: $checked_sha,
+              checked_tree: $checked_tree
+            }' > "$RUNNER_TEMP/pr-check-tree.json"
+      - name: Preserve tested PR merge tree
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr-check-tree-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/pr-check-tree.json
+          if-no-files-found: error
+          overwrite: true
 
   macos-launcher:
     name: macOS launcher
+    needs: main-check-scope
+    if: ${{ !cancelled() && (github.event_name != 'push' || needs['main-check-scope'].outputs.run_full != 'false') }}
     runs-on: macos-latest
     timeout-minutes: 40
     steps:
@@ -60,3 +273,80 @@ jobs:
         run: >-
           npm run app:preflight --
           "src-tauri/target/universal-apple-darwin/release/bundle/macos/Codex Taskboard.app"
+
+  windows-launcher:
+    name: Windows x64 launcher
+    needs: main-check-scope
+    if: ${{ !cancelled() && (github.event_name != 'push' || needs['main-check-scope'].outputs.run_full != 'false') }}
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - run: npm ci
+      - name: Run the Windows Node.js test suite
+        run: npm test
+      - name: Build the unsigned NSIS installer
+        run: npm run app:build:windows
+      - name: Preserve the unsigned NSIS installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-x64-nsis-${{ github.sha }}
+          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+
+  linux-launcher:
+    name: Ubuntu 24.04 x64 launcher
+    needs: main-check-scope
+    if: ${{ !cancelled() && (github.event_name != 'push' || needs['main-check-scope'].outputs.run_full != 'false') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Install Ubuntu build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            wget
+      - run: npm ci
+      - name: Build the Ubuntu 24.04 x64 packages
+        run: npm run app:build:linux:x64
+      - name: Verify the Ubuntu 24.04 x64 package contents
+        run: >-
+          node scripts/verify-linux-packages.mjs
+          src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+          src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+      - name: Preserve the Ubuntu 24.04 x64 packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-x64-deb-appimage-${{ github.sha }}
+          path: |
+            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+          if-no-files-found: error

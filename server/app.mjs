@@ -8,18 +8,20 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { WebSocket as WebSocketClient, WebSocketServer } from "ws";
 
 import {
   DEFAULT_PROJECT_ID,
+  JIRA_PROJECT_ID,
   TASK_STATUSES,
   isTaskPriority,
   isTaskStatus,
 } from "../shared/domain.mjs";
 import { resolveCodexExecutable } from "../shared/codex-executable.mjs";
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
-import { normalizeWorkflowSnapshot } from "../shared/workflow-control-flow.mjs";
 import { AiChatService } from "./ai-chat.mjs";
 import { discoverAiCatalog, resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
+import { decodeComposerReferenceKey } from "./composer-reference.mjs";
 import { createCloudConfigStore } from "./cloud-config.mjs";
 import { createFeishuPackageStore } from "./feishu-package-config.mjs";
 import { createFeishuPackageApi } from "./feishu-package-api.mjs";
@@ -29,6 +31,8 @@ import {
   isLocalCompanionRoute,
 } from "./cloud-proxy.mjs";
 import { ApiError, TaskboardDatabase } from "./database.mjs";
+import { createJiraConfigStore } from "./jira-config.mjs";
+import { createJiraIntegration } from "./jira-integration.mjs";
 import { ProjectSummaryService } from "./project-summary.mjs";
 import { codexInvocation } from "../shared/codex-invocation.mjs";
 import { createFeishuWorkflowStore, subjectProjectId } from "./feishu-workflow-store.mjs";
@@ -41,6 +45,7 @@ import { createArtifactUploadWorker } from "./upload-worker.mjs";
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const execFileAsync = promisify(execFile);
 const JSON_BODY_LIMIT = 1024 * 1024;
+const PROJECT_README_BODY_LIMIT = 3 * 1024 * 1024;
 const ATTACHMENT_BODY_LIMIT = 25 * 1024 * 1024;
 const ARTIFACT_MAX_BYTES = 20 * 1024 * 1024 * 1024;
 const AI_CHAT_TURN_BODY_LIMIT = 25 * 1024 * 1024;
@@ -92,7 +97,9 @@ const BRIDGE_DIAGNOSTIC_MESSAGES = new Map([
   ["ARTIFACT_SOURCE_PATH_UNBOUND", "The ZIP artifact source path is not bound on this machine"],
   ["UPLOAD_TARGET_PATH_UNBOUND", "The upload target path is not bound on this machine"],
 ]);
+const PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX = "taskboard.project-board-display-settings.v3.";
 const TRUSTED_EMBED_ORIGINS = new Set(["app://-"]);
+const TRUSTED_ORIGINS_ENV = "CODEX_TASKBOARD_TRUSTED_ORIGINS";
 const CODEX_AGENT_ACTOR = {
   type: "agent",
   id: "codex-agent",
@@ -360,30 +367,90 @@ function isTrustedNetworkHost(hostname) {
   return false;
 }
 
-function assertTrustedNetworkRequest(request, allowOpaqueOrigin = false) {
-  let host;
-  try {
-    host = new URL(`http://${request.headers.host ?? ""}`).hostname;
-  } catch {
-    throw new ApiError(403, "INVALID_HOST", "Request Host must be local or private");
+function parseTrustedOrigins(value) {
+  if (value === undefined) return new Set();
+  const configured = String(value).trim();
+  if (!configured) {
+    throw new Error(`${TRUSTED_ORIGINS_ENV} must not be empty when configured`);
   }
-  if (!isTrustedNetworkHost(host)) {
-    throw new ApiError(403, "INVALID_HOST", "Request Host must be local or private");
+
+  const origins = new Set();
+  for (const rawOrigin of configured.split(",")) {
+    const origin = rawOrigin.trim();
+    if (!origin || origin.includes("*")) {
+      throw new Error(`${TRUSTED_ORIGINS_ENV} must be a comma-separated list of exact HTTPS origins`);
+    }
+    let url;
+    try {
+      url = new URL(origin);
+    } catch {
+      throw new Error(`${TRUSTED_ORIGINS_ENV} must contain valid HTTPS origins`);
+    }
+    if (
+      url.protocol !== "https:"
+      || url.username
+      || url.password
+      || url.pathname !== "/"
+      || url.search
+      || url.hash
+    ) {
+      throw new Error(`${TRUSTED_ORIGINS_ENV} must contain exact HTTPS origins without paths, queries, fragments, or credentials`);
+    }
+    if (origins.has(url.origin)) {
+      throw new Error(`${TRUSTED_ORIGINS_ENV} must not contain duplicate origins`);
+    }
+    origins.add(url.origin);
+  }
+  return origins;
+}
+
+function parseRequestHost(value) {
+  if (typeof value !== "string" || !value || value !== value.trim()) {
+    throw new ApiError(403, "INVALID_HOST", "Request Host must be local, private, or explicitly trusted");
+  }
+  let url;
+  try {
+    url = new URL(`https://${value}`);
+  } catch {
+    throw new ApiError(403, "INVALID_HOST", "Request Host must be local, private, or explicitly trusted");
+  }
+  if (
+    url.username
+    || url.password
+    || url.pathname !== "/"
+    || url.search
+    || url.hash
+    || !url.hostname
+  ) {
+    throw new ApiError(403, "INVALID_HOST", "Request Host must be local, private, or explicitly trusted");
+  }
+  return { hostname: url.hostname, httpsOrigin: url.origin };
+}
+
+function assertTrustedNetworkRequest(request, allowOpaqueOrigin = false, trustedOrigins = new Set()) {
+  const host = parseRequestHost(request.headers.host);
+  const trustedNetworkHost = isTrustedNetworkHost(host.hostname);
+  const configuredTrustedHost = !trustedNetworkHost && trustedOrigins.has(host.httpsOrigin);
+  if (!trustedNetworkHost && !configuredTrustedHost) {
+    throw new ApiError(403, "INVALID_HOST", "Request Host must be local, private, or explicitly trusted");
   }
 
   const origin = request.headers.origin;
-  if (!origin) return;
-  if (TRUSTED_EMBED_ORIGINS.has(origin)) return;
-  if (allowOpaqueOrigin && origin === "null") return;
-  let originHost;
-  try {
-    originHost = new URL(origin).hostname;
-  } catch {
-    throw new ApiError(403, "INVALID_ORIGIN", "Request Origin must be local or private");
+  const configuredTrustedOrigin = trustedOrigins.has(origin);
+  if (origin && !configuredTrustedOrigin && !TRUSTED_EMBED_ORIGINS.has(origin)) {
+    if (!(allowOpaqueOrigin && origin === "null")) {
+      let originHost;
+      try {
+        originHost = new URL(origin).hostname;
+      } catch {
+        throw new ApiError(403, "INVALID_ORIGIN", "Request Origin must be local or private");
+      }
+      if (!isTrustedNetworkHost(originHost)) {
+        throw new ApiError(403, "INVALID_ORIGIN", "Request Origin must be local or private");
+      }
+    }
   }
-  if (!isTrustedNetworkHost(originHost)) {
-    throw new ApiError(403, "INVALID_ORIGIN", "Request Origin must be local or private");
-  }
+  return configuredTrustedHost || configuredTrustedOrigin;
 }
 
 function assertLoopbackRequest(request) {
@@ -423,6 +490,25 @@ function assertAllowedQuery(searchParams, allowed, routeLabel) {
 
 function assertNoQuery(searchParams, routeLabel) {
   assertAllowedQuery(searchParams, new Set(), routeLabel);
+}
+
+function parseAfterCursor(searchParams, routeLabel) {
+  assertAllowedQuery(searchParams, new Set(["after"]), routeLabel);
+  const value = searchParams.get("after");
+  if (value === null) return null;
+  const revision = Number(value);
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(revision)) {
+    throw new ApiError(400, "INVALID_CURSOR", "Cursor must be a non-negative integer revision");
+  }
+  return { value, revision };
+}
+
+function nextCursor(items, after) {
+  if (items.length === 0) return after?.value ?? "0";
+  return String(items.reduce(
+    (revision, item) => Math.max(revision, item.changeRevision),
+    0,
+  ));
 }
 
 function decodeRouteSegment(value, name) {
@@ -565,87 +651,6 @@ function parseVersion(value) {
   return value;
 }
 
-function parseWorkflowVersion(value) {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new ApiError(400, "INVALID_FIELD", "'version' must be a non-negative integer");
-  }
-  return value;
-}
-
-function parseWorkflowWorkspace(value) {
-  assertPlainObject(value);
-  assertAllowedKeys(value, new Set(["version", "tabs", "activeWorkflowId", "snapshots"]));
-  if (value.version !== 1) {
-    throw new ApiError(400, "INVALID_FIELD", "'workspace.version' must be 1");
-  }
-  if (!Array.isArray(value.tabs) || value.tabs.length === 0 || value.tabs.length > 100) {
-    throw new ApiError(400, "INVALID_FIELD", "'workspace.tabs' must contain 1 to 100 workflows");
-  }
-  const tabs = value.tabs.map((tab, index) => {
-    assertPlainObject(tab);
-    assertAllowedKeys(tab, new Set(["id", "name"]));
-    return {
-      id: stringField(tab.id, `workspace.tabs[${index}].id`, { required: true, maxLength: 128 }),
-      name: stringField(tab.name, `workspace.tabs[${index}].name`, { required: true, maxLength: 120 }),
-    };
-  });
-  if (new Set(tabs.map((tab) => tab.id)).size !== tabs.length) {
-    throw new ApiError(400, "INVALID_FIELD", "'workspace.tabs' ids must be unique");
-  }
-  const activeWorkflowId = stringField(value.activeWorkflowId, "workspace.activeWorkflowId", {
-    required: true,
-    maxLength: 128,
-  });
-  if (!tabs.some((tab) => tab.id === activeWorkflowId)) {
-    throw new ApiError(400, "INVALID_FIELD", "'workspace.activeWorkflowId' must reference a workflow tab");
-  }
-  assertPlainObject(value.snapshots);
-  const snapshots = {};
-  for (const tab of tabs) {
-    const snapshot = value.snapshots[tab.id];
-    assertPlainObject(snapshot);
-    assertAllowedKeys(snapshot, new Set(["nodes", "edges", "flow", "selectedNodeId"]));
-    if (!Array.isArray(snapshot.nodes) || snapshot.nodes.length > 10_000) {
-      throw new ApiError(400, "INVALID_FIELD", `'workspace.snapshots.${tab.id}.nodes' must be an array`);
-    }
-    if (snapshot.flow === undefined && (!Array.isArray(snapshot.edges) || snapshot.edges.length > 20_000)) {
-      throw new ApiError(400, "INVALID_FIELD", `'workspace.snapshots.${tab.id}.edges' must be an array`);
-    }
-    if (snapshot.flow !== undefined && snapshot.edges !== undefined) {
-      throw new ApiError(400, "INVALID_FIELD", `'workspace.snapshots.${tab.id}' cannot contain both 'flow' and 'edges'`);
-    }
-    const selectedNodeId = stringField(
-      snapshot.selectedNodeId ?? null,
-      `workspace.snapshots.${tab.id}.selectedNodeId`,
-      { nullable: true, maxLength: 256 },
-    );
-    try {
-      snapshots[tab.id] = normalizeWorkflowSnapshot({
-        nodes: snapshot.nodes,
-        edges: snapshot.edges,
-        flow: snapshot.flow,
-        selectedNodeId,
-      });
-    } catch (error) {
-      throw new ApiError(
-        400,
-        "INVALID_FIELD",
-        `'workspace.snapshots.${tab.id}' is not a valid workflow: ${error.message}`,
-      );
-    }
-  }
-  return { version: 1, tabs, activeWorkflowId, snapshots };
-}
-
-function parseWorkflowWorkspaceSave(body) {
-  assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["version", "workspace"]));
-  return {
-    version: parseWorkflowVersion(body.version),
-    workspace: parseWorkflowWorkspace(body.workspace),
-  };
-}
-
 function parseSortOrder(value) {
   if (typeof value !== "number" || !Number.isFinite(value) || Math.abs(value) > 1_000_000_000_000) {
     throw new ApiError(400, "INVALID_FIELD", "'sortOrder' must be a finite number between -1000000000000 and 1000000000000");
@@ -719,9 +724,82 @@ function parseProjectCreate(body) {
   return { id, name, workspacePath };
 }
 
+function parseProjectLabel(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["label"]));
+  return stringField(body.label, "label", { required: true, maxLength: 64 });
+}
+
+function parseProjectReadmeSave(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["content", "version"]));
+  const content = body.content ?? "";
+  if (typeof content !== "string") {
+    throw new ApiError(400, "INVALID_FIELD", "'content' must be a string");
+  }
+  if (content.length > 500_000) {
+    throw new ApiError(400, "INVALID_FIELD", "'content' cannot exceed 500000 characters");
+  }
+  const version = body.version;
+  if (version !== undefined && (!Number.isSafeInteger(version) || version < 0)) {
+    throw new ApiError(400, "INVALID_FIELD", "'version' must be a non-negative integer");
+  }
+  return { content, version };
+}
+
 function parseThreadId(value) {
   if (value === undefined) return undefined;
   return stringField(value, "threadId", { required: true, maxLength: 256 });
+}
+
+function parseThreadBinding(value) {
+  if (value === undefined || value === null) return value;
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set([
+    "threadId",
+    "codexProjectId",
+    "codexProjectKind",
+    "codexHostId",
+    "workspacePath",
+  ]));
+  const threadId = stringField(value.threadId, "threadBinding.threadId", {
+    required: true,
+    maxLength: 256,
+  });
+  const identityFields = [
+    value.codexProjectId,
+    value.codexProjectKind,
+    value.codexHostId,
+    value.workspacePath,
+  ];
+  if (identityFields.every((field) => field === undefined)) return { threadId };
+  if (identityFields.some((field) => field === undefined)) {
+    throw new ApiError(400, "INVALID_FIELD", "Thread identity must include project, kind, host, and workspace");
+  }
+  const codexProjectId = stringField(value.codexProjectId, "threadBinding.codexProjectId", {
+    required: true,
+    maxLength: 256,
+  });
+  const codexProjectKind = value.codexProjectKind;
+  const codexHostId = stringField(value.codexHostId, "threadBinding.codexHostId", {
+    required: true,
+    maxLength: 256,
+  });
+  const workspacePath = stringField(value.workspacePath, "threadBinding.workspacePath", {
+    required: true,
+    maxLength: 4096,
+  });
+  if (codexProjectKind !== "local" && codexProjectKind !== "remote") {
+    throw new ApiError(400, "INVALID_FIELD", "threadBinding.codexProjectKind must be local or remote");
+  }
+  if (
+    (codexProjectKind === "local" && codexHostId !== "local")
+    || (codexProjectKind === "remote" && codexHostId === "local")
+    || workspacePath.includes("\0")
+  ) {
+    throw new ApiError(400, "INVALID_FIELD", "Thread project identity is invalid");
+  }
+  return { threadId, codexProjectId, codexProjectKind, codexHostId, workspacePath };
 }
 
 function requestHeader(request, name) {
@@ -790,19 +868,11 @@ function resolveAssignee(target, actor) {
   return actor;
 }
 
-function parseWorkflowId(value) {
-  const workflowId = stringField(value, "workflowId", { nullable: true, maxLength: 128 });
-  if (workflowId === "") {
-    throw new ApiError(400, "INVALID_FIELD", "'workflowId' cannot be empty");
-  }
-  return workflowId;
-}
-
 function parseTaskCreate(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
-    "projectId", "title", "description", "status", "priority", "labels", "sortOrder", "threadId",
-    "assigneeTarget", "workflowId", "developmentContext", "startDate", "dueDate", "recurrence",
+    "projectId", "title", "description", "status", "priority", "labels", "sortOrder", "threadId", "threadBinding",
+    "assigneeTarget", "developmentContext", "startDate", "dueDate", "recurrence",
   ]));
   const projectId = validateProjectId(body.projectId ?? DEFAULT_PROJECT_ID);
   const task = {
@@ -814,8 +884,8 @@ function parseTaskCreate(body) {
     labels: body.labels === undefined ? [] : parseLabels(body.labels),
     sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
     threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
     assigneeTarget: parseAssigneeTarget(body.assigneeTarget),
-    workflowId: parseWorkflowId(body.workflowId ?? null),
     developmentContext: parseDevelopmentContext(body.developmentContext ?? null),
     startDate: parseDueDate(body.startDate ?? null, "startDate"),
     dueDate: parseDueDate(body.dueDate ?? null),
@@ -830,11 +900,12 @@ function parseTaskCreate(body) {
 function parseTaskPatch(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
-    "version", "projectId", "title", "description", "status", "priority", "labels", "threadId",
-    "assigneeTarget", "workflowId", "developmentContext", "startDate", "dueDate", "recurrence",
+    "version", "projectId", "title", "description", "status", "priority", "labels", "threadId", "threadBinding",
+    "assigneeTarget", "developmentContext", "startDate", "dueDate", "recurrence",
   ]));
   const version = parseVersion(body.version);
   const threadId = parseThreadId(body.threadId);
+  const threadBinding = parseThreadBinding(body.threadBinding);
   const assigneeTarget = parseAssigneeTarget(body.assigneeTarget);
   const changes = {};
   if (body.projectId !== undefined) changes.projectId = validateProjectId(body.projectId);
@@ -843,7 +914,6 @@ function parseTaskPatch(body) {
   if (body.status !== undefined) changes.status = parseStatus(body.status);
   if (body.priority !== undefined) changes.priority = parsePriority(body.priority);
   if (body.labels !== undefined) changes.labels = parseLabels(body.labels);
-  if (body.workflowId !== undefined) changes.workflowId = parseWorkflowId(body.workflowId);
   if (body.developmentContext !== undefined) changes.developmentContext = parseDevelopmentContext(body.developmentContext);
   if (body.startDate !== undefined) changes.startDate = parseDueDate(body.startDate, "startDate");
   if (body.dueDate !== undefined) changes.dueDate = parseDueDate(body.dueDate);
@@ -854,24 +924,48 @@ function parseTaskPatch(body) {
   if (Object.keys(changes).length === 0 && assigneeTarget === undefined) {
     throw new ApiError(400, "INVALID_BODY", "PATCH requires at least one task field");
   }
-  return { version, changes, threadId, assigneeTarget };
+  return { version, changes, threadId, threadBinding, assigneeTarget };
 }
 
 function parseMove(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["version", "status", "sortOrder", "threadId"]));
+  assertAllowedKeys(body, new Set(["version", "status", "sortOrder", "threadId", "threadBinding"]));
   return {
     version: parseVersion(body.version),
     status: parseStatus(body.status),
     sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
     threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
   };
 }
 
 function parseArchive(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["version", "threadId"]));
-  return { version: parseVersion(body.version), threadId: parseThreadId(body.threadId) };
+  assertAllowedKeys(body, new Set(["version", "threadId", "threadBinding"]));
+  return {
+    version: parseVersion(body.version),
+    threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
+  };
+}
+
+function parseRelationOrigin(value) {
+  if (value === undefined) return undefined;
+  if (value !== "manual" && value !== "mention") {
+    throw new ApiError(400, "INVALID_FIELD", "'origin' must be manual or mention");
+  }
+  return value;
+}
+
+function parseRelationMutation(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["version", "threadId", "threadBinding", "origin"]));
+  return {
+    version: parseVersion(body.version),
+    threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
+    origin: parseRelationOrigin(body.origin),
+  };
 }
 
 function parseIssueRelationType(value) {
@@ -887,16 +981,17 @@ function parseIssueRelationType(value) {
 
 function parseCommentCreate(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["body", "threadId"]));
+  assertAllowedKeys(body, new Set(["body", "threadId", "threadBinding"]));
   return {
     body: stringField(body.body ?? "", "body", { maxLength: 100_000 }),
     threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
   };
 }
 
 function parseCommentPatch(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["version", "body", "threadId"]));
+  assertAllowedKeys(body, new Set(["version", "body", "threadId", "threadBinding"]));
   if (body.body === undefined) {
     throw new ApiError(400, "INVALID_FIELD", "'body' is required");
   }
@@ -904,10 +999,11 @@ function parseCommentPatch(body) {
     version: parseVersion(body.version),
     body: stringField(body.body, "body", { maxLength: 100_000 }),
     threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
   };
 }
 
-function parseAttachmentHeaders(request) {
+function parseAttachmentHeaders(request, { requireKind = true } = {}) {
   const encodedFilename = request.headers["x-taskboard-filename"];
   if (typeof encodedFilename !== "string") {
     throw new ApiError(400, "INVALID_FILENAME", "X-Taskboard-Filename is required");
@@ -935,11 +1031,21 @@ function parseAttachmentHeaders(request) {
   if (contentType.length === 0 || contentType.length > 200 || !/^[!#$%&'*+.^_`|~0-9a-z-]+\/[!#$%&'*+.^_`|~0-9a-z-]+$/.test(contentType)) {
     throw new ApiError(415, "UNSUPPORTED_MEDIA_TYPE", "Attachment Content-Type is invalid");
   }
-  return { filename, contentType };
+  const kind = request.headers["x-taskboard-attachment-kind"] ?? (
+    requireKind ? null : "attachment"
+  );
+  if (kind !== "inline" && kind !== "attachment") {
+    throw new ApiError(
+      400,
+      "INVALID_ATTACHMENT_KIND",
+      "X-Taskboard-Attachment-Kind must be inline or attachment",
+    );
+  }
+  return { filename, contentType, kind };
 }
 
 function parseArtifactHeaders(request) {
-  const metadata = parseAttachmentHeaders(request);
+  const metadata = parseAttachmentHeaders(request, { requireKind: false });
   if (!metadata.filename.toLowerCase().endsWith(".zip")) {
     throw new ApiError(400, "INVALID_ARTIFACT_TYPE", "Artifact must be a .zip file");
   }
@@ -1043,6 +1149,28 @@ function parseArtifactUploadListFilters(searchParams) {
   return { projectId: validateProjectId(searchParams.get("projectId")) };
 }
 
+function parseTaskTreeQuery(searchParams) {
+  const allowed = new Set(["direction", "depth"]);
+  for (const key of searchParams.keys()) {
+    if (!allowed.has(key)) {
+      throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", `Unknown query parameter '${key}'`);
+    }
+    if (searchParams.getAll(key).length !== 1) {
+      throw new ApiError(400, "INVALID_TREE_QUERY", `Query parameter '${key}' cannot be repeated`);
+    }
+  }
+  const direction = searchParams.get("direction");
+  if (direction !== "descendants" && direction !== "ancestors") {
+    throw new ApiError(400, "INVALID_TREE_QUERY", "'direction' must be descendants or ancestors");
+  }
+  const rawDepth = searchParams.get("depth");
+  const depth = Number(rawDepth);
+  if (!/^\d+$/.test(rawDepth ?? "") || !Number.isSafeInteger(depth) || depth < 1 || depth > 25) {
+    throw new ApiError(400, "INVALID_TREE_QUERY", "'depth' must be an integer from 1 to 25");
+  }
+  return { direction, depth };
+}
+
 function parseAiSandbox(value) {
   if (value === undefined) return undefined;
   if (!["read-only", "workspace-write", "danger-full-access"].includes(value)) {
@@ -1063,6 +1191,43 @@ function parseAiSetting(value, name, maxLength) {
   return setting;
 }
 
+function parseAiExecutionTarget(value) {
+  const fields = [
+    "codexProjectId",
+    "codexProjectKind",
+    "codexHostId",
+    "workspacePath",
+  ];
+  const present = fields.filter((field) => value[field] !== undefined);
+  if (present.length === 0) return undefined;
+  if (present.length !== fields.length) {
+    throw new ApiError(400, "INVALID_CODEX_TARGET", "Codex project identity must contain all four fields");
+  }
+  const codexProjectKind = parseAiSetting(value.codexProjectKind, "codexProjectKind", 16);
+  if (codexProjectKind !== "local" && codexProjectKind !== "remote") {
+    throw new ApiError(400, "INVALID_CODEX_TARGET", "'codexProjectKind' must be local or remote");
+  }
+  const workspacePath = parseAiSetting(value.workspacePath, "workspacePath", 4096);
+  if (workspacePath.includes("\0")) {
+    throw new ApiError(400, "INVALID_CODEX_TARGET", "'workspacePath' cannot contain null bytes");
+  }
+  return {
+    codexProjectId: parseAiSetting(value.codexProjectId, "codexProjectId", 256),
+    codexProjectKind,
+    codexHostId: parseAiSetting(value.codexHostId, "codexHostId", 512),
+    workspacePath,
+  };
+}
+
+function aiExecutionTargetFromQuery(searchParams) {
+  return parseAiExecutionTarget({
+    codexProjectId: searchParams.get("codexProjectId") ?? undefined,
+    codexProjectKind: searchParams.get("codexProjectKind") ?? undefined,
+    codexHostId: searchParams.get("codexHostId") ?? undefined,
+    workspacePath: searchParams.get("workspacePath") ?? undefined,
+  });
+}
+
 function parseAiThreadCreate(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
@@ -1072,6 +1237,10 @@ function parseAiThreadCreate(body) {
     "model",
     "reasoningEffort",
     "sandbox",
+    "codexProjectId",
+    "codexProjectKind",
+    "codexHostId",
+    "workspacePath",
   ]));
   return {
     projectId: validateProjectId(body.projectId),
@@ -1080,6 +1249,7 @@ function parseAiThreadCreate(body) {
     model: parseAiSetting(body.model, "model", 128),
     reasoningEffort: parseAiSetting(body.reasoningEffort, "reasoningEffort", 64),
     sandbox: parseAiSandbox(body.sandbox),
+    ...parseAiExecutionTarget(body),
   };
 }
 
@@ -1167,6 +1337,7 @@ function parseAiAttachments(value) {
 
 function parseAiTurn(body) {
   assertPlainObject(body);
+  if (body.contractVersion !== undefined) return parseComposerTurn(body);
   assertAllowedKeys(body, new Set([
     "message",
     "skillIds",
@@ -1275,6 +1446,365 @@ function parseExecutionBody(body) {
     throw new ApiError(400, "INVALID_FIELD", "'trigger' must be manual, move, or automatic");
   }
   return { trigger };
+}
+
+function parseComposerCandidateQuery(searchParams) {
+  assertAllowedQuery(
+    searchParams,
+    new Set([
+      "projectId",
+      "threadId",
+      "trigger",
+      "query",
+      "surface",
+      "codexProjectId",
+      "codexProjectKind",
+      "codexHostId",
+      "workspacePath",
+    ]),
+    "GET /api/local/ai/composer/candidates",
+  );
+  let projectId;
+  const rawProjectId = searchParams.get("projectId");
+  if (rawProjectId !== null) {
+    try {
+      projectId = validateProjectId(rawProjectId);
+    } catch {
+      throw new ApiError(400, "INVALID_COMPOSER_QUERY", "Composer project id is invalid");
+    }
+  }
+  const trigger = searchParams.get("trigger");
+  if (trigger !== "/" && trigger !== "@") {
+    throw new ApiError(400, "INVALID_COMPOSER_QUERY", "Composer trigger must be '/' or '@'");
+  }
+  const query = searchParams.get("query") ?? "";
+  if (query.length > 256) {
+    throw new ApiError(400, "INVALID_COMPOSER_QUERY", "Composer query cannot exceed 256 characters");
+  }
+  let threadId;
+  try {
+    threadId = parseThreadId(searchParams.get("threadId") ?? undefined);
+  } catch {
+    throw new ApiError(400, "INVALID_COMPOSER_QUERY", "Composer thread id is invalid");
+  }
+  const surface = searchParams.get("surface") ?? "ai-chat";
+  if (!new Set(["ai-chat", "issue-description", "comment"]).has(surface)) {
+    throw new ApiError(400, "INVALID_COMPOSER_QUERY", "Composer surface is invalid");
+  }
+  return {
+    projectId,
+    threadId,
+    trigger,
+    query,
+    surface,
+    ...aiExecutionTargetFromQuery(searchParams),
+  };
+}
+
+function invalidComposerRebindRequest(message) {
+  return new ApiError(400, "INVALID_COMPOSER_REBIND_REQUEST", message);
+}
+
+function assertComposerRebindKeys(value, allowed, field) {
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) {
+      throw invalidComposerRebindRequest(`'${field}.${key}' is not allowed`);
+    }
+  }
+}
+
+function parseComposerRebindRequest(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw invalidComposerRebindRequest("Composer rebind body must be an object");
+  }
+  assertComposerRebindKeys(
+    value,
+    new Set(["contractVersion", "projectId", "threadId", "document"]),
+    "body",
+  );
+  if (value.contractVersion !== "composer.v1") {
+    throw invalidComposerRebindRequest("'contractVersion' must be 'composer.v1'");
+  }
+  let projectId;
+  try {
+    projectId = validateProjectId(value.projectId);
+  } catch {
+    throw invalidComposerRebindRequest("'projectId' is invalid");
+  }
+  let threadId;
+  try {
+    threadId = parseThreadId(value.threadId);
+  } catch {
+    throw invalidComposerRebindRequest("'threadId' is invalid");
+  }
+  const document = value.document;
+  if (!document || typeof document !== "object" || Array.isArray(document)) {
+    throw invalidComposerRebindRequest("'document' must be an object");
+  }
+  assertComposerRebindKeys(document, new Set(["version", "nodes"]), "document");
+  if (document.version !== 1) {
+    throw invalidComposerRebindRequest("'document.version' must be 1");
+  }
+  if (!Array.isArray(document.nodes) || document.nodes.length > 200) {
+    throw invalidComposerRebindRequest("'document.nodes' must contain at most 200 entries");
+  }
+  let textLength = 0;
+  const nodes = document.nodes.map((node, nodeIndex) => {
+    if (!node || typeof node !== "object" || Array.isArray(node)) {
+      throw invalidComposerRebindRequest(`'document.nodes[${nodeIndex}]' must be an object`);
+    }
+    if (node.type === "text") {
+      assertComposerRebindKeys(node, new Set(["type", "text"]), `document.nodes[${nodeIndex}]`);
+      if (typeof node.text !== "string") {
+        throw invalidComposerRebindRequest(`'document.nodes[${nodeIndex}].text' must be a string`);
+      }
+      textLength += node.text.length;
+      return { type: "text", text: node.text };
+    }
+    if (node.type === "unsupportedReference") {
+      assertComposerRebindKeys(
+        node,
+        new Set(["type", "referenceUri", "label"]),
+        `document.nodes[${nodeIndex}]`,
+      );
+      if (typeof node.label !== "string" || node.label.length === 0 || node.label.length > 256) {
+        throw invalidComposerRebindRequest(`'document.nodes[${nodeIndex}].label' is invalid`);
+      }
+      if (typeof node.referenceUri !== "string" || node.referenceUri.length > 1_024) {
+        throw invalidComposerRebindRequest(
+          `'document.nodes[${nodeIndex}].referenceUri' is invalid`,
+        );
+      }
+      const match = /^taskboard:\/\/composer-reference\/([^/]+)\/([^/]+)\/([^/]+)$/.exec(
+        node.referenceUri,
+      );
+      if (!match) {
+        throw invalidComposerRebindRequest(
+          `'document.nodes[${nodeIndex}].referenceUri' is not a composer reference marker`,
+        );
+      }
+      try {
+        decodeComposerReferenceKey(match[3]);
+      } catch {
+        throw invalidComposerRebindRequest(
+          `'document.nodes[${nodeIndex}].referenceUri' has an invalid reference key`,
+        );
+      }
+      const reasonCode = match[1] !== "v1"
+        ? "REFERENCE_FORMAT_UNSUPPORTED"
+        : !new Set(["skill", "agent"]).has(match[2])
+          ? "REFERENCE_KIND_UNSUPPORTED"
+          : null;
+      if (!reasonCode) {
+        throw invalidComposerRebindRequest(
+          `'document.nodes[${nodeIndex}]' must use persistedReference for supported markers`,
+        );
+      }
+      return {
+        type: "unsupportedReference",
+        referenceUri: node.referenceUri,
+        label: node.label,
+        reasonCode,
+      };
+    }
+    if (node.type !== "persistedReference") {
+      throw invalidComposerRebindRequest(
+        `'document.nodes[${nodeIndex}].type' must be text, persistedReference or unsupportedReference`,
+      );
+    }
+    assertComposerRebindKeys(
+      node,
+      new Set(["type", "referenceKind", "referenceKey", "label"]),
+      `document.nodes[${nodeIndex}]`,
+    );
+    if (node.referenceKind !== "skill" && node.referenceKind !== "agent") {
+      throw invalidComposerRebindRequest(
+        `'document.nodes[${nodeIndex}].referenceKind' must be skill or agent`,
+      );
+    }
+    if (
+      typeof node.referenceKey !== "string"
+      || node.referenceKey.length === 0
+      || node.referenceKey.length > 512
+    ) {
+      throw invalidComposerRebindRequest(
+        `'document.nodes[${nodeIndex}].referenceKey' is invalid`,
+      );
+    }
+    if (typeof node.label !== "string" || node.label.length === 0 || node.label.length > 256) {
+      throw invalidComposerRebindRequest(`'document.nodes[${nodeIndex}].label' is invalid`);
+    }
+    let stableId;
+    try {
+      stableId = decodeComposerReferenceKey(node.referenceKey);
+    } catch {
+      throw invalidComposerRebindRequest(
+        `'document.nodes[${nodeIndex}].referenceKey' is not canonical base64url`,
+      );
+    }
+    if (node.referenceKind === "skill" && stableId !== stableId.normalize("NFC")) {
+      throw invalidComposerRebindRequest(
+        `'document.nodes[${nodeIndex}].referenceKey' does not contain an NFC Skill name`,
+      );
+    }
+    return {
+      type: "persistedReference",
+      referenceKind: node.referenceKind,
+      referenceKey: node.referenceKey,
+      label: node.label,
+      stableId,
+    };
+  });
+  if (textLength > 100_000) {
+    throw invalidComposerRebindRequest("Composer text cannot exceed 100000 characters");
+  }
+  return {
+    contractVersion: "composer.v1",
+    projectId,
+    threadId,
+    document: { version: 1, nodes },
+  };
+}
+
+async function resolveComposerRebindWorkspace(aiChat, input) {
+  let thread;
+  if (input.threadId !== undefined) {
+    try {
+      thread = aiChat.getThread(input.threadId);
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "AI_CHAT_THREAD_NOT_FOUND") {
+        throw new ApiError(400, "INVALID_COMPOSER_QUERY", "Composer thread does not exist");
+      }
+      throw error;
+    }
+    if (thread.origin.projectId !== input.projectId) {
+      throw new ApiError(
+        400,
+        "INVALID_COMPOSER_QUERY",
+        "Composer thread does not belong to the selected project",
+      );
+    }
+    if (thread.origin.codexProjectKind !== "remote") {
+      try {
+        if (!(await stat(thread.origin.workspacePath)).isDirectory()) throw new Error("not a directory");
+      } catch {
+        throw new ApiError(
+          409,
+          "PROJECT_WORKSPACE_UNAVAILABLE",
+          "The conversation workspace is not available on this device",
+        );
+      }
+    }
+    return {
+      workspacePath: thread.origin.workspacePath,
+      composerCatalog: aiChat.composerCatalogForThread(thread),
+    };
+  }
+  let resolved;
+  try {
+    resolved = await aiChat.resolveContext(input.projectId, thread?.origin.issueId);
+  } catch (error) {
+    if (
+      error instanceof ApiError
+      && ["PROJECT_NOT_FOUND", "AI_CHAT_ISSUE_NOT_FOUND"].includes(error.code)
+    ) {
+      throw new ApiError(400, "INVALID_COMPOSER_QUERY", "Composer project is invalid");
+    }
+    throw error;
+  }
+  return { workspacePath: resolved.workspacePath, composerCatalog: aiChat.composerCatalog };
+}
+
+function parseComposerDocument(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set(["version", "nodes"]));
+  if (value.version !== 1) {
+    throw new ApiError(400, "INVALID_COMPOSER_DOCUMENT", "'document.version' must be 1");
+  }
+  if (!Array.isArray(value.nodes) || value.nodes.length > 200) {
+    throw new ApiError(
+      400,
+      "INVALID_COMPOSER_DOCUMENT",
+      "'document.nodes' must be an array with at most 200 entries",
+    );
+  }
+  let textLength = 0;
+  const nodes = value.nodes.map((node, index) => {
+    assertPlainObject(node);
+    if (typeof node.type !== "string" || !node.type) {
+      throw new ApiError(
+        400,
+        "INVALID_COMPOSER_DOCUMENT",
+        `'document.nodes[${index}].type' is required`,
+      );
+    }
+    if (node.type === "text") {
+      assertAllowedKeys(node, new Set(["type", "text"]));
+      if (typeof node.text !== "string") {
+        throw new ApiError(
+          400,
+          "INVALID_COMPOSER_DOCUMENT",
+          `'document.nodes[${index}].text' must be a string`,
+        );
+      }
+      textLength += node.text.length;
+      return { type: "text", text: node.text };
+    }
+    if (node.type === "skill" || node.type === "agent") {
+      assertAllowedKeys(node, new Set(["type", "candidateRef", "label"]));
+      return {
+        type: node.type,
+        candidateRef: stringField(
+          node.candidateRef,
+          `document.nodes[${index}].candidateRef`,
+          { required: true, maxLength: 512 },
+        ),
+        label: stringField(node.label, `document.nodes[${index}].label`, {
+          required: true,
+          maxLength: 256,
+        }),
+      };
+    }
+    return { type: node.type };
+  });
+  if (textLength > 100_000) {
+    throw new ApiError(
+      400,
+      "INVALID_COMPOSER_DOCUMENT",
+      "Composer text cannot exceed 100000 characters",
+    );
+  }
+  return { version: 1, nodes };
+}
+
+function parseComposerTurn(body) {
+  assertAllowedKeys(body, new Set([
+    "contractVersion",
+    "revision",
+    "document",
+    "dangerFullAccessConfirmed",
+    "attachments",
+  ]));
+  if (body.contractVersion !== "composer.v1") {
+    throw new ApiError(
+      400,
+      "INVALID_COMPOSER_DOCUMENT",
+      "'contractVersion' must be 'composer.v1'",
+    );
+  }
+  if (
+    body.dangerFullAccessConfirmed !== undefined
+    && typeof body.dangerFullAccessConfirmed !== "boolean"
+  ) {
+    throw new ApiError(400, "INVALID_FIELD", "'dangerFullAccessConfirmed' must be a boolean");
+  }
+  return {
+    contractVersion: "composer.v1",
+    revision: stringField(body.revision, "revision", { required: true, maxLength: 512 }),
+    document: parseComposerDocument(body.document),
+    dangerFullAccessConfirmed: body.dangerFullAccessConfirmed,
+    attachments: parseAiAttachments(body.attachments),
+  };
 }
 
 class EventHub {
@@ -1425,17 +1955,26 @@ async function resolveProjectWorkspace(project, codexProjectId, codexThreadId, c
   }
 }
 
-function parseWorktrees(output) {
+async function parseWorktrees(output) {
   const contexts = [];
   for (const block of output.trim().split(/\n\s*\n/)) {
     if (!block) continue;
     let worktreePath = "";
     let branch = null;
+    let prunable = false;
     for (const line of block.split("\n")) {
       if (line.startsWith("worktree ")) worktreePath = line.slice(9);
       if (line.startsWith("branch refs/heads/")) branch = line.slice(18);
+      if (line.startsWith("prunable")) prunable = true;
     }
-    if (worktreePath) contexts.push({ type: "worktree", path: worktreePath, branch });
+    if (!worktreePath || prunable) continue;
+    try {
+      await stat(worktreePath);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+    contexts.push({ type: "worktree", path: worktreePath, branch });
   }
   return contexts;
 }
@@ -1467,7 +2006,7 @@ async function scanDevelopmentContexts(workspacePath, processEnv = process.env) 
       workspacePath: root,
       contexts: [
         ...branches.map((branch) => ({ type: "branch", branch })),
-        ...parseWorktrees(worktreesResult.stdout),
+        ...(await parseWorktrees(worktreesResult.stdout)),
       ],
     };
   } catch {
@@ -1627,19 +2166,20 @@ async function discoverWorkflowCapabilities(resolved, workspacePath, processEnv)
 }
 
 export function resolveServerOptions(options = {}) {
-  const configuredDataDirectory = options.dataDirectory ?? process.env.CODEX_TASKBOARD_DATA_DIR;
+  const environment = options.processEnv ?? process.env;
+  const configuredDataDirectory = options.dataDirectory ?? environment.CODEX_TASKBOARD_DATA_DIR;
   const dataDirectory = configuredDataDirectory
     ? path.resolve(configuredDataDirectory)
     : path.join(PROJECT_ROOT, ".data");
   const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
   const instanceToken = String(
-    options.instanceToken ?? process.env.CODEX_TASKBOARD_INSTANCE_TOKEN ?? "",
+    options.instanceToken ?? environment.CODEX_TASKBOARD_INSTANCE_TOKEN ?? "",
   ).trim();
   if (instanceToken && !/^[a-z0-9-]{16,128}$/i.test(instanceToken)) {
     throw new Error("CODEX_TASKBOARD_INSTANCE_TOKEN must be an identifier");
   }
   const instanceSecret = String(
-    options.instanceSecret ?? process.env.CODEX_TASKBOARD_INSTANCE_SECRET ?? "",
+    options.instanceSecret ?? environment.CODEX_TASKBOARD_INSTANCE_SECRET ?? "",
   ).trim();
   if (instanceToken && !/^[a-f0-9-]{32,128}$/i.test(instanceSecret)) {
     throw new Error("CODEX_TASKBOARD_INSTANCE_SECRET must be set in launcher mode");
@@ -1659,9 +2199,12 @@ export function resolveServerOptions(options = {}) {
     feishuBridgeSecret: options.feishuBridgeSecret
       ?? process.env.CODEX_FEISHU_BRIDGE_SECRET
       ?? null,
+    jiraConfigPath: options.jiraConfigPath ?? path.join(dataDirectory, "jira-connection.json"),
     clientStoragePath: options.clientStoragePath ?? path.join(dataDirectory, "client-storage.json"),
     staticDirectory: options.staticDirectory ?? path.join(PROJECT_ROOT, "dist", "web"),
-    skillPath: options.skillPath ?? path.join(PROJECT_ROOT, "skills", "manage-taskboard", "SKILL.md"),
+    skillPath: options.skillPath
+      ?? environment.CODEX_TASKBOARD_SKILL_PATH
+      ?? path.join(PROJECT_ROOT, "skills", "manage-taskboard", "SKILL.md"),
     codexExecutable: resolveCodexExecutable({ explicit: options.codexExecutable }),
     codexStatePath: options.codexStatePath
       ?? path.join(codexHome, ".codex-global-state.json"),
@@ -1669,8 +2212,9 @@ export function resolveServerOptions(options = {}) {
       ?? path.join(codexHome, "process_manager", "chat_processes.json"),
     instanceToken,
     instanceSecret,
+    trustedOrigins: parseTrustedOrigins(environment[TRUSTED_ORIGINS_ENV]),
     version: String(
-      options.version ?? process.env.CODEX_TASKBOARD_VERSION ?? "development",
+      options.version ?? environment.CODEX_TASKBOARD_VERSION ?? "development",
     ).trim(),
   };
 }
@@ -2011,11 +2555,15 @@ export function createTaskboardServer(options = {}) {
     }
   }
 
-  async function updateClientStorage(body) {
+  function parseClientStorageUpdate(body) {
     assertPlainObject(body);
     assertAllowedKeys(body, new Set(["key", "value"]));
     const key = stringField(body.key, "key", { required: true, maxLength: 512 });
     const value = stringField(body.value, "value", { nullable: true, maxLength: 100_000 });
+    return { key, value };
+  }
+
+  async function updateClientStorage({ key, value }) {
     clientStorageWrite = clientStorageWrite.catch(() => {}).then(async () => {
       const entries = await readClientStorage();
       if (value === null) delete entries[key];
@@ -2032,9 +2580,41 @@ export function createTaskboardServer(options = {}) {
   const cloudConfig = options.cloudConfigStore ?? createCloudConfigStore({
     configPath: resolved.cloudConfigPath,
   });
+  const jiraConfig = options.jiraConfigStore ?? createJiraConfigStore({
+    configPath: resolved.jiraConfigPath,
+  });
+  const jira = createJiraIntegration({
+    configStore: jiraConfig,
+    database,
+    fetch: options.jiraFetch ?? globalThis.fetch,
+  });
+  let hostRuntime = null;
+  function currentHostThreadBinding(threadId) {
+    if (
+      !hostRuntime
+      || hostRuntime.threadId !== threadId
+      || !hostRuntime.codexProjectId
+      || !hostRuntime.codexProjectKind
+      || !hostRuntime.codexHostId
+      || !hostRuntime.workspacePath
+    ) return undefined;
+    return {
+      threadId,
+      codexProjectId: hostRuntime.codexProjectId,
+      codexProjectKind: hostRuntime.codexProjectKind,
+      codexHostId: hostRuntime.codexHostId,
+      workspacePath: hostRuntime.workspacePath,
+    };
+  }
+  function resolveInputThreadBinding(input) {
+    if (input.threadBinding !== undefined) return input;
+    const threadBinding = currentHostThreadBinding(input.threadId);
+    return threadBinding ? { ...input, threadBinding } : input;
+  }
   const cloudProxy = createCloudProxy({
     configStore: cloudConfig,
     fetch: options.remoteFetch ?? globalThis.fetch,
+    resolveThreadBinding: currentHostThreadBinding,
     resolveDevelopmentContext: async (projectId, context) => {
       if (!context.branch) return null;
       const config = await cloudConfig.read();
@@ -2079,9 +2659,27 @@ export function createTaskboardServer(options = {}) {
     return payload;
   }
 
-  async function resolveAiChatContext(projectId, issueId) {
+  async function resolveAiChatContext(projectId, issueId, codexTarget) {
     const config = await cloudConfig.read();
     if (!config.remoteUrl) {
+      if (codexTarget?.codexProjectKind === "remote") {
+        const project = database.getProject(projectId);
+        if (!project) {
+          throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
+        }
+        let issue;
+        if (issueId !== undefined) {
+          issue = database.getTask(issueId);
+          if (!issue || issue.projectId !== projectId || issue.archivedAt != null) {
+            throw new ApiError(
+              404,
+              "AI_CHAT_ISSUE_NOT_FOUND",
+              `Task '${issueId}' is not an active task in project '${projectId}'`,
+            );
+          }
+        }
+        return { project, issue, addDirectories: [], ...codexTarget };
+      }
       let resolvedWorkspace;
       const issue = issueId !== undefined ? database.getTask(issueId) : null;
       if (issueId !== undefined && (!issue || issue.projectId !== projectId || issue.archivedAt != null)) {
@@ -2190,6 +2788,10 @@ export function createTaskboardServer(options = {}) {
       }
     }
 
+    if (codexTarget?.codexProjectKind === "remote") {
+      return { project, issue, addDirectories: [], ...codexTarget };
+    }
+
     const resolvedWorkspace = await resolveMappedAiWorkspace(
       projectId,
       project,
@@ -2205,6 +2807,7 @@ export function createTaskboardServer(options = {}) {
     manageTaskboardSkillPath: resolved.skillPath,
     processEnv: codexProcessEnvironment,
     resolveContext: resolveAiChatContext,
+    remoteAppServerFactory: options.remoteAppServerFactory,
   });
   function executionModeForMetadata(metadata) {
     return metadata?.executionMode === "automatic" || metadata?.mode === "automatic"
@@ -2723,7 +3326,6 @@ export function createTaskboardServer(options = {}) {
   const codexSessionSearches = new Map();
   const codexSessionStateCache = new Map();
   const codexSessionsDirectory = path.join(path.dirname(resolved.codexStatePath), "sessions");
-  let hostRuntime = null;
 
   async function findCodexSession(threadId) {
     const cached = codexSessionSearches.get(threadId);
@@ -2860,7 +3462,11 @@ export function createTaskboardServer(options = {}) {
         request.url = `${incomingUrl.pathname.slice(routePrefix.length) || "/"}${incomingUrl.search}`;
       }
 
-      assertTrustedNetworkRequest(request, Boolean(resolved.instanceToken));
+      const configuredTrustedRequest = assertTrustedNetworkRequest(
+        request,
+        Boolean(resolved.instanceToken),
+        resolved.trustedOrigins,
+      );
       const origin = request.headers.origin;
       const trustedEmbedOrigin = TRUSTED_EMBED_ORIGINS.has(origin)
         || (Boolean(resolved.instanceToken) && origin === "null");
@@ -2903,6 +3509,21 @@ export function createTaskboardServer(options = {}) {
         if (result) return sendJson(response, result.status, result.body);
       }
       const isLocalAiRoute = pathname === "/api/local/ai" || pathname.startsWith("/api/local/ai/");
+      const isDevelopmentContextsRoute = /^\/api\/projects\/[^/]+\/development-contexts$/.test(pathname);
+      if (
+        configuredTrustedRequest
+        && (
+          pathname.startsWith("/api/local/")
+          || pathname === "/api/device-workspaces"
+          || isDevelopmentContextsRoute
+        )
+      ) {
+        throw new ApiError(
+          409,
+          "LOCAL_COMPANION_REQUIRED",
+          "This capability requires a device-local Taskboard origin",
+        );
+      }
       if (isLocalAiRoute) {
         assertAiLoopbackRequest(request);
       } else if (pathname.startsWith("/api/local/")) {
@@ -2947,8 +3568,7 @@ export function createTaskboardServer(options = {}) {
       }
       const isMachineCapabilityRoute = pathname === "/api/meta"
         || pathname === "/api/device-workspaces"
-        || pathname === "/api/workflow-capabilities"
-        || /^\/api\/projects\/[^/]+\/development-contexts$/.test(pathname);
+        || isDevelopmentContextsRoute;
       const capabilityCloudConfig = isMachineCapabilityRoute
         ? await cloudConfig.read()
         : null;
@@ -2976,10 +3596,41 @@ export function createTaskboardServer(options = {}) {
       if (pathname === "/api/client-storage") {
         if (request.method === "GET") {
           await clientStorageWrite;
-          return sendJson(response, 200, { entries: await readClientStorage() });
+          const entries = await readClientStorage();
+          const config = await cloudConfig.read();
+          if (config.remoteUrl) {
+            assertLoopbackRequest(request);
+            const shared = await readCloudJson("/api/client-storage");
+            for (const key of Object.keys(entries)) {
+              if (key.startsWith(PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX)) delete entries[key];
+            }
+            for (const [key, value] of Object.entries(shared.entries)) {
+              if (key.startsWith(PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX)) entries[key] = value;
+            }
+          }
+          return sendJson(response, 200, { entries });
         }
         if (request.method === "PATCH") {
-          await updateClientStorage(await readJson(request));
+          const update = parseClientStorageUpdate(await readJson(request));
+          const config = await cloudConfig.read();
+          if (
+            config.remoteUrl
+            && update.key.startsWith(PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX)
+          ) {
+            assertLoopbackRequest(request);
+            return sendFetchResponse(
+              response,
+              await cloudProxy.forward(new Request("http://127.0.0.1/api/client-storage", {
+                method: "PATCH",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify(update),
+              })),
+            );
+          }
+          await updateClientStorage(update);
+          if (update.key.startsWith(PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX)) {
+            events.emit("client-storage.updated", { key: update.key });
+          }
           return sendEmpty(response, 204);
         }
         return methodNotAllowed(response, ["GET", "PATCH"]);
@@ -3014,7 +3665,15 @@ export function createTaskboardServer(options = {}) {
         if (request.method === "PUT") {
           const body = await readJson(request);
           assertPlainObject(body);
-          assertAllowedKeys(body, new Set(["threadId", "threadRunning", "threadTodoProgress"]));
+          assertAllowedKeys(body, new Set([
+            "threadId",
+            "threadRunning",
+            "threadTodoProgress",
+            "codexProjectId",
+            "codexProjectKind",
+            "codexHostId",
+            "workspacePath",
+          ]));
           const threadId = stringField(body.threadId, "threadId", { required: true, maxLength: 256 });
           if (typeof body.threadRunning !== "boolean") {
             throw new ApiError(400, "INVALID_FIELD", "'threadRunning' must be a boolean");
@@ -3033,6 +3692,21 @@ export function createTaskboardServer(options = {}) {
             threadId,
             threadRunning: body.threadRunning,
             threadTodoProgress,
+            codexProjectId: stringField(body.codexProjectId ?? null, "codexProjectId", {
+              nullable: true,
+              maxLength: 256,
+            }),
+            codexProjectKind: body.codexProjectKind === "local" || body.codexProjectKind === "remote"
+              ? body.codexProjectKind
+              : null,
+            codexHostId: stringField(body.codexHostId ?? null, "codexHostId", {
+              nullable: true,
+              maxLength: 256,
+            }),
+            workspacePath: stringField(body.workspacePath ?? null, "workspacePath", {
+              nullable: true,
+              maxLength: 4096,
+            }),
             updatedAt: Date.now(),
           };
           return sendJson(response, 200, { runtime: hostRuntime });
@@ -3082,6 +3756,62 @@ export function createTaskboardServer(options = {}) {
         return methodNotAllowed(response, ["GET", "PUT", "DELETE"]);
       }
 
+      if (pathname === "/api/local/jira-connection") {
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Jira 连接接口不接受查询参数");
+        }
+        if (request.method === "GET") {
+          return sendJson(response, 200, { connection: await jira.status() });
+        }
+        if (request.method === "PUT") {
+          const activeCloudConfig = await cloudConfig.read();
+          if (activeCloudConfig.remoteUrl) {
+            throw new ApiError(
+              409,
+              "JIRA_LOCAL_MODE_REQUIRED",
+              "Jira 连接当前仅支持本地数据模式，请先退出云端协作模式",
+            );
+          }
+          const body = await readJson(request);
+          assertPlainObject(body);
+          assertAllowedKeys(body, new Set(["baseUrl", "username", "password", "projects"]));
+          const baseUrl = stringField(body.baseUrl, "baseUrl", { required: true, maxLength: 2048 });
+          const username = stringField(body.username ?? "", "username", { maxLength: 254 });
+          const password = body.password ?? "";
+          if (typeof password !== "string") {
+            throw new ApiError(400, "INVALID_FIELD", "'password' must be a string");
+          }
+          if (password.length > 4096) {
+            throw new ApiError(400, "INVALID_FIELD", "'password' cannot exceed 4096 characters");
+          }
+          try {
+            const connection = await jira.configure({
+              baseUrl,
+              username,
+              password,
+              projects: body.projects,
+            });
+            events.emit("project.labels.updated", { project: database.getProject(JIRA_PROJECT_ID) });
+            return sendJson(response, 200, { connection });
+          } catch (error) {
+            if (error instanceof ApiError) throw error;
+            throw new ApiError(400, error.code ?? "INVALID_JIRA_CONFIG", error.message);
+          }
+        }
+        return methodNotAllowed(response, ["GET", "PUT"]);
+      }
+
+      if (pathname === "/api/local/jira-connection/sync") {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Jira 同步接口不接受查询参数");
+        }
+        await assertEmptyRequestBody(request, "POST /api/local/jira-connection/sync");
+        const connection = await jira.sync({ force: true });
+        events.emit("project.labels.updated", { project: database.getProject(JIRA_PROJECT_ID) });
+        return sendJson(response, 200, { connection });
+      }
+
       const projectMappingRoute = pathname.match(/^\/api\/local\/project-mappings\/([^/]+)$/);
       if (projectMappingRoute) {
         if (request.method !== "PUT") return methodNotAllowed(response, ["PUT"]);
@@ -3112,13 +3842,19 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/meta does not accept query parameters");
         }
         return sendJson(response, 200, {
-          manageTaskboardSkillPath: resolved.skillPath,
-          capabilities: { localAiChat: isLoopbackAddress(request.socket.remoteAddress) },
+          ...(configuredTrustedRequest ? {} : { manageTaskboardSkillPath: resolved.skillPath }),
+          capabilities: {
+            localAiChat: !configuredTrustedRequest
+              && isLoopbackAddress(request.socket.remoteAddress),
+          },
           ...(capabilityCloudConfig?.remoteUrl
             ? {
               mode: "cloud",
-              realtime: { transport: "poll", intervalMs: 2000 },
-              localCapabilities: { available: true },
+              realtime: {
+                transport: "websocket",
+                endpoint: "/api/events",
+              },
+              localCapabilities: { available: !configuredTrustedRequest },
             }
             : {}),
         });
@@ -3126,9 +3862,47 @@ export function createTaskboardServer(options = {}) {
 
       if (pathname === "/api/local/ai/catalog") {
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
-        assertAllowedQuery(url.searchParams, new Set(["projectId"]), "GET /api/local/ai/catalog");
+        assertAllowedQuery(url.searchParams, new Set([
+          "projectId",
+          "codexProjectId",
+          "codexProjectKind",
+          "codexHostId",
+          "workspacePath",
+        ]), "GET /api/local/ai/catalog");
         const projectId = validateProjectId(url.searchParams.get("projectId") ?? undefined);
-        return sendJson(response, 200, await aiChat.getCatalog(projectId));
+        return sendJson(
+          response,
+          200,
+          await aiChat.getCatalog(projectId, undefined, aiExecutionTargetFromQuery(url.searchParams)),
+        );
+      }
+
+      if (pathname === "/api/local/ai/composer/candidates") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        const query = parseComposerCandidateQuery(url.searchParams);
+        return sendJson(
+          response,
+          200,
+          await aiChat.composerCatalog.candidatesForSurface(
+            await aiChat.getComposerCandidates(query),
+            query,
+          ),
+        );
+      }
+
+      if (pathname === "/api/local/ai/composer/rebind") {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/ai/composer/rebind");
+        const input = parseComposerRebindRequest(await readJson(request));
+        const { workspacePath, composerCatalog } = await resolveComposerRebindWorkspace(aiChat, input);
+        return sendJson(
+          response,
+          200,
+          await composerCatalog.rebindPersistedReferences({
+            workspacePath,
+            nodes: input.document.nodes,
+          }),
+        );
       }
 
       const projectSummaryRoute = pathname.match(/^\/api\/local\/projects\/([^/]+)\/summary$/);
@@ -3198,6 +3972,16 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 202, { run });
       }
 
+      const aiThreadCompactRoute = pathname.match(/^\/api\/local\/ai\/threads\/([^/]+)\/compact$/);
+      if (aiThreadCompactRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/ai/threads/:id/compact");
+        const threadId = decodeRouteSegment(aiThreadCompactRoute[1], "Thread id");
+        await assertEmptyRequestBody(request, "POST /api/local/ai/threads/:id/compact");
+        const thread = await aiChat.compactThread(threadId);
+        return sendJson(response, 200, { thread });
+      }
+
       const aiThreadRoute = pathname.match(/^\/api\/local\/ai\/threads\/([^/]+)$/);
       if (aiThreadRoute) {
         assertNoQuery(url.searchParams, "/api/local/ai/threads/:id");
@@ -3237,33 +4021,6 @@ export function createTaskboardServer(options = {}) {
         });
       }
 
-      if (pathname === "/api/workflow-capabilities") {
-        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
-        const unknownQuery = [...url.searchParams.keys()].filter((key) => key !== "workspacePath");
-        if (unknownQuery.length > 0) {
-          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", `Unknown query parameter: ${unknownQuery[0]}`);
-        }
-        const workspacePath = stringField(
-          url.searchParams.get("workspacePath") ?? null,
-          "workspacePath",
-          { nullable: true, maxLength: 4096 },
-        );
-        if (workspacePath?.includes("\0")) {
-          throw new ApiError(400, "INVALID_FIELD", "'workspacePath' cannot contain null bytes");
-        }
-        if (workspacePath && !path.isAbsolute(workspacePath)) {
-          throw new ApiError(400, "INVALID_FIELD", "'workspacePath' must be absolute");
-        }
-        return sendJson(
-          response,
-          200,
-          await discoverWorkflowCapabilities(
-            resolved,
-            workspacePath ?? PROJECT_ROOT,
-            codexProcessEnvironment,
-          ),
-        );
-      }
 
       let currentCloudConfig = null;
       if (pathname.startsWith("/api/")) {
@@ -3362,6 +4119,105 @@ export function createTaskboardServer(options = {}) {
             workflowVersion: workflow.version,
           });
           return sendJson(response, 200, { workflow });
+        }
+        return methodNotAllowed(response, ["GET", "PUT"]);
+      }
+
+      const projectLabelsRoute = pathname.match(/^\/api\/projects\/([^/]+)\/labels$/);
+      if (projectLabelsRoute) {
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Project label routes do not accept query parameters");
+        }
+        let projectId;
+        try {
+          projectId = decodeURIComponent(projectLabelsRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Project id contains invalid encoding");
+        }
+        validateProjectId(projectId);
+        if (request.method !== "POST" && request.method !== "DELETE") {
+          return methodNotAllowed(response, ["POST", "DELETE"]);
+        }
+        if (request.method === "DELETE" && projectId === JIRA_PROJECT_ID) {
+          throw new ApiError(
+            409,
+            "JIRA_LABEL_CATALOG_DELETE_UNAVAILABLE",
+            "Jira 标签目录由同步管理，不能在 Taskboard 中删除",
+          );
+        }
+        const label = parseProjectLabel(await readJson(request));
+        const project = request.method === "POST"
+          ? database.addProjectLabel(projectId, label)
+          : database.deleteProjectLabel(projectId, label);
+        events.emit("project.labels.updated", { project });
+        return sendJson(response, 200, { project });
+      }
+
+      const projectReadmeAttachmentsRoute = pathname.match(
+        /^\/api\/projects\/([^/]+)\/readme\/attachments$/,
+      );
+      if (projectReadmeAttachmentsRoute) {
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Project README attachment routes do not accept query parameters");
+        }
+        let projectId;
+        try {
+          projectId = decodeURIComponent(projectReadmeAttachmentsRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Project id contains invalid encoding");
+        }
+        validateProjectId(projectId);
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const metadata = parseAttachmentHeaders(request);
+        if (metadata.kind !== "inline") {
+          throw new ApiError(400, "INVALID_ATTACHMENT_KIND", "Project README attachments must be inline");
+        }
+        const body = await readBody(request, ATTACHMENT_BODY_LIMIT, "Attachment cannot exceed 25 MiB");
+        const id = randomUUID();
+        await mkdir(resolved.attachmentsDirectory, { recursive: true });
+        const storagePath = path.join(resolved.attachmentsDirectory, id);
+        await writeFile(storagePath, body, { flag: "wx" });
+        let attachment;
+        try {
+          attachment = database.createProjectReadmeAttachment(projectId, {
+            id,
+            ...metadata,
+            size: body.length,
+          });
+        } catch (error) {
+          await unlink(storagePath);
+          throw error;
+        }
+        return sendJson(response, 201, { attachment });
+      }
+
+      const projectReadmeRoute = pathname.match(/^\/api\/projects\/([^/]+)\/readme$/);
+      if (projectReadmeRoute) {
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Project README routes do not accept query parameters");
+        }
+        let projectId;
+        try {
+          projectId = decodeURIComponent(projectReadmeRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Project id contains invalid encoding");
+        }
+        validateProjectId(projectId);
+        if (request.method === "GET") {
+          return sendJson(response, 200, { readme: database.getProjectReadme(projectId) });
+        }
+        if (request.method === "PUT") {
+          const input = parseProjectReadmeSave(await readJson(
+            request,
+            PROJECT_README_BODY_LIMIT,
+            "Project README request cannot exceed 3 MiB",
+          ));
+          const readme = database.saveProjectReadme(projectId, input.content, input.version);
+          events.emit("project.readme.updated", {
+            projectId,
+            readmeVersion: readme.version,
+          });
+          return sendJson(response, 200, { readme });
         }
         return methodNotAllowed(response, ["GET", "PUT"]);
       }
@@ -3536,11 +4392,21 @@ export function createTaskboardServer(options = {}) {
 
       if (pathname === "/api/tasks") {
         if (request.method === "GET") {
-          return sendJson(response, 200, { tasks: database.listTasks(parseTaskFilters(url.searchParams)) });
+          const filters = parseTaskFilters(url.searchParams);
+          if (!filters.projectId || filters.projectId === JIRA_PROJECT_ID) await jira.sync();
+          return sendJson(response, 200, { tasks: database.listTasks(filters) });
         }
         if (request.method === "POST") {
           const actor = actorFromRequest(request);
-          const { assigneeTarget, ...input } = parseTaskCreate(await readJson(request));
+          const { assigneeTarget, ...parsedInput } = parseTaskCreate(await readJson(request));
+          const input = resolveInputThreadBinding(parsedInput);
+          if (input.projectId === JIRA_PROJECT_ID) {
+            throw new ApiError(
+              409,
+              "JIRA_CREATE_UNAVAILABLE",
+              "请在 Jira 中新建议题，Taskboard 当前只同步已分配给你的任务",
+            );
+          }
           const task = database.createTask({
             ...input,
             actor,
@@ -3600,27 +4466,35 @@ export function createTaskboardServer(options = {}) {
         }
         const relationType = parseIssueRelationType(type);
         if (request.method === "POST") {
-          const { version, threadId } = parseArchive(await readJson(request));
+          const { version, threadId, threadBinding, origin } = resolveInputThreadBinding(
+            parseRelationMutation(await readJson(request)),
+          );
           const result = database.addTaskRelation(
             taskId,
             version,
             relationType,
             relatedTaskId,
             threadId,
+            threadBinding,
             actorFromRequest(request),
+            origin,
           );
           events.emit("task.relation.updated", result);
           return sendJson(response, 200, result);
         }
         if (request.method === "DELETE") {
-          const { version, threadId } = parseArchive(await readJson(request));
+          const { version, threadId, threadBinding, origin } = resolveInputThreadBinding(
+            parseRelationMutation(await readJson(request)),
+          );
           const result = database.removeTaskRelation(
             taskId,
             version,
             relationType,
             relatedTaskId,
             threadId,
+            threadBinding,
             actorFromRequest(request),
+            origin,
           );
           events.emit("task.relation.updated", result);
           return sendJson(response, 200, result);
@@ -3659,15 +4533,22 @@ export function createTaskboardServer(options = {}) {
         if (taskId.length === 0 || taskId.length > 128) {
           throw new ApiError(400, "INVALID_PATH", "Task id is invalid");
         }
+        if (request.method === "GET") {
+          const after = parseAfterCursor(url.searchParams, "Comment routes");
+          const comments = after
+            ? database.listCommentsAfter(taskId, after)
+            : database.listComments(taskId);
+          return sendJson(response, 200, {
+            comments,
+            nextCursor: nextCursor(comments, after),
+          });
+        }
         if ([...url.searchParams.keys()].length > 0) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Comment routes do not accept query parameters");
         }
-        if (request.method === "GET") {
-          return sendJson(response, 200, { comments: database.listComments(taskId) });
-        }
         if (request.method === "POST") {
           const comment = database.createComment(taskId, {
-            ...parseCommentCreate(await readJson(request)),
+            ...resolveInputThreadBinding(parseCommentCreate(await readJson(request))),
             actor: actorFromRequest(request),
           });
           const task = database.getTask(taskId);
@@ -3692,8 +4573,14 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Comment routes do not accept query parameters");
         }
         if (request.method === "PATCH") {
-          const patch = parseCommentPatch(await readJson(request));
-          const comment = database.updateComment(id, patch.version, patch.body, patch.threadId);
+          const patch = resolveInputThreadBinding(parseCommentPatch(await readJson(request)));
+          const comment = database.updateComment(
+            id,
+            patch.version,
+            patch.body,
+            patch.threadId,
+            patch.threadBinding,
+          );
           const task = database.getTask(comment.taskId);
           events.emit("comment.updated", { comment, task });
           return sendJson(response, 200, { comment });
@@ -3726,11 +4613,16 @@ export function createTaskboardServer(options = {}) {
         if (commentId.length === 0 || commentId.length > 128) {
           throw new ApiError(400, "INVALID_PATH", "Comment id is invalid");
         }
+        if (request.method === "GET") {
+          const after = parseAfterCursor(url.searchParams, "Attachment routes");
+          const attachments = database.listCommentAttachments(commentId, after);
+          return sendJson(response, 200, {
+            attachments,
+            nextCursor: nextCursor(attachments, after),
+          });
+        }
         if ([...url.searchParams.keys()].length > 0) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Attachment routes do not accept query parameters");
-        }
-        if (request.method === "GET") {
-          return sendJson(response, 200, { attachments: database.listCommentAttachments(commentId) });
         }
         if (request.method === "POST") {
           const comment = database.getComment(commentId);
@@ -3766,11 +4658,16 @@ export function createTaskboardServer(options = {}) {
         if (taskId.length === 0 || taskId.length > 128) {
           throw new ApiError(400, "INVALID_PATH", "Task id is invalid");
         }
+        if (request.method === "GET") {
+          const after = parseAfterCursor(url.searchParams, "Attachment routes");
+          const attachments = database.listAttachments(taskId, after);
+          return sendJson(response, 200, {
+            attachments,
+            nextCursor: nextCursor(attachments, after),
+          });
+        }
         if ([...url.searchParams.keys()].length > 0) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Attachment routes do not accept query parameters");
-        }
-        if (request.method === "GET") {
-          return sendJson(response, 200, { attachments: database.listAttachments(taskId) });
         }
         if (request.method === "POST") {
           const task = database.getTask(taskId);
@@ -4003,14 +4900,17 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "GET" && request.method !== "HEAD") {
           return methodNotAllowed(response, ["GET", "HEAD"]);
         }
-        const attachment = database.getAttachment(id);
+        const attachment = database.getAttachment(id) ?? database.getProjectReadmeAttachment(id);
         if (!attachment) throw new ApiError(404, "ATTACHMENT_NOT_FOUND", `Attachment '${id}' does not exist`);
         const body = await readFile(path.join(resolved.attachmentsDirectory, attachment.id));
         const encodedFilename = encodeURIComponent(attachment.filename).replace(/['()*]/g, (character) => (
           `%${character.charCodeAt(0).toString(16).toUpperCase()}`
         ));
         const canOpenInline = attachmentContentRoute[2] === "content"
-          && INLINE_ATTACHMENT_TYPES.has(attachment.contentType);
+          && (
+            INLINE_ATTACHMENT_TYPES.has(attachment.contentType)
+            || attachment.contentType.startsWith("video/")
+          );
         response.writeHead(200, {
           "cache-control": "private, no-store",
           "content-disposition": `${canOpenInline ? "inline" : "attachment"}; filename*=UTF-8''${encodedFilename}`,
@@ -4112,6 +5012,22 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 200, { task: refreshed });
       }
 
+      const taskTreeRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/tree$/);
+      if (taskTreeRoute) {
+        let id;
+        try {
+          id = decodeURIComponent(taskTreeRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Task id contains invalid encoding");
+        }
+        if (id.length === 0 || id.length > 128) {
+          throw new ApiError(400, "INVALID_PATH", "Task id is invalid");
+        }
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        const { direction, depth } = parseTaskTreeQuery(url.searchParams);
+        return sendJson(response, 200, { tree: database.getTaskTree(id, direction, depth) });
+      }
+
       const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move|start-ai))?$/);
       if (taskRoute) {
         let id;
@@ -4134,11 +5050,68 @@ export function createTaskboardServer(options = {}) {
         }
         if (!action && request.method === "PATCH") {
           const actor = actorFromRequest(request);
-          const { version, changes, threadId, assigneeTarget } = parseTaskPatch(await readJson(request));
+          const {
+            version,
+            changes,
+            threadId,
+            threadBinding,
+            assigneeTarget,
+          } = resolveInputThreadBinding(parseTaskPatch(await readJson(request)));
+          const current = database.getTask(id);
+          if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          let jiraChanged = false;
+          if (current.source !== "jira" && changes.projectId === JIRA_PROJECT_ID) {
+            throw new ApiError(
+              409,
+              "JIRA_PROJECT_MOVE_UNAVAILABLE",
+              "本地任务不能移入 Jira 同步项目",
+            );
+          }
+          if (current.source === "jira") {
+            if (current.version !== version) {
+              throw new ApiError(409, "VERSION_CONFLICT", "Task changed since it was last read", {
+                expectedVersion: version,
+                actualVersion: current.version,
+              });
+            }
+            if (current.archivedAt !== null) {
+              throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be updated");
+            }
+            if (Object.hasOwn(changes, "projectId")) {
+              throw new ApiError(409, "JIRA_PROJECT_MOVE_UNAVAILABLE", "Jira 任务不能移到本地项目");
+            }
+            if (assigneeTarget !== undefined) {
+              throw new ApiError(409, "JIRA_ASSIGNEE_UNAVAILABLE", "请在 Jira 中修改经办人");
+            }
+            const dueDate = Object.hasOwn(changes, "dueDate") ? changes.dueDate : current.dueDate;
+            const recurrence = Object.hasOwn(changes, "recurrence")
+              ? changes.recurrence
+              : current.recurrence;
+            if (recurrence && !dueDate) {
+              throw new ApiError(400, "INVALID_FIELD", "A recurring issue requires a due date");
+            }
+            jiraChanged = await jira.updateTask(current, changes);
+          }
           if (assigneeTarget !== undefined) {
             changes.assignee = resolveAssignee(assigneeTarget, actor);
           }
-          const task = database.updateTask(id, version, changes, threadId, actor);
+          let task;
+          try {
+            task = database.updateTask(id, version, changes, threadId, threadBinding, actor);
+          } catch (error) {
+            if (jiraChanged) {
+              try {
+                await jira.reconcile();
+              } catch {
+                throw new ApiError(
+                  502,
+                  "JIRA_RECONCILE_FAILED",
+                  "Jira 已更新，但 Taskboard 重新同步失败，请手动同步",
+                );
+              }
+            }
+            throw error;
+          }
           events.emit("task.updated", { task });
           const automaticUpload = maybeAutomaticallyEnqueueCompletedTask(task);
           return sendJson(response, 200, {
@@ -4148,6 +5121,10 @@ export function createTaskboardServer(options = {}) {
           });
         }
         if (!action && request.method === "DELETE") {
+          const current = database.getTask(id);
+          if (current?.source === "jira") {
+            throw new ApiError(409, "JIRA_DELETE_UNAVAILABLE", "Jira 任务不能从 Taskboard 永久删除");
+          }
           const { version } = parseArchive(await readJson(request));
           const deleted = database.deleteArchivedTask(id, version);
           for (const attachmentId of deleted.attachmentIds) {
@@ -4181,9 +5158,10 @@ export function createTaskboardServer(options = {}) {
           )));
         }
         if (action === "move" && request.method === "POST") {
-          const move = parseMove(await readJson(request));
+          const move = resolveInputThreadBinding(parseMove(await readJson(request)));
           const current = database.getTask(id);
-          const marker = current ? parseFeishuTaskMetadata(current.description) : null;
+          if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          const marker = parseFeishuTaskMetadata(current.description);
           if (current?.status === "queued" && move.status === "in_progress") {
             throw new ApiError(
               409,
@@ -4191,12 +5169,24 @@ export function createTaskboardServer(options = {}) {
               "Queued executions start automatically when their package slot is available",
             );
           }
-          if (current && current.status === "todo" && move.status === "in_progress" && marker) {
+          if (current.status === "todo" && move.status === "in_progress" && marker) {
             assertAiLoopbackRequest(request);
             const metadata = requireTrustedFeishuTask(current, { requirePackage: true });
             return sendJson(response, 202, await startTrackedTask(current.id, () => executionCoordinator.schedule(
               current, metadata, "move", { actor: actorFromRequest(request) },
             )));
+          }
+          if (current.source === "jira") {
+            if (current.version !== move.version) {
+              throw new ApiError(409, "VERSION_CONFLICT", "Task changed since it was last read", {
+                expectedVersion: move.version,
+                actualVersion: current.version,
+              });
+            }
+            if (current.archivedAt !== null) {
+              throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
+            }
+            await jira.moveTask(current, move.status);
           }
           const task = database.moveTask(
             id,
@@ -4204,6 +5194,7 @@ export function createTaskboardServer(options = {}) {
             move.status,
             move.sortOrder,
             move.threadId,
+            move.threadBinding,
             actorFromRequest(request),
           );
           events.emit("task.moved", { task });
@@ -4215,14 +5206,38 @@ export function createTaskboardServer(options = {}) {
           });
         }
         if (action === "archive" && request.method === "POST") {
-          const { version, threadId } = parseArchive(await readJson(request));
-          const task = database.archiveTask(id, version, threadId, actorFromRequest(request));
+          const current = database.getTask(id);
+          if (current?.source === "jira") {
+            throw new ApiError(409, "JIRA_ARCHIVE_UNAVAILABLE", "Jira 任务由同步范围自动管理，不能手动归档");
+          }
+          const { version, threadId, threadBinding } = resolveInputThreadBinding(
+            parseArchive(await readJson(request)),
+          );
+          const task = database.archiveTask(
+            id,
+            version,
+            threadId,
+            threadBinding,
+            actorFromRequest(request),
+          );
           events.emit("task.archived", { task });
           return sendJson(response, 200, { task });
         }
         if (action === "restore" && request.method === "POST") {
-          const { version, threadId } = parseArchive(await readJson(request));
-          const task = database.restoreTask(id, version, threadId, actorFromRequest(request));
+          const current = database.getTask(id);
+          if (current?.source === "jira") {
+            throw new ApiError(409, "JIRA_RESTORE_UNAVAILABLE", "Jira 任务由同步范围自动管理，不能手动恢复");
+          }
+          const { version, threadId, threadBinding } = resolveInputThreadBinding(
+            parseArchive(await readJson(request)),
+          );
+          const task = database.restoreTask(
+            id,
+            version,
+            threadId,
+            threadBinding,
+            actorFromRequest(request),
+          );
           events.emit("task.restored", { task });
           return sendJson(response, 200, { task });
         }
@@ -4257,6 +5272,121 @@ export function createTaskboardServer(options = {}) {
       }
       console.error(error);
       sendJson(response, 500, { error: { code: "INTERNAL_ERROR", message: "Internal server error" } });
+    }
+  });
+
+  const cloudRealtimeServer = new WebSocketServer({ noServer: true });
+  const cloudRealtimeSockets = new Set();
+
+  function rejectWebSocketUpgrade(socket, status, message) {
+    const body = `${message}\n`;
+    socket.end([
+      `HTTP/1.1 ${status} ${message}`,
+      "Connection: close",
+      "Content-Type: text/plain; charset=utf-8",
+      `Content-Length: ${Buffer.byteLength(body)}`,
+      "",
+      body,
+    ].join("\r\n"));
+  }
+
+  function closeOrTerminateWebSocket(webSocket, code, reason) {
+    if (webSocket.readyState !== WebSocketClient.OPEN) {
+      webSocket.terminate();
+      return;
+    }
+    if (code >= 1000 && ![1004, 1005, 1006, 1015].includes(code)) {
+      webSocket.close(code, reason);
+    } else {
+      webSocket.terminate();
+    }
+  }
+
+  server.on("upgrade", async (request, socket, head) => {
+    let remoteSocket;
+    try {
+      const incomingUrl = new URL(request.url, "http://127.0.0.1");
+      if (resolved.instanceToken) {
+        if (!incomingUrl.pathname.startsWith(`${routePrefix}/`)) {
+          rejectWebSocketUpgrade(socket, 404, "Not Found");
+          return;
+        }
+        request.url = `${incomingUrl.pathname.slice(routePrefix.length) || "/"}${incomingUrl.search}`;
+      }
+      assertTrustedNetworkRequest(
+        request,
+        Boolean(resolved.instanceToken),
+        resolved.trustedOrigins,
+      );
+      const url = new URL(request.url, "http://127.0.0.1");
+      if (url.pathname !== "/api/events" || [...url.searchParams.keys()].length > 0) {
+        rejectWebSocketUpgrade(socket, 404, "Not Found");
+        return;
+      }
+      assertLoopbackRequest(request);
+      const target = await cloudProxy.webSocketTarget("/api/events");
+      remoteSocket = new WebSocketClient(target.url, { headers: target.headers });
+      const pendingMessages = [];
+      const queueMessage = (data, isBinary) => pendingMessages.push({ data, isBinary });
+      remoteSocket.on("message", queueMessage);
+      await new Promise((resolve, reject) => {
+        const cleanup = () => {
+          remoteSocket.off("open", onOpen);
+          remoteSocket.off("error", onError);
+          remoteSocket.off("close", onClose);
+        };
+        const onOpen = () => {
+          cleanup();
+          resolve();
+        };
+        const onError = (error) => {
+          cleanup();
+          reject(error);
+        };
+        const onClose = () => {
+          cleanup();
+          reject(new Error("Cloud realtime connection closed before opening"));
+        };
+        remoteSocket.once("open", onOpen);
+        remoteSocket.once("error", onError);
+        remoteSocket.once("close", onClose);
+      });
+      cloudRealtimeServer.handleUpgrade(request, socket, head, (localSocket) => {
+        const pair = { localSocket, remoteSocket };
+        cloudRealtimeSockets.add(pair);
+        const removePair = () => cloudRealtimeSockets.delete(pair);
+        const forwardMessage = (data, isBinary) => {
+          if (localSocket.readyState === WebSocketClient.OPEN) {
+            localSocket.send(data, { binary: isBinary });
+          }
+        };
+
+        remoteSocket.off("message", queueMessage);
+        remoteSocket.on("message", forwardMessage);
+        for (const { data, isBinary } of pendingMessages) forwardMessage(data, isBinary);
+
+        localSocket.on("message", () => {
+          localSocket.close(1008, "Client messages are not supported");
+        });
+        localSocket.on("close", (code, reason) => {
+          removePair();
+          closeOrTerminateWebSocket(remoteSocket, code, reason);
+        });
+        localSocket.on("error", () => remoteSocket.terminate());
+
+        remoteSocket.on("close", (code, reason) => {
+          removePair();
+          closeOrTerminateWebSocket(localSocket, code, reason);
+        });
+        remoteSocket.on("error", () => {
+          if (localSocket.readyState === WebSocketClient.OPEN) {
+            localSocket.close(1011, "Cloud realtime connection failed");
+          }
+        });
+      });
+    } catch (error) {
+      remoteSocket?.terminate();
+      rejectWebSocketUpgrade(socket, error?.status ?? 502, "WebSocket connection failed");
     }
   });
 
@@ -4303,6 +5433,12 @@ export function createTaskboardServer(options = {}) {
       closing = true;
       taskStartAbortController.abort();
       cancelQueuedTaskStarts();
+      for (const { localSocket, remoteSocket } of cloudRealtimeSockets) {
+        localSocket.terminate();
+        remoteSocket.terminate();
+      }
+      cloudRealtimeSockets.clear();
+      cloudRealtimeServer.close();
       const serverClosed = listening
         ? new Promise((resolve, reject) => {
             server.close((error) => error ? reject(error) : resolve());

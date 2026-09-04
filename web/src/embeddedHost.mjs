@@ -25,13 +25,16 @@ export function installEmbeddedExternalLinkHandler() {
       : null;
     if (!link) return;
 
+    const rawHref = link.getAttribute("href");
+    if (!rawHref) return;
+
     let url;
     try {
-      url = new URL(link.href, window.location.href);
+      url = new URL(rawHref);
     } catch {
       return;
     }
-    if (url.protocol !== "https:") return;
+    if (url.protocol !== "http:" && url.protocol !== "https:") return;
     event.preventDefault();
     postEmbeddedHostMessage({
       type: "taskboard:open-external",
