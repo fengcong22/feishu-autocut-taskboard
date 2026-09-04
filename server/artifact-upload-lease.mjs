@@ -20,6 +20,6 @@ export function artifactUploadLeaseNeedsRecovery(row, nowMs) {
   if (leaseUntilMs === null || startedAtMs === null) return true;
   if (leaseUntilMs <= nowMs) return true;
   if (leaseUntilMs > nowMs + ARTIFACT_UPLOAD_MAX_FUTURE_MS) return true;
-  const issuedDuration = leaseUntilMs - startedAtMs;
-  return issuedDuration <= 0 || issuedDuration > ARTIFACT_UPLOAD_MAX_FUTURE_MS;
+  if (startedAtMs > nowMs + ARTIFACT_UPLOAD_CLOCK_SKEW_MS) return true;
+  return leaseUntilMs <= startedAtMs;
 }

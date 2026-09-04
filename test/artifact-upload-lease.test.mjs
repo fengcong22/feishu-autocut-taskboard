@@ -182,6 +182,29 @@ test("renews an owned upload lease and fences stale claims", async () => {
   }
 });
 
+test("repeated renewal keeps a long-running upload lease valid", async () => {
+  const fixture = await createUploadLeaseFixture({ count: 1, uploadConcurrency: 1 });
+  const originalDateNow = Date.now;
+  try {
+    const claimed = fixture.database.claimNextArtifactUpload();
+    const startedAt = fixture.database.database.prepare(
+      "SELECT started_at FROM artifact_uploads WHERE id = ?",
+    ).get(claimed.id).started_at;
+    const startedAtMs = Date.parse(startedAt);
+
+    Date.now = () => startedAtMs + 5 * 60 * 1000;
+    assert.ok(fixture.database.renewArtifactUploadLease(claimed.id, claimed.claimToken));
+    Date.now = () => startedAtMs + 10 * 60 * 1000;
+    assert.ok(fixture.database.renewArtifactUploadLease(claimed.id, claimed.claimToken));
+
+    assert.equal(fixture.database.recoverUploadingArtifactUploads(), 0);
+    assert.equal(fixture.database.getArtifactUpload(claimed.id).status, "uploading");
+  } finally {
+    Date.now = originalDateNow;
+    await fixture.close();
+  }
+});
+
 test("an invalid upload lease cannot schedule a rapid recovery loop", async () => {
   let recoveryCalls = 0;
   const timers = [];
