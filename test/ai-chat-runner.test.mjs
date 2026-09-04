@@ -53,7 +53,9 @@ const args = process.argv.slice(2);
 if (process.env.FAKE_ENVIRONMENT_CAPTURE_PATH) {
   appendFileSync(process.env.FAKE_ENVIRONMENT_CAPTURE_PATH, JSON.stringify({
     args,
-    launcherKeys: Object.keys(process.env).filter((name) => name.startsWith("CODEX_TASKBOARD_")),
+    launcherKeys: Object.keys(process.env).filter((name) => (
+      name.startsWith("CODEX_TASKBOARD_") || name === "CODEX_FEISHU_BRIDGE_SECRET"
+    )),
   }) + "\\n");
 }
 if (args[0] === "debug" && args[1] === "models") {
@@ -159,6 +161,7 @@ if (args[0] === "app-server") {
       CODEX_TASKBOARD_INSTANCE_SECRET: "must-not-reach-codex",
       CODEX_TASKBOARD_PORT: "47823",
       CODEX_TASKBOARD_VERSION: "0.2.0",
+      CODEX_FEISHU_BRIDGE_SECRET: "must-not-reach-codex",
     },
     killGraceMs: 50,
   });
