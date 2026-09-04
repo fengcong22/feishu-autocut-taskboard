@@ -565,6 +565,17 @@ function taskArtifactWorkFromRow(row) {
   };
 }
 
+function taskArtifactSummaryFromRow(row) {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    filename: row.filename,
+    validationStatus: row.validation_status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 function artifactUploadFromRow(row) {
   return {
     id: row.id,
@@ -604,6 +615,7 @@ function projectFromRow(row) {
     archivedIssueCount: Number(row.archived_issue_count ?? 0),
     archivedAt: row.archived_at ?? null,
     source: row.source ?? "local",
+    subjectKey: row.subject_key ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -1131,17 +1143,23 @@ export class TaskboardDatabase {
       WHERE thread_id IS NOT NULL AND version = 1 AND creator_id = 'local-user'
     `);
     const identityTaskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
-    const assigneeMigrations = [
+    const assigneeColumns = [
       ["assignee_type", "TEXT CHECK (assignee_type IN ('user', 'agent'))", "creator_type"],
       ["assignee_id", "TEXT", "creator_id"],
       ["assignee_name", "TEXT", "creator_name"],
       ["assignee_avatar_url", "TEXT", "creator_avatar_url"],
-    ].filter(([column]) => !identityTaskColumns.some((current) => current.name === column));
-    if (assigneeMigrations.length > 0) {
+    ];
+    const assigneeMigrations = assigneeColumns
+      .filter(([column]) => !identityTaskColumns.some((current) => current.name === column));
+    const assigneeBackfills = assigneeColumns
+      .filter(([column]) => !taskColumns.some((current) => current.name === column));
+    if (assigneeMigrations.length > 0 || assigneeBackfills.length > 0) {
       this.database.exec("BEGIN IMMEDIATE");
       try {
-        for (const [column, definition, source] of assigneeMigrations) {
+        for (const [column, definition] of assigneeMigrations) {
           this.database.exec(`ALTER TABLE tasks ADD COLUMN ${column} ${definition}`);
+        }
+        for (const [column, , source] of assigneeBackfills) {
           this.database.exec(`UPDATE tasks SET ${column} = ${source}`);
         }
         this.database.exec("COMMIT");
@@ -1452,6 +1470,16 @@ export class TaskboardDatabase {
         projects.updated_at,
         projects.archived_at,
         projects.source,
+        (
+          SELECT feishu_subjects.subject_key
+          FROM feishu_subjects
+          WHERE feishu_subjects.project_id = projects.id
+          ORDER BY
+            CASE WHEN feishu_subjects.removed_at IS NULL THEN 0 ELSE 1 END,
+            feishu_subjects.updated_at DESC,
+            feishu_subjects.subject_key
+          LIMIT 1
+        ) AS subject_key,
         COUNT(tasks.id) FILTER (WHERE tasks.archived_at IS NULL) AS issue_count,
         COUNT(tasks.id) FILTER (WHERE tasks.archived_at IS NOT NULL) AS archived_issue_count
       FROM projects
@@ -2316,6 +2344,16 @@ export class TaskboardDatabase {
         projects.updated_at,
         projects.archived_at,
         projects.source,
+        (
+          SELECT feishu_subjects.subject_key
+          FROM feishu_subjects
+          WHERE feishu_subjects.project_id = projects.id
+          ORDER BY
+            CASE WHEN feishu_subjects.removed_at IS NULL THEN 0 ELSE 1 END,
+            feishu_subjects.updated_at DESC,
+            feishu_subjects.subject_key
+          LIMIT 1
+        ) AS subject_key,
         COUNT(tasks.id) FILTER (WHERE tasks.archived_at IS NULL) AS issue_count,
         COUNT(tasks.id) FILTER (WHERE tasks.archived_at IS NOT NULL) AS archived_issue_count
       FROM projects
@@ -3456,6 +3494,64 @@ export class TaskboardDatabase {
     }
   }
 
+  detachFailedPreStartThreadForRetry(id, expectedVersion, actor) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.getTask(id);
+      if (!current) {
+        throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+      }
+      this.#requireVersion(current, expectedVersion);
+      if (
+        !(current.status === "todo" || current.status === "queued")
+        || current.archivedAt !== null
+        || current.threadId === null
+      ) {
+        throw new ApiError(409, "TASK_NOT_STARTABLE", "Only ready tasks can be started with Codex");
+      }
+      const failedPreStartThread = this.database.prepare(`
+        SELECT ai_chat_threads.id
+        FROM ai_chat_threads
+        WHERE ai_chat_threads.id = ?
+          AND ai_chat_threads.origin_issue_id = ?
+          AND ai_chat_threads.origin_project_id = ?
+          AND ai_chat_threads.status = 'failed'
+          AND ai_chat_threads.codex_thread_id IS NULL
+          AND EXISTS (
+            SELECT 1 FROM ai_chat_runs
+            WHERE ai_chat_runs.thread_id = ai_chat_threads.id
+              AND ai_chat_runs.status = 'failed'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM ai_chat_runs
+            WHERE ai_chat_runs.thread_id = ai_chat_threads.id
+              AND ai_chat_runs.status = 'running'
+          )
+      `).get(current.threadId, current.id, current.projectId);
+      if (!failedPreStartThread) {
+        throw new ApiError(409, "TASK_NOT_STARTABLE", "Only ready tasks can be started with Codex");
+      }
+      const timestamp = now();
+      const result = this.database.prepare(`
+        UPDATE tasks
+        SET thread_id = NULL, version = version + 1, updated_at = ?
+        WHERE id = ? AND version = ? AND thread_id = ?
+      `).run(timestamp, current.id, expectedVersion, current.threadId);
+      if (result.changes !== 1) this.#throwMissingOrConflict(id, expectedVersion);
+      this.#recordTaskActivity(
+        current.id,
+        actor,
+        taskFieldChanges(current, { threadId: null }),
+        timestamp,
+      );
+      this.database.exec("COMMIT");
+      return this.getTask(current.id);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   claimTaskForAiStart(id, expectedVersion, actor) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -4119,6 +4215,46 @@ export class TaskboardDatabase {
       WHERE task_id = ?
       ORDER BY created_at DESC, id DESC
     `).all(task.id).map(taskArtifactFromRow);
+  }
+
+  listTaskArtifactSummaryItems(projectId) {
+    const rows = this.database.prepare(`
+      SELECT
+        task_artifacts.id,
+        task_artifacts.task_id,
+        task_artifacts.filename,
+        task_artifacts.validation_status,
+        task_artifacts.created_at,
+        task_artifacts.updated_at,
+        tasks.description AS task_description,
+        tasks.labels AS task_labels,
+        feishu_task_origins.metadata_json AS origin_metadata_json
+      FROM task_artifacts
+      JOIN tasks ON tasks.id = task_artifacts.task_id
+      LEFT JOIN feishu_task_origins ON feishu_task_origins.task_id = tasks.id
+      WHERE tasks.project_id = ?
+      ORDER BY task_artifacts.updated_at DESC, task_artifacts.id DESC
+    `).all(projectId);
+    return rows.flatMap((row) => {
+      let origin = null;
+      try {
+        if (row.origin_metadata_json) {
+          origin = {
+            taskId: row.task_id,
+            ...normalizeFeishuTaskOrigin(JSON.parse(row.origin_metadata_json)),
+          };
+        }
+      } catch {}
+      return [{
+        summary: taskArtifactSummaryFromRow(row),
+        task: {
+          id: row.task_id,
+          description: row.task_description,
+          labels: JSON.parse(row.task_labels),
+        },
+        origin,
+      }];
+    });
   }
 
   getTaskArtifact(id) {

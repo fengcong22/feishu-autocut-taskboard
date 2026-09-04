@@ -195,7 +195,11 @@ export class AiChatService {
     return this.database.deleteAiChatThread(threadId);
   }
 
-  async startTurn(threadId, input, { onRunCreated = null } = {}) {
+  async startTurn(
+    threadId,
+    input,
+    { onRunCreated = null, taskClaimedByServer = false } = {},
+  ) {
     let thread = this.getThread(threadId);
     if (this.#threadIsActive(thread)) {
       throw new ApiError(
@@ -243,6 +247,13 @@ export class AiChatService {
         "The project's device workspace no longer matches this conversation",
       );
     }
+    if (taskClaimedByServer === true && !resolved.trustedAutoCutSource) {
+      throw new ApiError(
+        409,
+        "TRUSTED_AUTOCUT_CONTEXT_REQUIRED",
+        "A server-claimed Auto-Cut turn requires trusted source context",
+      );
+    }
 
     const skillIds = input.skillIds ?? [];
     const availableSkills = new Map(
@@ -264,7 +275,9 @@ export class AiChatService {
       imagePaths,
     } = await this.#writeTurnAttachments(attachments);
     try {
-      const args = buildCodexArgs(thread, resolved.addDirectories, imagePaths);
+      const args = buildCodexArgs(thread, resolved.addDirectories, imagePaths, {
+        skipGitRepoCheck: resolved.skipGitRepoCheck === true,
+      });
       const prompt = buildCodexPrompt(
         thread,
         {
@@ -273,6 +286,12 @@ export class AiChatService {
           attachmentPaths,
         },
         this.manageTaskboardSkillPath,
+        {
+          includeManageTaskboardSkill: taskClaimedByServer !== true,
+          trustedAutoCutSource: taskClaimedByServer === true
+            ? resolved.trustedAutoCutSource
+            : null,
+        },
       );
       const run = this.database.createAiChatRun({ threadId });
       try {

@@ -191,6 +191,7 @@ export interface Project {
   archivedIssueCount: number;
   archivedAt: string | null;
   source: "global" | "local" | "feishu";
+  subjectKey?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -495,6 +496,15 @@ export interface TaskArtifact {
   updatedAt: string;
 }
 
+export interface TaskArtifactSummary {
+  id: string;
+  taskId: string;
+  filename: string;
+  validationStatus: "verified";
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface FeishuTaskOrigin {
   taskId?: string;
   version: number;
@@ -527,6 +537,7 @@ export interface ArtifactUpload {
   taskId: string;
   artifactId: string;
   subjectKey: string;
+  targetId: string | null;
   filename: string;
   sha256: string;
   status: "queued" | "uploading" | "uploaded" | "failed";

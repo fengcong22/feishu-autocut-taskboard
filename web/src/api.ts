@@ -18,6 +18,7 @@ import type {
   ProjectSummary,
   Task,
   TaskArtifact,
+  TaskArtifactSummary,
   TaskChangeActivity,
   TaskboardMetadata,
   TaskDraft,
@@ -883,6 +884,18 @@ export async function listArtifactUploads(
     { signal },
   );
   return data.items;
+}
+
+export async function listTaskArtifactSummaries(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<TaskArtifactSummary[]> {
+  const params = new URLSearchParams({ projectId });
+  const data = await request<{ summaries: TaskArtifactSummary[] }>(
+    `/api/local/task-artifact-summaries?${params}`,
+    { signal },
+  );
+  return data.summaries;
 }
 
 export async function enqueueTaskArtifactUpload(

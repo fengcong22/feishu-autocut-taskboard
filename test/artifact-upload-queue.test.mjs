@@ -130,6 +130,19 @@ async function waitForUploadStatus(baseUrl, taskId, uploadId, status, timeoutMs 
   throw new Error(`Timed out waiting for artifact upload '${uploadId}' to reach '${status}'`);
 }
 
+async function waitForMissingFile(filePath, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await access(filePath);
+    } catch {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  await assert.rejects(access(filePath));
+}
+
 test("server begins listening without waiting for upload recovery to drain", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-upload-start-"));
   let releaseStart;
@@ -618,6 +631,94 @@ test("a task keeps the upload target and concurrency from its creation-time subj
   }
 });
 
+test("a completed task created before upload setup can use the current target", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-artifact-upload-late-target-"));
+  const destinationDirectory = path.join(directory, "late-upload-target");
+  const uploadWorker = { start() {}, wake() {}, async close() {} };
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    codexExecutable: process.execPath,
+    uploadWorker,
+    feishuPackages: {
+      packages: {
+        "Auto-cut-A": { projectId: "auto-cut-a", workspacePath: directory, prompt: "fixture prompt" },
+      },
+    },
+    feishuWorkflowSync: async () => ({ ok: true }),
+  });
+  try {
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const catalog = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
+      method: "POST",
+      json: {
+        baseToken: "bas_late_target",
+        baseName: "剪辑学科",
+        tables: [{ tableId: "tbl_subject", tableName: "历史", fields: [] }],
+      },
+    });
+    const subject = catalog.body.catalog[0].subjects[0];
+    const task = (await request(baseUrl, "/api/tasks", {
+      method: "POST",
+      json: {
+        projectId: subject.projectId,
+        title: "先剪辑后配置上传",
+        description: manualFeishuDescription("bas_late_target", "tbl_subject", {
+          subjectKey: subject.subjectKey,
+          configVersion: subject.configVersion,
+        }),
+        status: "in_progress",
+        priority: "none",
+        labels: ["feishu"],
+      },
+    })).body.task;
+
+    const key = encodeURIComponent(subject.subjectKey);
+    const saved = await request(baseUrl, `/api/local/feishu/workflow/subjects/${key}`, {
+      method: "PATCH",
+      json: {
+        upload: {
+          enqueueMode: "manual",
+          artifactSourceMode: "manual_select",
+          artifactSourcePath: null,
+          targetId: "late-target",
+          targetPath: destinationDirectory,
+          uploadConcurrency: 1,
+        },
+      },
+    });
+    assert.equal(saved.response.status, 200);
+
+    const artifact = (await request(baseUrl, `/api/local/tasks/${encodeURIComponent(task.id)}/artifacts`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/zip",
+        "x-taskboard-filename": encodeURIComponent("late-target.zip"),
+      },
+      body: createStoredZip([
+        { name: "draft/draft_content.json", content: "{}" },
+        { name: "draft/draft_meta_info.json", content: "{}" },
+      ]),
+    })).body.artifact;
+    const currentTask = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`);
+    const accepted = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`, {
+      method: "PATCH",
+      json: { version: currentTask.body.task.version, status: "done" },
+    });
+    assert.equal(accepted.response.status, 200);
+
+    const queued = await request(baseUrl, `/api/local/tasks/${encodeURIComponent(task.id)}/upload-queue`, {
+      method: "POST",
+      json: { artifactId: artifact.id },
+    });
+    assert.equal(queued.response.status, 202);
+    assert.equal(queued.body.upload.targetId, "late-target");
+  } finally {
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("a manual task cannot enter the upload queue before review approval", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-artifact-upload-review-gate-"));
   const destinationDirectory = path.join(directory, "upload-target");
@@ -993,7 +1094,7 @@ async function assertUploadCompletionRechecksTrustedFeishuProvenance({ baseToken
     assert.ok(failed, "upload should settle after the copy resumes");
     assert.equal(failed.status, "failed");
     assert.equal(failed.errorCode, "TASK_PROVENANCE_CHANGED");
-    await assert.rejects(access(path.join(destinationDirectory, "final-provenance.zip")));
+    await waitForMissingFile(path.join(destinationDirectory, "final-provenance.zip"));
   } finally {
     releaseCopy?.();
     await app.close();

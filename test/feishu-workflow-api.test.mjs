@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -812,6 +813,20 @@ test("local Feishu workflow API persists preview and subject lifecycle", async (
     assert.equal(enabled.body.subject.lifecycle, "enabled");
     const catalog = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/catalog");
     assert.equal(catalog.body.catalog[0].subjects[0].lifecycle, "enabled");
+    const hidden = await request(fixtureData.baseUrl, `/api/local/feishu/workflow/subjects/${key}/display`, {
+      method: "PATCH", body: { displayEnabled: false },
+    });
+    assert.equal(hidden.response.status, 200);
+    assert.equal(hidden.body.subject.displayEnabled, false);
+    assert.equal(hidden.body.subject.lifecycle, "enabled");
+    assert.equal(hidden.body.subject.configVersion, enabled.body.subject.configVersion);
+    const shown = await request(fixtureData.baseUrl, `/api/local/feishu/workflow/subjects/${key}/display`, {
+      method: "PATCH", body: { displayEnabled: true },
+    });
+    assert.equal(shown.response.status, 200);
+    assert.equal(shown.body.subject.displayEnabled, true);
+    assert.equal(shown.body.subject.lifecycle, "enabled");
+    assert.equal(shown.body.subject.configVersion, enabled.body.subject.configVersion);
   } finally {
     await fixtureData.app.close();
     await rm(fixtureData.directory, { recursive: true, force: true });
@@ -864,5 +879,726 @@ test("Feishu removal archives its source project and preview restoration reactiv
   } finally {
     await fixtureData.app.close();
     await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("preview API does not return credentials or query secrets from source URLs", async () => {
+  const fixtureData = await fixture();
+  try {
+    const created = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/catalog", {
+      method: "POST",
+      body: {
+        baseToken: "bas_api_url",
+        baseName: "URL Base",
+        sourceUrlLabel: "https://user:secret@example.test/base?token=secret#fragment",
+        tables: [{ tableId: "tbl_url", tableName: "语文", fields: [] }],
+      },
+    });
+    assert.equal(created.response.status, 201);
+    assert.equal(created.body.catalog[0].sourceUrlLabel, "https://example.test/base");
+
+    const listed = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/catalog");
+    const base = listed.body.catalog.find((entry) => entry.baseToken === "bas_api_url");
+    assert.equal(base.sourceUrlLabel, "https://example.test/base");
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("Wiki Base preview is proxied unchanged and stored under the resolved Base token", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-wiki-preview-"));
+  let receivedUrl = null;
+  const bridge = createServer(async (incoming, response) => {
+    const chunks = [];
+    for await (const chunk of incoming) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    receivedUrl = body.url;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      baseToken: "bas_resolved",
+      baseName: "知识库课程",
+      tables: [{ tableId: "tbl_math", tableName: "小学数学", fields: [] }],
+    }));
+  });
+  await new Promise((resolve, reject) => {
+    bridge.once("error", reject);
+    bridge.listen(0, "127.0.0.1", resolve);
+  });
+  const bridgeAddress = bridge.address();
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    codexExecutable: process.execPath,
+    feishuBridgeUrl: `http://127.0.0.1:${bridgeAddress.port}`,
+    feishuPackages: { packages: {} },
+  });
+  try {
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const wikiUrl = "https://example.feishu.cn/wiki/wik_demo?table=tbl_math";
+    const result = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
+      method: "POST",
+      body: { url: wikiUrl },
+    });
+
+    assert.equal(result.response.status, 201);
+    assert.equal(receivedUrl, wikiUrl);
+    assert.equal(result.body.catalog[0].baseToken, "bas_resolved");
+    assert.equal(result.body.catalog[0].subjects[0].subjectKey, "bas_resolved:tbl_math");
+    assert.equal(
+      result.body.catalog[0].sourceUrlLabel,
+      "https://example.feishu.cn/wiki/wik_demo",
+    );
+  } finally {
+    await app.close();
+    await new Promise((resolve) => bridge.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Wiki Base preview maps a known Bridge error without exposing its message", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-wiki-error-"));
+  const bridge = createServer(async (incoming, response) => {
+    for await (const _chunk of incoming) { /* drain */ }
+    response.writeHead(400, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      error: {
+        code: "FEISHU_WIKI_NOT_BASE",
+        message: "private Wiki node title and token",
+      },
+    }));
+  });
+  await new Promise((resolve, reject) => {
+    bridge.once("error", reject);
+    bridge.listen(0, "127.0.0.1", resolve);
+  });
+  const bridgeAddress = bridge.address();
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    codexExecutable: process.execPath,
+    feishuBridgeUrl: `http://127.0.0.1:${bridgeAddress.port}`,
+    feishuPackages: { packages: {} },
+  });
+  try {
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const result = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
+      method: "POST",
+      body: { url: "https://example.feishu.cn/wiki/wik_doc" },
+    });
+
+    assert.equal(result.response.status, 400);
+    assert.deepEqual(result.body, {
+      error: {
+        code: "FEISHU_WIKI_NOT_BASE",
+        message: "该知识库链接不是多维表格",
+      },
+    });
+    assert.doesNotMatch(JSON.stringify(result.body), /private|wik_doc/i);
+  } finally {
+    await app.close();
+    await new Promise((resolve) => bridge.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Wiki Base preview rejects a malformed successful Bridge response as an upstream failure", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-wiki-malformed-"));
+  const malformedPreviews = [
+    { baseToken: "bas_incomplete", tables: [] },
+    { baseToken: "bas_incomplete", baseName: "不完整", tables: {} },
+    {
+      baseToken: "bas_incomplete",
+      baseName: "不完整",
+      tables: [{ tableId: "tbl_missing_fields", tableName: "缺少字段" }],
+    },
+    {
+      baseToken: "bas_incomplete",
+      baseName: "不完整",
+      tables: [{
+        tableId: "tbl_missing_type",
+        tableName: "缺少字段类型",
+        fields: [{ fieldId: "fld_status", fieldName: "状态", uiType: null, options: [] }],
+      }],
+    },
+    {
+      baseToken: "bas_incomplete",
+      baseName: "不完整",
+      metadataRefreshedAt: { internal: "private timestamp object" },
+      tables: [],
+    },
+    {
+      baseToken: "bas_incomplete",
+      baseName: "不完整",
+      tables: [
+        { tableId: "tbl_duplicate", tableName: "重复一", fields: [] },
+        { tableId: "tbl_duplicate", tableName: "重复二", fields: [] },
+      ],
+    },
+  ];
+  const bridge = createServer(async (incoming, response) => {
+    for await (const _chunk of incoming) { /* drain */ }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(malformedPreviews.shift()));
+  });
+  await new Promise((resolve, reject) => {
+    bridge.once("error", reject);
+    bridge.listen(0, "127.0.0.1", resolve);
+  });
+  const bridgeAddress = bridge.address();
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    codexExecutable: process.execPath,
+    feishuBridgeUrl: `http://127.0.0.1:${bridgeAddress.port}`,
+    feishuPackages: { packages: {} },
+  });
+  try {
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    for (const suffix of ["name", "tables", "fields", "type", "timestamp", "duplicate"]) {
+      const result = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
+        method: "POST",
+        body: { url: `https://example.feishu.cn/wiki/wik_incomplete_${suffix}` },
+      });
+      assert.equal(result.response.status, 502);
+      assert.deepEqual(result.body, {
+        error: {
+          code: "FEISHU_METADATA_INVALID_RESPONSE",
+          message: "飞书返回了无法识别的多维表格信息",
+        },
+      });
+    }
+    assert.deepEqual(
+      (await request(baseUrl, "/api/local/feishu/workflow/catalog")).body.catalog,
+      [],
+    );
+  } finally {
+    await app.close();
+    await new Promise((resolve) => bridge.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Wiki Base preview strips unexpected Bridge properties before persisting metadata", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-wiki-sanitize-"));
+  const bridge = createServer(async (incoming, response) => {
+    for await (const _chunk of incoming) { /* drain */ }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      baseToken: "bas_sanitized",
+      baseName: "安全课程库",
+      metadataRefreshedAt: 1710000000000,
+      internal: "private base details",
+      tables: [{
+        tableId: "tbl_subject",
+        tableName: "语文",
+        internal: "private table details",
+        fields: [{
+          fieldId: "fld_status",
+          fieldName: "状态",
+          type: 3,
+          uiType: "SingleSelect",
+          internal: "private field details",
+          options: [{
+            id: "opt_ready",
+            name: "待剪辑",
+            color: 1,
+            internal: "private option details",
+          }],
+        }],
+      }],
+    }));
+  });
+  await new Promise((resolve, reject) => {
+    bridge.once("error", reject);
+    bridge.listen(0, "127.0.0.1", resolve);
+  });
+  const bridgeAddress = bridge.address();
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    codexExecutable: process.execPath,
+    feishuBridgeUrl: `http://127.0.0.1:${bridgeAddress.port}`,
+    feishuPackages: { packages: {} },
+  });
+  try {
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const result = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
+      method: "POST",
+      body: { url: "https://example.feishu.cn/wiki/wik_sanitized" },
+    });
+
+    assert.equal(result.response.status, 201);
+    assert.equal(result.body.catalog[0].metadataRefreshedAt, 1710000000000);
+    assert.deepEqual(result.body.catalog[0].subjects[0].metadata, {
+      fields: [{
+        fieldId: "fld_status",
+        fieldName: "状态",
+        type: 3,
+        uiType: "SingleSelect",
+        options: [{ id: "opt_ready", name: "待剪辑", color: 1 }],
+      }],
+    });
+    assert.doesNotMatch(JSON.stringify(result.body), /private .* details/i);
+  } finally {
+    await app.close();
+    await new Promise((resolve) => bridge.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("default Bridge workflow sync identifies Taskboard with the dedicated client header", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-sync-header-"));
+  let receivedClient = null;
+  let receivedExpectedVersion = null;
+  let receivedSubjectVersion = null;
+  const bridge = createServer(async (incoming, response) => {
+    receivedClient = incoming.headers["x-feishu-bridge-client"] ?? null;
+    const chunks = [];
+    for await (const chunk of incoming) chunks.push(chunk);
+    if (receivedClient !== "taskboard") {
+      response.writeHead(403, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { code: "BRIDGE_CLIENT_REQUIRED" } }));
+      return;
+    }
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    receivedExpectedVersion = body.expectedVersion;
+    receivedSubjectVersion = body.subject?.configVersion;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ subject: body.subject }));
+  });
+  await new Promise((resolve, reject) => {
+    bridge.once("error", reject);
+    bridge.listen(0, "127.0.0.1", resolve);
+  });
+  const bridgeAddress = bridge.address();
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    codexExecutable: process.execPath,
+    feishuBridgeUrl: `http://127.0.0.1:${bridgeAddress.port}`,
+    feishuPackages: {
+      packages: {
+        "Auto-cut-A": { projectId: "auto-cut-a", workspacePath: directory, prompt: "fixture prompt" },
+      },
+    },
+  });
+  try {
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const catalog = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
+      method: "POST",
+      body: {
+        baseToken: "bas_sync_header",
+        baseName: "同步请求头",
+        tables: [{
+          tableId: "tbl_subject",
+          tableName: "语文",
+          fields: [{
+            fieldId: "fld_status",
+            fieldName: "状态",
+            type: 3,
+            uiType: "SingleSelect",
+            options: [{ id: "opt_ready", name: "待剪辑" }],
+          }],
+        }],
+      },
+    });
+    const subject = catalog.body.catalog[0].subjects[0];
+    const key = encodeURIComponent(subject.subjectKey);
+    const draft = await request(baseUrl, `/api/local/feishu/workflow/subjects/${key}`, {
+      method: "PATCH",
+      body: {
+        trigger: { fieldId: "fld_status", fieldName: "状态", startValue: "待剪辑", optionId: "opt_ready" },
+        execution: { mode: "manual", concurrencyGroup: "sync-header", maxConcurrent: 1, resourceGroups: [] },
+        packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-A", subjectCodeFieldId: null, branchMap: null },
+        upload: { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 },
+      },
+    });
+    const enabled = await request(baseUrl, `/api/local/feishu/workflow/subjects/${key}/enable`, {
+      method: "POST",
+      body: { expectedVersion: draft.body.subject.configVersion },
+    });
+    assert.equal(enabled.response.status, 200);
+    assert.equal(receivedClient, "taskboard");
+    assert.equal(receivedExpectedVersion, draft.body.subject.configVersion);
+    assert.equal(receivedSubjectVersion, draft.body.subject.configVersion + 1);
+  } finally {
+    await app.close();
+    await new Promise((resolve) => bridge.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("share import asks the loopback Bridge for live diagnostics and merges local diagnostics", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-share-bridge-"));
+  let receivedClient = null;
+  let receivedDryRun = null;
+  let receivedPath = null;
+  let receivedContentType = null;
+  const bridge = createServer(async (incoming, response) => {
+    receivedClient = incoming.headers["x-feishu-bridge-client"] ?? null;
+    receivedPath = incoming.url;
+    receivedContentType = incoming.headers["content-type"] ?? null;
+    const chunks = [];
+    for await (const chunk of incoming) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    receivedDryRun = body.dryRun;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      configuration: body.configuration,
+      dryRun: body.dryRun,
+      diagnostics: [{
+        code: "FIELD_NOT_FOUND",
+        severity: "warning",
+        path: "C:\\Users\\secret\\field.txt",
+        message: "SDK failed while reading C:\\Users\\secret\\field.txt",
+        alias: "FEISHUAPPSECRET123",
+        sdkError: "shared-secret-sdk-error",
+      }, {
+        code: "PACKAGE_WORKSPACE_PATH_UNBOUND",
+        severity: "error",
+        path: "bases.bas_share.subjects.tbl_subject.packageRoute",
+        message: "Bridge package points to D:\\Auto-Cut\\secret",
+      }, {
+        code: "UPLOAD_TARGET_PATH_UNBOUND",
+        severity: "warning",
+        path: "bases.bas_share.subjects.tbl_subject.upload.targetPath",
+        message: "Bridge has no Taskboard-local upload target binding",
+      }],
+    }));
+  });
+  await new Promise((resolve, reject) => {
+    bridge.once("error", reject);
+    bridge.listen(0, "127.0.0.1", resolve);
+  });
+  const bridgeAddress = bridge.address();
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    codexExecutable: process.execPath,
+    feishuBridgeUrl: `http://127.0.0.1:${bridgeAddress.port}`,
+    feishuPackages: {
+      packages: {
+        "Auto-cut-A": { projectId: "auto-cut-a", workspacePath: directory, prompt: "fixture prompt" },
+      },
+    },
+  });
+  const configuration = {
+    schemaVersion: 1,
+    bases: [{
+      baseToken: "bas_share",
+      baseName: "共享 Base",
+      subjects: [{
+        subjectKey: "bas_share:tbl_subject",
+        baseToken: "bas_share",
+        baseName: "共享 Base",
+        tableId: "tbl_subject",
+        tableName: "语文",
+        displayEnabled: true,
+        lifecycle: "draft",
+        configVersion: 1,
+        trigger: { fieldId: "fld_missing", fieldName: "进度", startValue: "待制作", optionId: null },
+        title: { fieldId: null, fieldName: null },
+        execution: { mode: "manual", concurrencyGroup: "default", maxConcurrent: 1, resourceGroups: [] },
+        packageRoute: {
+          routeMode: "fixed",
+          packageAlias: "Auto-cut-missing",
+          subjectCodeFieldId: null,
+          branchMap: { B: "Auto-cut-missing-B", C: "Auto-cut-missing-C" },
+        },
+        upload: { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 },
+      }],
+    }],
+  };
+  try {
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const result = await request(
+      `http://127.0.0.1:${address.port}`,
+      "/api/local/feishu/workflow/share/import",
+      { method: "POST", body: { configuration, dryRun: true } },
+    );
+    assert.equal(result.response.status, 200);
+    assert.equal(receivedClient, "local-operator");
+    assert.equal(receivedDryRun, true);
+    assert.equal(receivedPath, "/api/feishu/workflow/share/import");
+    assert.equal(receivedContentType, "application/json");
+    assert.ok(result.body.diagnostics.some((entry) => entry.code === "FIELD_NOT_FOUND"));
+    assert.ok(result.body.diagnostics.some((entry) => entry.code === "PACKAGE_ALIAS_UNAVAILABLE"));
+    assert.ok(result.body.diagnostics.some((entry) => entry.code === "PACKAGE_WORKSPACE_PATH_UNBOUND"));
+    assert.equal(result.body.diagnostics.some((entry) => entry.code === "UPLOAD_TARGET_PATH_UNBOUND"), false);
+    assert.deepEqual(
+      result.body.diagnostics
+        .filter((entry) => entry.code === "PACKAGE_ALIAS_UNAVAILABLE")
+        .map((entry) => entry.alias)
+        .sort(),
+      ["Auto-cut-missing", "Auto-cut-missing-B", "Auto-cut-missing-C"],
+    );
+    assert.doesNotMatch(
+      JSON.stringify(result.body),
+      /shared-secret-sdk-error|Users\\\\secret|Auto-Cut\\\\secret|FEISHUAPPSECRET123/,
+    );
+    assert.equal(result.body.diagnosticsOk, false);
+    assert.equal(result.body.dryRun, true);
+    assert.deepEqual((await request(`http://127.0.0.1:${address.port}`, "/api/local/feishu/workflow/catalog")).body.catalog, []);
+  } finally {
+    await app.close();
+    await new Promise((resolve) => bridge.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("share import rejects a non-loopback Bridge before changing the local catalog", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-share-non-loopback-"));
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    codexExecutable: process.execPath,
+    feishuBridgeUrl: "http://localhost:47824",
+    feishuPackages: {
+      packages: {
+        "Auto-cut-A": { projectId: "auto-cut-a", workspacePath: directory, prompt: "fixture prompt" },
+      },
+    },
+  });
+  const configuration = {
+    schemaVersion: 1,
+    bases: [{
+      baseToken: "bas_rejected",
+      baseName: "拒绝导入 Base",
+      subjects: [{
+        subjectKey: "bas_rejected:tbl_subject",
+        baseToken: "bas_rejected",
+        baseName: "拒绝导入 Base",
+        tableId: "tbl_subject",
+        tableName: "语文",
+        displayEnabled: true,
+        lifecycle: "draft",
+        configVersion: 1,
+        trigger: { fieldId: "fld_status", fieldName: "进度", startValue: "待制作", optionId: null },
+        title: { fieldId: null, fieldName: null },
+        execution: { mode: "manual", concurrencyGroup: "default", maxConcurrent: 1, resourceGroups: [] },
+        packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-A", subjectCodeFieldId: null, branchMap: null },
+        upload: { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 },
+      }],
+    }],
+  };
+  try {
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const result = await request(baseUrl, "/api/local/feishu/workflow/share/import", {
+      method: "POST",
+      body: { configuration, dryRun: false },
+    });
+    assert.equal(result.response.status, 503);
+    assert.equal(result.body.error.code, "FEISHU_BRIDGE_UNAVAILABLE");
+    assert.deepEqual((await request(baseUrl, "/api/local/feishu/workflow/catalog")).body.catalog, []);
+  } finally {
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("share import refuses Bridge redirects without forwarding the operator request", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-share-redirect-"));
+  let redirectedRequests = 0;
+  const redirected = createServer(async (incoming, response) => {
+    redirectedRequests += 1;
+    for await (const _chunk of incoming) { /* drain */ }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ configuration: {}, diagnostics: [] }));
+  });
+  await new Promise((resolve, reject) => {
+    redirected.once("error", reject);
+    redirected.listen(0, "127.0.0.1", resolve);
+  });
+  const redirectedAddress = redirected.address();
+  const bridge = createServer(async (incoming, response) => {
+    for await (const _chunk of incoming) { /* drain */ }
+    response.writeHead(307, {
+      location: `http://127.0.0.1:${redirectedAddress.port}/captured`,
+    });
+    response.end();
+  });
+  await new Promise((resolve, reject) => {
+    bridge.once("error", reject);
+    bridge.listen(0, "127.0.0.1", resolve);
+  });
+  const bridgeAddress = bridge.address();
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    codexExecutable: process.execPath,
+    feishuBridgeUrl: `http://127.0.0.1:${bridgeAddress.port}`,
+    feishuPackages: {
+      packages: {
+        "Auto-cut-A": { projectId: "auto-cut-a", workspacePath: directory, prompt: "fixture prompt" },
+      },
+    },
+  });
+  const configuration = {
+    schemaVersion: 1,
+    bases: [{
+      baseToken: "bas_redirect",
+      baseName: "重定向 Base",
+      subjects: [{
+        subjectKey: "bas_redirect:tbl_subject",
+        baseToken: "bas_redirect",
+        baseName: "重定向 Base",
+        tableId: "tbl_subject",
+        tableName: "语文",
+        displayEnabled: true,
+        lifecycle: "draft",
+        configVersion: 1,
+        trigger: { fieldId: "fld_status", fieldName: "进度", startValue: "待制作", optionId: null },
+        title: { fieldId: null, fieldName: null },
+        execution: { mode: "manual", concurrencyGroup: "default", maxConcurrent: 1, resourceGroups: [] },
+        packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-A", subjectCodeFieldId: null, branchMap: null },
+        upload: { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 },
+      }],
+    }],
+  };
+  try {
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const result = await request(
+      `http://127.0.0.1:${address.port}`,
+      "/api/local/feishu/workflow/share/import",
+      { method: "POST", body: { configuration, dryRun: false } },
+    );
+    assert.equal(result.response.status, 503);
+    assert.equal(result.body.error.code, "FEISHU_BRIDGE_UNAVAILABLE");
+    assert.equal(redirectedRequests, 0);
+    assert.deepEqual((await request(`http://127.0.0.1:${address.port}`, "/api/local/feishu/workflow/catalog")).body.catalog, []);
+  } finally {
+    await app.close();
+    await new Promise((resolve) => bridge.close(resolve));
+    await new Promise((resolve) => redirected.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("committed share import returns diagnostics recomputed at commit time", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-share-recheck-"));
+  let packageReads = 0;
+  const packageConfig = {
+    "Auto-cut-A": {
+      projectId: "auto-cut-a",
+      projectName: "Auto-cut-A",
+      workspacePath: directory,
+      prompt: "fixture prompt",
+    },
+  };
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    codexExecutable: process.execPath,
+    feishuPackageStore: {
+      async read() {
+        packageReads += 1;
+        return packageReads === 1 ? packageConfig : {};
+      },
+    },
+    feishuWorkflowShareImport: async (configuration) => ({ configuration, diagnostics: [] }),
+  });
+  const configuration = {
+    schemaVersion: 1,
+    bases: [{
+      baseToken: "bas_recheck",
+      baseName: "重检 Base",
+      subjects: [{
+        subjectKey: "bas_recheck:tbl_subject",
+        baseToken: "bas_recheck",
+        baseName: "重检 Base",
+        tableId: "tbl_subject",
+        tableName: "语文",
+        displayEnabled: true,
+        lifecycle: "draft",
+        configVersion: 1,
+        trigger: { fieldId: "fld_status", fieldName: "进度", startValue: "待制作", optionId: null },
+        title: { fieldId: null, fieldName: null },
+        execution: { mode: "manual", concurrencyGroup: "default", maxConcurrent: 1, resourceGroups: [] },
+        packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-A", subjectCodeFieldId: null, branchMap: null },
+        upload: { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 },
+      }],
+    }],
+  };
+  try {
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const result = await request(baseUrl, "/api/local/feishu/workflow/share/import", {
+      method: "POST",
+      body: { configuration, dryRun: false },
+    });
+    assert.equal(result.response.status, 200);
+    assert.equal(packageReads, 2);
+    assert.ok(result.body.diagnostics.some((entry) => entry.code === "PACKAGE_ALIAS_UNAVAILABLE"));
+    assert.equal(result.body.diagnosticsOk, false);
+    assert.equal((await request(baseUrl, "/api/local/feishu/workflow/catalog")).body.catalog[0].subjects[0].lifecycle, "draft");
+  } finally {
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("workflow sync maps untrusted Bridge error codes to a safe local error", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-sync-error-"));
+  const bridge = createServer(async (incoming, response) => {
+    for await (const _chunk of incoming) { /* drain */ }
+    response.writeHead(409, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      error: {
+        code: "FEISHUAPPSECRET_LEAK",
+        message: "secret workspace path should never cross the boundary",
+      },
+    }));
+  });
+  await new Promise((resolve, reject) => {
+    bridge.once("error", reject);
+    bridge.listen(0, "127.0.0.1", resolve);
+  });
+  const bridgeAddress = bridge.address();
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    codexExecutable: process.execPath,
+    feishuBridgeUrl: `http://127.0.0.1:${bridgeAddress.port}`,
+    feishuPackages: {
+      packages: {
+        "Auto-cut-A": { projectId: "auto-cut-a", workspacePath: directory, prompt: "fixture prompt" },
+      },
+    },
+  });
+  try {
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const preview = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
+      method: "POST",
+      body: {
+        baseToken: "bas_sync_error",
+        baseName: "同步错误 Base",
+        tables: [{
+          tableId: "tbl_subject",
+          tableName: "语文",
+          fields: [{ fieldId: "fld_status", fieldName: "进度", type: 1, options: [] }],
+        }],
+      },
+    });
+    assert.equal(preview.response.status, 201);
+    const key = encodeURIComponent("bas_sync_error:tbl_subject");
+    const draft = await request(baseUrl, `/api/local/feishu/workflow/subjects/${key}`, {
+      method: "PATCH",
+      body: {
+        trigger: { fieldId: "fld_status", fieldName: "进度", startValue: "待制作", optionId: null },
+        execution: { mode: "manual", concurrencyGroup: "default", maxConcurrent: 1, resourceGroups: [] },
+        packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-A", subjectCodeFieldId: null, branchMap: null },
+        upload: { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 },
+      },
+    });
+    assert.equal(draft.response.status, 200);
+    const enabled = await request(baseUrl, `/api/local/feishu/workflow/subjects/${key}/enable`, {
+      method: "POST",
+      body: { expectedVersion: draft.body.subject.configVersion },
+    });
+    assert.equal(enabled.response.status, 409);
+    assert.equal(enabled.body.error.code, "FEISHU_WORKFLOW_SYNC_FAILED");
+    assert.doesNotMatch(JSON.stringify(enabled.body), /FEISHUAPPSECRET|secret workspace/i);
+  } finally {
+    await app.close();
+    await new Promise((resolve) => bridge.close(resolve));
+    await rm(directory, { recursive: true, force: true });
   }
 });

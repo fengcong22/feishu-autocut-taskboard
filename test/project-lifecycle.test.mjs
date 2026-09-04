@@ -50,6 +50,37 @@ test("active listing omits archived projects and explicit history includes them"
   assert.equal(all.body.projects.find((project) => project.id === "temp-history").archivedAt !== null, true);
 });
 
+test("project history exposes its retained Feishu subject identity without tasks", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-project-subject-"));
+  const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+  try {
+    const timestamp = new Date().toISOString();
+    const subjectKey = "base-empty-history:table";
+    const projectId = subjectProjectId(subjectKey);
+    database.database.prepare(`INSERT INTO projects
+      (id, name, workspace_path, source, archived_at, next_task_number, created_at, updated_at)
+      VALUES (?, 'Empty history', NULL, 'feishu', ?, 1, ?, ?)`
+    ).run(projectId, timestamp, timestamp, timestamp);
+    database.database.prepare(`INSERT INTO feishu_bases
+      (base_token, base_name, removed_at, created_at, updated_at)
+      VALUES ('base-empty-history', 'Removed Base', ?, ?, ?)`
+    ).run(timestamp, timestamp, timestamp);
+    database.database.prepare(`INSERT INTO feishu_subjects
+      (subject_key, base_token, table_id, table_name, project_id, lifecycle, config_version,
+       config_json, metadata_json, removed_at, created_at, updated_at)
+      VALUES (?, 'base-empty-history', 'table', 'Removed subject', ?, 'disabled', 1,
+       '{}', '{}', ?, ?, ?)`
+    ).run(subjectKey, projectId, timestamp, timestamp, timestamp);
+
+    const project = database.listProjects({ includeArchived: true })
+      .find((candidate) => candidate.id === projectId);
+    assert.equal(project.subjectKey, subjectKey);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("archived projects reject writes until restored", async () => {
   const baseUrl = await startServer();
   await request(baseUrl, "/api/projects", { method: "POST", body: { id: "temp-write-guard", name: "Guard", workspacePath: null } });

@@ -118,6 +118,39 @@ test("opening the database interrupts abandoned runs and preserves resumable Cod
   }
 });
 
+test("deleting a newly-created running AI chat run restores the thread to idle", async () => {
+  const fixture = await createFixture();
+  try {
+    fixture.database.createAiChatThread({
+      id: "thread-1",
+      title: "New conversation",
+      status: "idle",
+      origin: {
+        projectId: "local",
+        projectName: "Local",
+        workspacePath: "/tmp/project",
+      },
+      codexThreadId: null,
+      model: "gpt-real",
+      reasoningEffort: "medium",
+      sandbox: "read-only",
+    });
+    fixture.database.createAiChatRun({
+      id: "run-1",
+      threadId: "thread-1",
+      status: "running",
+    });
+
+    fixture.database.deleteAiChatRun("run-1");
+
+    assert.equal(fixture.database.getAiChatRun("run-1"), null);
+    assert.equal(fixture.database.getAiChatThread("thread-1").status, "idle");
+    assert.equal(fixture.database.getAiChatThread("thread-1").currentRun, null);
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("deleting an AI chat thread removes its runs and visible events", async () => {
   const fixture = await createFixture();
   try {

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { createTaskboardServer } from "../server/index.mjs";
 import { createFeishuPackageApi } from "../server/feishu-package-api.mjs";
 import { createFeishuPackageStore } from "../server/feishu-package-config.mjs";
 
@@ -138,4 +139,95 @@ test("package listing includes real reference summaries from the store", async (
   assert.deepEqual(result.body.packages[0].references, [{ subjectKey: "base/table", subjectName: "语文" }]);
   assert.equal(result.body.packages[0].referenceCount, 1);
   store.references = original;
+});
+
+test("production server blocks deletion for enabled subjects and unfinished tasks", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-references-"));
+  const alias = "Auto-cut-production";
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    feishuPackages: {
+      [alias]: {
+        alias,
+        name: "Production package",
+        projectId: "production-package",
+        workspacePath: null,
+        model: null,
+        reasoningEffort: null,
+        prompt: null,
+        zipSourceDirectory: null,
+        maxConcurrent: 1,
+        state: "draft",
+      },
+    },
+  });
+  const timestamp = new Date().toISOString();
+  const config = {
+    packageRoute: { routeMode: "fixed", packageAlias: alias, subjectCodeFieldId: null, branchMap: null },
+  };
+  app.database.database.prepare(`
+    INSERT INTO feishu_bases (base_token, base_name, source_url_label, metadata_refreshed_at, created_at, updated_at)
+    VALUES (?, ?, NULL, NULL, ?, ?)
+  `).run("base-production", "生产 Base", timestamp, timestamp);
+  app.database.database.prepare(`
+    INSERT INTO feishu_subjects (
+      subject_key, base_token, table_id, table_name, project_id, display_enabled,
+      lifecycle, config_version, config_json, metadata_json, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 1, 'enabled', 1, ?, '{}', ?, ?)
+  `).run(
+    "base-production:table-chinese",
+    "base-production",
+    "table-chinese",
+    "语文",
+    "feishu-production",
+    JSON.stringify(config),
+    timestamp,
+    timestamp,
+  );
+  const actor = { type: "user", id: "local-user", name: "本地用户", avatarUrl: null };
+  app.database.createTask({
+    projectId: "local",
+    title: "待剪辑视频",
+    description: "",
+    status: "todo",
+    priority: "none",
+    labels: ["feishu"],
+    actor,
+    assignee: actor,
+    workflowId: null,
+    startDate: null,
+    dueDate: null,
+    recurrence: null,
+    feishuOrigin: {
+      source: "feishu-base",
+      eventId: "evt-production",
+      baseToken: "base-production",
+      tableId: "table-chinese",
+      recordId: "record-1",
+      subjectKey: "base-production:table-chinese",
+      packageAlias: alias,
+    },
+  });
+
+  try {
+    const address = await app.listen({ port: 0 });
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const listedResponse = await fetch(`${baseUrl}/api/local/autocut/packages`);
+    const listed = await listedResponse.json();
+    assert.equal(listed.packages[0].referenceCount, 2);
+    assert.deepEqual(listed.packages[0].references.map((reference) => reference.type).sort(), ["subject", "task"]);
+
+    const removedResponse = await fetch(`${baseUrl}/api/local/autocut/packages/${alias}`, {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ revision: listed.packages[0].revision }),
+    });
+    const removed = await removedResponse.json();
+    assert.equal(removedResponse.status, 409);
+    assert.equal(removed.error.code, "PACKAGE_IN_USE");
+    assert.equal(removed.error.details.references.length, 2);
+  } finally {
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });

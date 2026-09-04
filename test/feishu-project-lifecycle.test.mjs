@@ -55,6 +55,22 @@ function baseWithSubjects(ids) {
   };
 }
 
+function configuredSubjectPatch(tableId) {
+  return {
+    displayEnabled: true,
+    trigger: {
+      fieldId: `status-${tableId}`,
+      fieldName: "Status",
+      startValue: "Ready",
+      optionId: `ready-${tableId}`,
+    },
+    title: { fieldId: null, fieldName: null },
+    execution: { mode: "manual", concurrencyGroup: "autocut", maxConcurrent: 1, resourceGroups: [] },
+    packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-A", subjectCodeFieldId: null, branchMap: null },
+    upload: { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 },
+  };
+}
+
 function createViewState(database, subjectKey) {
   const initial = database.getUnifiedWorkflowViews(subjectKey);
   const created = database.createUnifiedWorkflowView({
@@ -96,6 +112,73 @@ test("removing one subject archives only that subject project", async () => {
   assert.equal(fixture.database.getProject(sibling.projectId).archivedAt, null);
   assert.equal(fixture.database.listProjects().some((item) => item.id === subject.projectId), false);
   assert.equal(fixture.database.listProjects({ includeArchived: true }).some((item) => item.id === subject.projectId), true);
+});
+
+test("removing a draft Base does not require Bridge lifecycle sync", async () => {
+  let syncCalls = 0;
+  const fixture = await createFeishuFixture({
+    syncSubject: async () => {
+      syncCalls += 1;
+      throw new Error("bridge unavailable");
+    },
+  });
+  const catalog = await fixture.store.upsertBasePreview(baseWithSubjects(["table-a", "table-b"]));
+
+  const remaining = await fixture.store.removeBase(catalog.baseToken);
+
+  assert.deepEqual(remaining, []);
+  assert.equal(syncCalls, 0);
+  for (const subject of catalog.subjects) {
+    assert.notEqual(fixture.database.getProject(subject.projectId).archivedAt, null);
+  }
+});
+
+test("removing a draft with malformed history still requires Bridge lifecycle sync", async () => {
+  let syncCalls = 0;
+  const fixture = await createFeishuFixture({
+    syncSubject: async () => {
+      syncCalls += 1;
+      throw new Error("bridge unavailable");
+    },
+  });
+  const catalog = await fixture.store.upsertBasePreview(baseWithSubjects(["table-a"]));
+  const subject = catalog.subjects[0];
+  fixture.database.database.prepare(`UPDATE feishu_subject_versions
+    SET snapshot_json = ? WHERE subject_key = ? AND version = 1`)
+    .run("{}", subject.subjectKey);
+
+  await assert.rejects(() => fixture.store.removeBase(catalog.baseToken), /bridge unavailable/);
+
+  assert.equal(syncCalls, 1);
+  assert.equal(fixture.database.getProject(subject.projectId).archivedAt, null);
+});
+
+test("removing a previously enabled draft still requires Bridge lifecycle sync", async () => {
+  let syncCalls = 0;
+  const fixture = await createFeishuFixture({
+    syncSubject: async (_subject, options) => {
+      syncCalls += 1;
+      if (options.lifecycle === "disabled") throw new Error("bridge unavailable");
+      return { ok: true };
+    },
+  });
+  const catalog = await fixture.store.upsertBasePreview(baseWithSubjects(["table-a"]));
+  const configured = await fixture.store.saveSubjectDraft(
+    catalog.subjects[0].subjectKey,
+    configuredSubjectPatch("table-a"),
+  );
+  const enabled = await fixture.store.enableSubject(configured.subjectKey, configured.configVersion);
+  await fixture.store.saveSubjectDraft(enabled.subjectKey, {
+    ...configuredSubjectPatch("table-a"),
+    expectedVersion: enabled.configVersion,
+  });
+
+  await assert.rejects(() => fixture.store.removeBase(catalog.baseToken), /bridge unavailable/);
+
+  assert.equal(syncCalls, 2);
+  const remaining = await fixture.store.listCatalog();
+  assert.deepEqual(remaining[0].subjects.map((subject) => subject.lifecycle), ["draft"]);
+  assert.equal(fixture.database.getProject(catalog.subjects[0].projectId).archivedAt, null);
 });
 
 test("re-adding a removed subject restores its Feishu project", async () => {
@@ -157,9 +240,9 @@ test("removing and restoring Base subjects synchronizes project and view lifecyc
 test("failed Bridge lifecycle sync leaves Base subjects, projects, and views unchanged", async () => {
   let syncCalls = 0;
   const fixture = await createFeishuFixture({
-    syncSubject: async () => {
+    syncSubject: async (_subject, options) => {
       syncCalls += 1;
-      if (syncCalls === 2) throw new Error("bridge unavailable");
+      if (options.lifecycle === "disabled") throw new Error("bridge unavailable");
       return { ok: true };
     },
   });
@@ -169,11 +252,17 @@ test("failed Bridge lifecycle sync leaves Base subjects, projects, and views unc
     createViewState(fixture.database, subject.subjectKey),
   ]));
 
+  const configured = await fixture.store.saveSubjectDraft(
+    catalog.subjects[0].subjectKey,
+    configuredSubjectPatch("table-a"),
+  );
+  await fixture.store.enableSubject(configured.subjectKey, configured.configVersion);
+
   await assert.rejects(() => fixture.store.removeBase(catalog.baseToken), /bridge unavailable/);
   assert.equal(syncCalls, 2);
 
   const active = await fixture.store.listCatalog();
-  assert.deepEqual(active[0].subjects.map((subject) => subject.lifecycle), ["draft", "draft"]);
+  assert.deepEqual(active[0].subjects.map((subject) => subject.lifecycle), ["enabled", "draft"]);
   for (const subject of catalog.subjects) {
     assert.equal(fixture.database.getProject(subject.projectId).archivedAt, null);
     assert.deepEqual(viewState(fixture.database, subject.subjectKey), {

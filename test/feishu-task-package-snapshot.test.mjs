@@ -165,7 +165,7 @@ test("package refresh replaces the snapshot only for a waiting trusted task", as
   }
 });
 
-test("a known disabled package can register a held task but cannot start it", async () => {
+test("a known disabled package accepts a held start without launching Codex", async () => {
   const fixtureData = await fixture();
   try {
     const projectId = subjectProjectId("bas_snapshot:tbl_subject");
@@ -193,8 +193,12 @@ test("a known disabled package can register a held task but cannot start it", as
       body: "{}",
     });
     const startBody = await start.json();
-    assert.equal(start.status, 409);
-    assert.equal(startBody.error.code, "PACKAGE_DISABLED");
+    assert.equal(start.status, 202);
+    assert.equal(startBody.task.status, "todo");
+    assert.equal(startBody.task.threadId, null);
+    assert.equal(startBody.execution.state, "delayed");
+    assert.equal(fixtureData.app.database.getFeishuExecution(created.body.task.id).state, "delayed");
+    assert.equal(fixtureData.app.database.listAiChatThreads().length, 0);
   } finally {
     await fixtureData.app.close();
     await rm(fixtureData.directory, { recursive: true, force: true });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdtemp, mkdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -56,6 +56,8 @@ async function createFixture({
     supported_reasoning_levels: [{ effort: "low" }],
   }],
   failSkillDiscovery = false,
+  failFirstExecBeforeThread = false,
+  requireSkipGitRepoCheck = false,
   turnDelayMs = 0,
   allowAutomaticExecution = false,
   feishuPackageStore,
@@ -66,7 +68,10 @@ async function createFixture({
   await mkdir(workspacePath);
   const workspace = await realpath(workspacePath);
   const codexExecutable = path.join(directory, "fake-codex.mjs");
+  const promptCapturePath = path.join(directory, "codex-prompt.txt");
+  const firstExecFailureMarker = path.join(directory, "first-exec-failure");
   await writeFile(codexExecutable, `
+import { existsSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
 if (args[0] === "debug") {
   process.stdout.write(${JSON.stringify(JSON.stringify({ models: catalogModels }))});
@@ -86,10 +91,18 @@ if (args[0] === "debug") {
     }
   });
 } else {
+  if (${JSON.stringify(requireSkipGitRepoCheck)} && !args.includes("--skip-git-repo-check")) {
+    process.exit(41);
+  }
+  if (${JSON.stringify(failFirstExecBeforeThread)} && !existsSync(${JSON.stringify(firstExecFailureMarker)})) {
+    writeFileSync(${JSON.stringify(firstExecFailureMarker)}, "failed");
+    process.exit(42);
+  }
   process.stdin.setEncoding("utf8");
   let prompt = "";
   process.stdin.on("data", (chunk) => { prompt += chunk; });
   process.stdin.on("end", () => {
+    writeFileSync(${JSON.stringify(promptCapturePath)}, prompt);
     process.stdout.write('{"type":"thread.started","thread_id":"fixture-session"}\\n');
     setTimeout(() => {
       process.stdout.write(prompt.includes("FAIL")
@@ -130,7 +143,14 @@ if (args[0] === "debug") {
     name: "Fixture subject",
     workspacePath: workspace,
   });
-  return { app, baseUrl: `http://127.0.0.1:${address.port}`, directory, packagesPath, workspace };
+  return {
+    app,
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    directory,
+    packagesPath,
+    promptCapturePath,
+    workspace,
+  };
 }
 
 async function request(baseUrl, pathname, options = {}) {
@@ -322,6 +342,132 @@ test("manual start creates and runs a task-linked local Codex thread", async () 
   }
 });
 
+test("trusted Auto-Cut packages can run from non-Git workspaces", async () => {
+  const fixture = await createFixture({ requireSkipGitRepoCheck: true });
+  try {
+    const task = await request(fixture.baseUrl, "/api/tasks", {
+      method: "POST",
+      body: {
+        projectId: "auto-cut-copy-a",
+        title: "Non-Git Auto-Cut package",
+        description: feishuDescription(),
+        status: "todo",
+        priority: "high",
+        labels: ["feishu"],
+      },
+    });
+    assert.equal(task.response.status, 201);
+
+    const started = await request(fixture.baseUrl, `/api/tasks/${task.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    assert.equal(started.response.status, 202);
+    await waitForRun(
+      fixture.baseUrl,
+      started.body.thread.id,
+      (current) => current.status === "completed",
+    );
+  } finally {
+    await fixture.app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("server-claimed Auto-Cut prompts do not ask Codex to claim the task again", async () => {
+  const fixture = await createFixture();
+  try {
+    const task = await request(fixture.baseUrl, "/api/tasks", {
+      method: "POST",
+      body: {
+        projectId: "auto-cut-copy-a",
+        title: "Already claimed Auto-Cut package",
+        description: feishuDescription(),
+        status: "todo",
+        priority: "high",
+        labels: ["feishu"],
+      },
+    });
+    assert.equal(task.response.status, 201);
+
+    const started = await request(fixture.baseUrl, `/api/tasks/${task.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    assert.equal(started.response.status, 202);
+    await waitForRun(
+      fixture.baseUrl,
+      started.body.thread.id,
+      (current) => current.status === "completed",
+    );
+
+    const prompt = await readFile(fixture.promptCapturePath, "utf8");
+    assert.doesNotMatch(prompt, /\$manage-taskboard|e-taskboard/);
+    assert.match(prompt, /<taskboard_context>/);
+    assert.doesNotMatch(prompt, /issue_identifier:/);
+    assert.match(prompt, /autocut_source:\s*source: feishu-base/);
+    assert.match(prompt, /base_token: bas_fixture/);
+    assert.match(prompt, /table_id: tbl_fixture/);
+    assert.match(prompt, /record_id: rec_fixture/);
+    assert.match(prompt, /<user_message>\s*trusted fixture prompt\s*<\/user_message>/);
+  } finally {
+    await fixture.app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("trusted tasks can retry after Codex failed before creating a native thread", async () => {
+  const fixture = await createFixture({ failFirstExecBeforeThread: true });
+  try {
+    const task = await request(fixture.baseUrl, "/api/tasks", {
+      method: "POST",
+      body: {
+        projectId: "auto-cut-copy-a",
+        title: "Retry pre-start failure",
+        description: feishuDescription(),
+        status: "todo",
+        priority: "high",
+        labels: ["feishu"],
+      },
+    });
+    const first = await request(fixture.baseUrl, `/api/tasks/${task.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    assert.equal(first.response.status, 202);
+    await waitForRun(fixture.baseUrl, first.body.thread.id, (run) => run.status === "failed");
+    const blocked = await waitForTask(
+      fixture.baseUrl,
+      task.body.task.id,
+      (current) => current.status === "blocked",
+    );
+    assert.equal(blocked.threadId, first.body.thread.id);
+
+    const ready = await request(fixture.baseUrl, `/api/tasks/${task.body.task.id}/move`, {
+      method: "POST",
+      body: { version: blocked.version, status: "todo", sortOrder: 0 },
+    });
+    assert.equal(ready.response.status, 200);
+    assert.equal(ready.body.task.threadId, first.body.thread.id);
+
+    const retried = await request(fixture.baseUrl, `/api/tasks/${task.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    assert.equal(retried.response.status, 202);
+    assert.notEqual(retried.body.thread.id, first.body.thread.id);
+    await waitForRun(
+      fixture.baseUrl,
+      retried.body.thread.id,
+      (run) => run.status === "completed",
+    );
+    assert.equal(fixture.app.database.getAiChatThread(first.body.thread.id).status, "failed");
+  } finally {
+    await fixture.app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
 test("manual start resolves a trusted package independently from the subject project", async () => {
   const fixture = await createFixture();
   try {
@@ -491,7 +637,7 @@ test("manual status changes during a run are preserved and clear the AI start cl
   }
 });
 
-test("concurrent manual starts claim the task once and create one AI thread", async () => {
+test("concurrent manual starts are idempotent and create one AI thread", async () => {
   const fixture = await createFixture();
   try {
     const project = await request(fixture.baseUrl, "/api/projects", {
@@ -523,7 +669,7 @@ test("concurrent manual starts claim the task once and create one AI thread", as
     ]);
     assert.deepEqual(
       [first.response.status, second.response.status].sort((left, right) => left - right),
-      [202, 409],
+      [202, 202],
     );
 
     const threads = await request(fixture.baseUrl, "/api/local/ai/threads");

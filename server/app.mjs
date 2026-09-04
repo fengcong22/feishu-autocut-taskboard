@@ -2154,7 +2154,19 @@ export function createTaskboardServer(options = {}) {
           project: database.getProject(projectId),
         };
       }
-      return { ...resolvedWorkspace, issue };
+      return {
+        ...resolvedWorkspace,
+        issue,
+        skipGitRepoCheck: Boolean(trustedOrigin && packageConfig),
+        trustedAutoCutSource: trustedOrigin && packageConfig
+          ? {
+              source: trustedOrigin.source,
+              baseToken: trustedOrigin.baseToken,
+              tableId: trustedOrigin.tableId,
+              recordId: trustedOrigin.recordId,
+            }
+          : null,
+      };
     }
 
     const projectPayload = await readCloudJson("/api/projects");
@@ -2263,8 +2275,14 @@ export function createTaskboardServer(options = {}) {
 
   function enqueueArtifactUpload(task, metadata, artifact, { automaticOnly = false } = {}) {
     const snapshotSubjectKey = metadata.subjectKey ?? `${metadata.baseToken}:${metadata.tableId}`;
-    const target = Number.isSafeInteger(metadata.configVersion)
+    const snapshotTarget = Number.isSafeInteger(metadata.configVersion)
       ? database.getFeishuSubjectUploadTargetByVersion(snapshotSubjectKey, metadata.configVersion)
+      : database.getFeishuSubjectUploadTargetByOrigin(metadata.baseToken, metadata.tableId);
+    // A task created before upload was configured has an intentionally empty
+    // target in its snapshot. Let that task use the subject's current target;
+    // once a target was captured, keep the creation-time binding stable.
+    const target = snapshotTarget?.targetPath
+      ? snapshotTarget
       : database.getFeishuSubjectUploadTargetByOrigin(metadata.baseToken, metadata.tableId);
     if (automaticOnly && target?.enqueueMode !== "automatic") return null;
     if (!target) {
@@ -2551,6 +2569,7 @@ export function createTaskboardServer(options = {}) {
       run = await aiChat.startTurn(thread.id, {
         message: packageConfig.prompt,
       }, {
+        taskClaimedByServer: true,
         onRunCreated: (createdRun) => database.bindTaskAiStartRun(
           claimedTask.id,
           claimedTask.claimToken,
@@ -2642,7 +2661,14 @@ export function createTaskboardServer(options = {}) {
       );
     }
     assertTaskStartAllowed(signal);
-    const claimedTask = database.claimTaskForAiStart(task.id, task.version, actor);
+    const startableTask = task.threadId
+      ? database.detachFailedPreStartThreadForRetry(task.id, task.version, actor)
+      : task;
+    const claimedTask = database.claimTaskForAiStart(
+      startableTask.id,
+      startableTask.version,
+      actor,
+    );
     events.emit("task.updated", { task: claimedTask });
     const execution = executionRequestForTask(claimedTask, metadata, packageConfig);
     let lease = providedLease;
@@ -3841,6 +3867,15 @@ export function createTaskboardServer(options = {}) {
           Boolean(matchingFeishuTaskOrigin(task, task.feishuOrigin))
         ));
         return sendJson(response, 200, { items });
+      }
+
+      if (pathname === "/api/local/task-artifact-summaries") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        const { projectId } = parseArtifactUploadListFilters(url.searchParams);
+        const summaries = database.listTaskArtifactSummaryItems(projectId)
+          .filter(({ task, origin }) => Boolean(matchingFeishuTaskOrigin(task, origin)))
+          .map(({ summary }) => summary);
+        return sendJson(response, 200, { summaries });
       }
 
       const taskArtifactUploadRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/upload(?:\/(retry))?$/);

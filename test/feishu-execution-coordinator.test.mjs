@@ -210,6 +210,41 @@ test("manual immediate start skips the delay", async () => {
   assert.equal(fixture.starts.length, 1);
 });
 
+test("repeated manual scheduling of the same task is idempotent while the first start is pending", async () => {
+  const fixture = createFixture({ packages: { "Auto-cut-copyA": { maxConcurrent: 1 } } });
+  fixture.tasks.set("task-1", task("task-1"));
+
+  const first = fixture.coordinator.schedule(fixture.tasks.get("task-1"), metadata("Auto-cut-copyA"), "manual");
+  const second = fixture.coordinator.schedule(fixture.tasks.get("task-1"), metadata("Auto-cut-copyA"), "manual");
+  const secondSnapshot = fixture.database.getFeishuExecution("task-1");
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+
+  assert.equal(firstResult.task.status, "in_progress");
+  assert.equal(secondSnapshot.state, "delayed");
+  assert.equal(secondResult.task.id, "task-1");
+  assert.equal(fixture.starts.length, 1);
+});
+
+test("repeated manual scheduling reuses a running execution after launch settles", async () => {
+  const fixture = createFixture({ packages: { "Auto-cut-copyA": { maxConcurrent: 1 } } });
+  fixture.tasks.set("task-1", task("task-1"));
+
+  const first = await fixture.coordinator.schedule(
+    fixture.tasks.get("task-1"),
+    metadata("Auto-cut-copyA"),
+    "manual",
+  );
+  const second = await fixture.coordinator.schedule(
+    fixture.tasks.get("task-1"),
+    metadata("Auto-cut-copyA"),
+    "manual",
+  );
+
+  assert.equal(first.execution.state, "running");
+  assert.equal(second.execution.state, "running");
+  assert.equal(fixture.starts.length, 1);
+});
+
 test("a saturated package queues FIFO while another package starts independently", async () => {
   const fixture = createFixture({
     packages: {

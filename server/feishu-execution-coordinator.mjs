@@ -205,11 +205,14 @@ export function createFeishuExecutionCoordinator({
     if (!task?.id) throw new TypeError("task.id is required");
     const existing = entries.get(task.id);
     if (existing) {
+      // A drop can be delivered more than once before React has committed its
+      // loading state. The first reservation is already durable, so a repeat
+      // with the same trigger is an idempotent read rather than a conflict.
+      if (existing.trigger === trigger) return executionResult(task.id);
       if (trigger !== "automatic") {
         const activeExecution = database.getFeishuExecution(task.id);
         if (
-          (existing.scheduling && existing.trigger === trigger)
-          || existing.launching
+          existing.launching
           || activeExecution?.state === "running"
           || activeExecution?.state === "queued"
         ) {
@@ -228,6 +231,12 @@ export function createFeishuExecutionCoordinator({
           return pump(existing);
         }
       }
+      return executionResult(task.id);
+    }
+    const persisted = database.getFeishuExecution(task.id);
+    if (persisted?.trigger === trigger) {
+      // The in-memory entry may already have been removed after launch while
+      // the durable execution remains running. Reuse that reservation too.
       return executionResult(task.id);
     }
     const mode = metadata?.executionMode === "automatic" || metadata?.mode === "automatic"

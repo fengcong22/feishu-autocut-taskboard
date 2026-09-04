@@ -4,6 +4,7 @@ import { ApiError } from "./database.mjs";
 
 const now = () => new Date().toISOString();
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
+const TARGET_ID_PATTERN = /^[\p{L}\p{N}][\p{L}\p{N}_-]{0,255}$/u;
 const LIFECYCLES = new Set(["draft", "enabled", "disabled"]);
 const EXECUTION_MODES = new Set(["manual", "automatic"]);
 const ARTIFACT_SOURCE_MODES = new Set(["manual_select", "watch_directory", "driver_report"]);
@@ -33,6 +34,13 @@ function identifier(value, name) {
 function optionalIdentifier(value, name) {
   if (value === undefined || value === null || value === "") return null;
   return identifier(value, name);
+}
+
+function optionalTargetIdentifier(value, name) {
+  if (value === undefined || value === null || value === "") return null;
+  const result = requireText(value, name);
+  if (!TARGET_ID_PATTERN.test(result)) throw new ApiError(400, "INVALID_FIELD", `${name} is invalid`);
+  return result;
 }
 
 function assertKeys(value, allowed, name) {
@@ -376,7 +384,7 @@ function validateSubjectConfig(value) {
   if (!EXECUTION_MODES.has(value.upload.enqueueMode)) throw new ApiError(400, "INVALID_FIELD", "upload.enqueueMode is invalid");
   if (!ARTIFACT_SOURCE_MODES.has(value.upload.artifactSourceMode)) throw new ApiError(400, "INVALID_FIELD", "upload.artifactSourceMode is invalid");
   if (!Number.isSafeInteger(value.upload.uploadConcurrency) || value.upload.uploadConcurrency < 1) throw new ApiError(400, "INVALID_FIELD", "upload.uploadConcurrency must be positive");
-  optionalIdentifier(value.upload.targetId, "upload.targetId");
+  optionalTargetIdentifier(value.upload.targetId, "upload.targetId");
   if (typeof value.displayEnabled !== "boolean") throw new ApiError(400, "INVALID_FIELD", "displayEnabled must be boolean");
   for (const field of ["artifactSourcePath", "targetPath"]) {
     const candidate = value.upload[field];
@@ -542,6 +550,36 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     db.prepare(`INSERT INTO feishu_subject_versions (subject_key, version, snapshot_json, created_at) VALUES (?, ?, ?, ?)`)
       .run(row.subject_key, version, JSON.stringify(snapshot), timestamp);
   }
+
+  function requiresBridgeDisableBeforeRemoval(subject) {
+    if (subject.lifecycle === "enabled") return true;
+    if (subject.lifecycle !== "draft") return false;
+
+    const versions = db.prepare(`SELECT version, snapshot_json FROM feishu_subject_versions
+      WHERE subject_key = ? ORDER BY version`).all(subject.subject_key);
+    if (versions.length !== subject.config_version) return true;
+
+    // Only a complete draft-only history proves that Bridge never received this subject.
+    let lastSyncedLifecycle = null;
+    let latestLifecycle = null;
+    for (const [index, version] of versions.entries()) {
+      if (version.version !== index + 1) return true;
+      try {
+        const snapshot = JSON.parse(version.snapshot_json);
+        if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)
+          || snapshot.configVersion !== version.version || !LIFECYCLES.has(snapshot.lifecycle)) {
+          return true;
+        }
+        latestLifecycle = snapshot.lifecycle;
+        if (snapshot.lifecycle !== "draft") lastSyncedLifecycle = snapshot.lifecycle;
+      } catch {
+        return true;
+      }
+    }
+    if (latestLifecycle !== subject.lifecycle) return true;
+    return lastSyncedLifecycle !== null && lastSyncedLifecycle !== "disabled";
+  }
+
   return {
     async listCatalog() {
       return db.prepare("SELECT * FROM feishu_bases WHERE removed_at IS NULL ORDER BY base_name, base_token").all().map((row) => rowBase(db, row));
@@ -842,7 +880,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
             lifecycle: "disabled",
             configVersion: expectedVersion + 1,
           });
-          if (typeof syncSubject === "function") {
+          if (requiresBridgeDisableBeforeRemoval(locked) && typeof syncSubject === "function") {
             await syncSubject(disabled, { lifecycle: "disabled", expectedVersion });
           }
           const transitioned = db.prepare(`UPDATE feishu_subjects
