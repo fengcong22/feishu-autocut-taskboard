@@ -1069,19 +1069,19 @@ test("device workspaces come from this machine's Codex project roots", async () 
   });
 });
 
-test("accepts private LAN requests and rejects public Host and Origin headers", async () => {
-  const baseUrl = await startServer(undefined, { host: "0.0.0.0" });
+test("accepts loopback requests and rejects public Host and Origin headers", async () => {
+  const baseUrl = await startServer();
 
   const codexOriginResult = await request(baseUrl, "/health", {
     headers: { origin: "app://-" },
   });
   assert.equal(codexOriginResult.response.status, 200);
 
-  const lanHostResult = await requestWithHost(baseUrl, "192.168.1.24:47823");
-  assert.equal(lanHostResult.status, 200);
+  const loopbackHostResult = await requestWithHost(baseUrl, "127.0.0.1:47823");
+  assert.equal(loopbackHostResult.status, 200);
 
   const lanOriginResult = await request(baseUrl, "/health", {
-    headers: { origin: "http://192.168.1.24:47823" },
+    headers: { origin: "http://127.0.0.1:47823" },
   });
   assert.equal(lanOriginResult.response.status, 200);
 
@@ -1960,13 +1960,13 @@ test("request boundaries reject unknown fields and invalid values", async () => 
   assert.equal(invalidWorktree.body.error.code, "INVALID_FIELD");
 });
 
-test("task changes from one LAN client are broadcast to another client", async () => {
-  const baseUrl = await startServer(undefined, { host: "0.0.0.0" });
-  const lanHeaders = {
-    host: "192.168.1.24:47823",
-    origin: "http://192.168.1.24:47823",
+test("task changes from one loopback client are broadcast to another client", async () => {
+  const baseUrl = await startServer();
+  const loopbackHeaders = {
+    host: "127.0.0.1:47823",
+    origin: "http://127.0.0.1:47823",
   };
-  const eventResponse = await fetch(`${baseUrl}/api/events`, { headers: lanHeaders });
+  const eventResponse = await fetch(`${baseUrl}/api/events`, { headers: loopbackHeaders });
   assert.equal(eventResponse.status, 200);
   const reader = eventResponse.body.getReader();
   const decoder = new TextDecoder();
@@ -1974,7 +1974,7 @@ test("task changes from one LAN client are broadcast to another client", async (
 
   const createResult = await request(baseUrl, "/api/tasks", {
     method: "POST",
-    headers: lanHeaders,
+    headers: loopbackHeaders,
     body: { title: "Broadcast me" },
   });
   assert.equal(createResult.response.status, 201);
@@ -1992,7 +1992,7 @@ test("task changes from one LAN client are broadcast to another client", async (
   assert.equal(event.task.id, createResult.body.task.id);
 
   const listResult = await request(baseUrl, "/api/tasks?projectId=local", {
-    headers: lanHeaders,
+    headers: loopbackHeaders,
   });
   assert.equal(listResult.response.status, 200);
   assert.equal(listResult.body.tasks.some((task) => task.id === createResult.body.task.id), true);

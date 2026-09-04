@@ -4,6 +4,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
+import { codexInvocation } from "../shared/codex-invocation.mjs";
 import { ApiError } from "./database.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -136,7 +137,8 @@ function sanitizeModels(value) {
 
 function listSkills(codexExecutable, workspacePath, processEnv) {
   return new Promise((resolve, reject) => {
-    const child = spawn(codexExecutable, ["app-server", "--stdio"], {
+    const invocation = codexInvocation(codexExecutable, ["app-server", "--stdio"]);
+    const child = spawn(invocation.command, invocation.args, {
       cwd: workspacePath,
       env: processEnv,
       stdio: ["pipe", "pipe", "ignore"],
@@ -254,8 +256,9 @@ export async function discoverAiCatalog({
   processEnv,
 }) {
   const environment = withoutTaskboardLauncherEnvironment(processEnv);
+  const debugInvocation = codexInvocation(codexExecutable, ["debug", "models"]);
   const [modelResult, skillEntries] = await Promise.all([
-    execFileAsync(codexExecutable, ["debug", "models"], {
+    execFileAsync(debugInvocation.command, debugInvocation.args, {
       cwd: workspacePath,
       env: environment,
       encoding: "utf8",

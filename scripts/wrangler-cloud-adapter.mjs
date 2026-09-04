@@ -16,10 +16,19 @@ import {
   CLOUD_PROJECT_COUNTS_SQL,
   createCloudD1ImportSql,
 } from "./migrate-to-cloud.mjs";
+import { codexInvocation } from "../shared/codex-invocation.mjs";
 
 const execFile = promisify(execFileCallback);
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const defaultWrangler = path.join(projectRoot, "node_modules", ".bin", "wrangler");
+// The npm shim is a POSIX shell script on Windows. Use Wrangler's JavaScript
+// entrypoint there so child_process does not depend on an installed shell.
+const defaultWrangler = process.platform === "win32"
+  ? path.join(projectRoot, "node_modules", "wrangler", "bin", "wrangler.js")
+  : path.join(projectRoot, "node_modules", ".bin", "wrangler");
+const defaultRunCommand = (executable, args, options) => {
+  const invocation = codexInvocation(executable, args);
+  return execFile(invocation.command, invocation.args, options);
+};
 
 function parseD1Results(stdout) {
   const parsed = JSON.parse(stdout);
@@ -41,7 +50,7 @@ export function createWranglerCloudAdapters({
   bucket = "codex-taskboard-attachments",
   preparedImportSql,
   environment = process.env,
-  runCommand = execFile,
+  runCommand = defaultRunCommand,
 } = {}) {
   const remoteEnabled = environment.TASKBOARD_MIGRATION_REMOTE === "1";
   const useRemote = remote ?? remoteEnabled;

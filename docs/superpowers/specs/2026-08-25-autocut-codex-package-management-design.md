@@ -288,12 +288,20 @@ Drafts may be incomplete. Enabling requires:
 
 Runtime behavior is fail-closed:
 
+- a server-registered Feishu task whose package alias resolves to its trusted
+  machine-local package snapshot may run from a non-Git workspace; Taskboard
+  supplies Codex's non-Git workspace flag only for that server-derived path;
+  ordinary tasks, copied description markers, browser input, and Feishu cell
+  values cannot request or inherit the flag;
 - a disabled package, missing workspace, or unavailable model leaves the task
   in `待处理` with a safe configuration error and does not start Codex;
 - a restart restores persisted delay and queue state without creating a
   duplicate task or Codex run;
 - failure before a Codex run exists releases the lease and returns the task to
   `待处理` with a retry action;
+- a failed local conversation that never received a native Codex thread ID may
+  be detached when its trusted task is retried from `待处理`; the failed
+  conversation remains in history and the retry creates a new conversation;
 - failure after Codex started records the failure and requires an explicit
   retry, because partial media output may exist;
 - a missing ZIP reports `等待选择 ZIP` and allows manual association;
