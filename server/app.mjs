@@ -3108,7 +3108,7 @@ export function createTaskboardServer(options = {}) {
     const target = snapshotTarget?.targetPath
       ? snapshotTarget
       : database.getFeishuSubjectUploadTargetByOrigin(metadata.baseToken, metadata.tableId);
-    if (automaticOnly && target?.enqueueMode !== "automatic") return null;
+    if (automaticOnly && (snapshotTarget?.enqueueMode ?? target?.enqueueMode) !== "automatic") return null;
     if (!target) {
       throw new ApiError(409, "TASK_UPLOAD_NOT_CONFIGURED", "This task is not linked to a configured subject");
     }

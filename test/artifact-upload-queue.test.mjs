@@ -190,6 +190,7 @@ async function registerArtifactTask(fixture, {
   executionMode = "automatic",
   enqueueMode = "automatic",
   artifactSourceMode = "driver_report",
+  targetConfigured = true,
 }) {
   const tableId = "tbl_subject";
   const sourceDirectory = path.join(fixture.directory, `${baseToken}-accepted-zips`);
@@ -217,8 +218,8 @@ async function registerArtifactTask(fixture, {
           enqueueMode,
           artifactSourceMode,
           artifactSourcePath: artifactSourceMode === "driver_report" ? sourceDirectory : null,
-          targetId: `${baseToken}-target`,
-          targetPath: destinationDirectory,
+          targetId: targetConfigured ? `${baseToken}-target` : null,
+          targetPath: targetConfigured ? destinationDirectory : null,
           uploadConcurrency: 1,
         },
       },
@@ -949,14 +950,28 @@ test("driver report cannot register or complete an archived task", async () => {
   }
 });
 
-test("driver report automatic completion does not enqueue when enqueue mode is manual", async () => {
+test("driver report keeps its creation-time manual enqueue policy when a target is added later", async () => {
   const fixture = await createDriverReportFixture("taskboard-driver-report-manual-enqueue-");
   try {
     const registered = await registerArtifactTask(fixture, {
       baseToken: "bas_driver_manual_enqueue",
       executionMode: "automatic",
       enqueueMode: "manual",
+      targetConfigured: false,
     });
+    const subjectPath = `/api/local/feishu/workflow/subjects/${encodeURIComponent(registered.subject.subjectKey)}`;
+    const reconfigured = await request(fixture.baseUrl, subjectPath, {
+      method: "PATCH",
+      json: {
+        upload: {
+          ...registered.subject.upload,
+          enqueueMode: "automatic",
+          targetId: "later-automatic-target",
+          targetPath: registered.destinationDirectory,
+        },
+      },
+    });
+    assert.equal(reconfigured.response.status, 200);
     const binding = bindActiveArtifactRun(fixture, registered.task, "manual-enqueue");
     const reported = await writeReportedZip(
       registered.sourceDirectory,
