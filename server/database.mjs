@@ -731,6 +731,15 @@ function projectSummaryFromRow(row) {
   };
 }
 
+function workflowWorkspaceFromRow(row) {
+  return {
+    projectId: row.project_id,
+    workspace: JSON.parse(row.workspace),
+    version: row.version,
+    updatedAt: row.updated_at,
+  };
+}
+
 function projectReadmeFromRow(row, projectId) {
   return {
     projectId: row.project_id ?? projectId,

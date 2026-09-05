@@ -19,6 +19,7 @@ import {
 } from "../shared/domain.mjs";
 import { resolveCodexExecutable } from "../shared/codex-executable.mjs";
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
+import { normalizeWorkflowSnapshot } from "../shared/workflow-control-flow.mjs";
 import { AiChatService } from "./ai-chat.mjs";
 import { discoverAiCatalog, resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
 import { decodeComposerReferenceKey } from "./composer-reference.mjs";
@@ -649,6 +650,87 @@ function parseVersion(value) {
     throw new ApiError(400, "INVALID_FIELD", "'version' must be a positive integer");
   }
   return value;
+}
+
+function parseWorkflowVersion(value) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new ApiError(400, "INVALID_FIELD", "'version' must be a non-negative integer");
+  }
+  return value;
+}
+
+function parseWorkflowWorkspace(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set(["version", "tabs", "activeWorkflowId", "snapshots"]));
+  if (value.version !== 1) {
+    throw new ApiError(400, "INVALID_FIELD", "'workspace.version' must be 1");
+  }
+  if (!Array.isArray(value.tabs) || value.tabs.length === 0 || value.tabs.length > 100) {
+    throw new ApiError(400, "INVALID_FIELD", "'workspace.tabs' must contain 1 to 100 workflows");
+  }
+  const tabs = value.tabs.map((tab, index) => {
+    assertPlainObject(tab);
+    assertAllowedKeys(tab, new Set(["id", "name"]));
+    return {
+      id: stringField(tab.id, `workspace.tabs[${index}].id`, { required: true, maxLength: 128 }),
+      name: stringField(tab.name, `workspace.tabs[${index}].name`, { required: true, maxLength: 120 }),
+    };
+  });
+  if (new Set(tabs.map((tab) => tab.id)).size !== tabs.length) {
+    throw new ApiError(400, "INVALID_FIELD", "'workspace.tabs' ids must be unique");
+  }
+  const activeWorkflowId = stringField(value.activeWorkflowId, "workspace.activeWorkflowId", {
+    required: true,
+    maxLength: 128,
+  });
+  if (!tabs.some((tab) => tab.id === activeWorkflowId)) {
+    throw new ApiError(400, "INVALID_FIELD", "'workspace.activeWorkflowId' must reference a workflow tab");
+  }
+  assertPlainObject(value.snapshots);
+  const snapshots = Object.create(null);
+  for (const tab of tabs) {
+    const snapshot = value.snapshots[tab.id];
+    assertPlainObject(snapshot);
+    assertAllowedKeys(snapshot, new Set(["nodes", "edges", "flow", "selectedNodeId"]));
+    if (!Array.isArray(snapshot.nodes) || snapshot.nodes.length > 10_000) {
+      throw new ApiError(400, "INVALID_FIELD", `'workspace.snapshots.${tab.id}.nodes' must be an array`);
+    }
+    if (snapshot.flow === undefined && (!Array.isArray(snapshot.edges) || snapshot.edges.length > 20_000)) {
+      throw new ApiError(400, "INVALID_FIELD", `'workspace.snapshots.${tab.id}.edges' must be an array`);
+    }
+    if (snapshot.flow !== undefined && snapshot.edges !== undefined) {
+      throw new ApiError(400, "INVALID_FIELD", `'workspace.snapshots.${tab.id}' cannot contain both 'flow' and 'edges'`);
+    }
+    const selectedNodeId = stringField(
+      snapshot.selectedNodeId ?? null,
+      `workspace.snapshots.${tab.id}.selectedNodeId`,
+      { nullable: true, maxLength: 256 },
+    );
+    try {
+      snapshots[tab.id] = normalizeWorkflowSnapshot({
+        nodes: snapshot.nodes,
+        edges: snapshot.edges,
+        flow: snapshot.flow,
+        selectedNodeId,
+      });
+    } catch (error) {
+      throw new ApiError(
+        400,
+        "INVALID_FIELD",
+        `'workspace.snapshots.${tab.id}' is not a valid workflow: ${error.message}`,
+      );
+    }
+  }
+  return { version: 1, tabs, activeWorkflowId, snapshots };
+}
+
+function parseWorkflowWorkspaceSave(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["version", "workspace"]));
+  return {
+    version: parseWorkflowVersion(body.version),
+    workspace: parseWorkflowWorkspace(body.workspace),
+  };
 }
 
 function parseSortOrder(value) {
