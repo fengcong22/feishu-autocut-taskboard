@@ -721,6 +721,7 @@ export interface Attachment {
 export interface TaskArtifact {
   id: string;
   taskId: string;
+  runId: string | null;
   filename: string;
   contentType: string;
   size: number;

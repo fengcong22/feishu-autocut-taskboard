@@ -643,6 +643,7 @@ function taskArtifactFromRow(row) {
   return {
     id: row.id,
     taskId: row.task_id,
+    runId: row.run_id ?? null,
     filename: row.filename,
     contentType: row.content_type,
     size: row.size,
@@ -954,17 +955,22 @@ export class TaskboardDatabase {
       CREATE TABLE IF NOT EXISTS task_artifacts (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        run_id TEXT,
         storage_key TEXT NOT NULL UNIQUE,
         filename TEXT NOT NULL,
         content_type TEXT NOT NULL,
         size INTEGER NOT NULL CHECK (size >= 0),
         sha256 TEXT NOT NULL,
-        source_mode TEXT NOT NULL CHECK (source_mode = 'manual_select'),
+        source_mode TEXT NOT NULL CHECK (source_mode IN ('manual_select', 'driver_report')),
         validation_status TEXT NOT NULL CHECK (validation_status = 'verified'),
         entry_count INTEGER NOT NULL CHECK (entry_count > 0),
         draft_root TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        CHECK (
+          (source_mode = 'manual_select' AND run_id IS NULL)
+          OR (source_mode = 'driver_report' AND run_id IS NOT NULL)
+        )
       );
 
       CREATE INDEX IF NOT EXISTS task_artifacts_task_created
@@ -1220,6 +1226,8 @@ export class TaskboardDatabase {
       );
 
     `);
+
+    this.#migrateTaskArtifacts();
 
     const feishuBaseColumns = this.database.prepare("PRAGMA table_info(feishu_bases)").all();
     if (!feishuBaseColumns.some((column) => column.name === "removed_at")) {
@@ -1711,6 +1719,75 @@ export class TaskboardDatabase {
 
   close() {
     this.database.close();
+  }
+
+  #migrateTaskArtifacts() {
+    const artifactsSql = this.database.prepare(`
+      SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'task_artifacts'
+    `).get()?.sql ?? "";
+    const artifactColumns = new Set(
+      this.database.prepare("PRAGMA table_info(task_artifacts)").all().map((column) => column.name),
+    );
+    const isCurrent = artifactColumns.has("run_id") && artifactsSql.includes("'driver_report'");
+
+    if (!isCurrent) {
+      const runId = artifactColumns.has("run_id") ? "run_id" : "NULL";
+      this.database.exec("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE");
+      try {
+        this.database.exec(`
+          CREATE TABLE task_artifacts_run_migration (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            run_id TEXT,
+            storage_key TEXT NOT NULL UNIQUE,
+            filename TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            size INTEGER NOT NULL CHECK (size >= 0),
+            sha256 TEXT NOT NULL,
+            source_mode TEXT NOT NULL CHECK (source_mode IN ('manual_select', 'driver_report')),
+            validation_status TEXT NOT NULL CHECK (validation_status = 'verified'),
+            entry_count INTEGER NOT NULL CHECK (entry_count > 0),
+            draft_root TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK (
+              (source_mode = 'manual_select' AND run_id IS NULL)
+              OR (source_mode = 'driver_report' AND run_id IS NOT NULL)
+            )
+          );
+
+          INSERT INTO task_artifacts_run_migration (
+            id, task_id, run_id, storage_key, filename, content_type, size, sha256,
+            source_mode, validation_status, entry_count, draft_root, created_at, updated_at
+          )
+          SELECT
+            id, task_id, ${runId}, storage_key, filename, content_type, size, sha256,
+            source_mode, validation_status, entry_count, draft_root, created_at, updated_at
+          FROM task_artifacts;
+
+          DROP TABLE task_artifacts;
+          ALTER TABLE task_artifacts_run_migration RENAME TO task_artifacts;
+        `);
+        this.database.exec("COMMIT");
+      } catch (error) {
+        this.database.exec("ROLLBACK");
+        throw error;
+      } finally {
+        this.database.exec("PRAGMA foreign_keys = ON");
+      }
+
+      const violation = this.database.prepare("PRAGMA foreign_key_check").get();
+      if (violation) {
+        throw new Error(`Task artifact migration produced a foreign key violation in '${violation.table}'`);
+      }
+    }
+
+    this.database.exec(`
+      CREATE INDEX IF NOT EXISTS task_artifacts_task_created
+        ON task_artifacts(task_id, created_at, id);
+      CREATE UNIQUE INDEX IF NOT EXISTS task_artifacts_run
+        ON task_artifacts(run_id) WHERE run_id IS NOT NULL;
+    `);
   }
 
   #migrateTaskStatuses() {
@@ -4492,6 +4569,35 @@ export class TaskboardDatabase {
     }));
   }
 
+  getTaskAiStartForArtifactReport(taskId, runId) {
+    const row = this.database.prepare(`
+      SELECT
+        task_ai_starts.task_id,
+        task_ai_starts.thread_id,
+        task_ai_starts.run_id,
+        task_ai_starts.claim_token
+      FROM task_ai_starts
+      JOIN tasks ON tasks.id = task_ai_starts.task_id
+      JOIN ai_chat_runs ON ai_chat_runs.id = task_ai_starts.run_id
+      JOIN ai_chat_threads ON ai_chat_threads.id = task_ai_starts.thread_id
+      WHERE task_ai_starts.task_id = ?
+        AND task_ai_starts.run_id = ?
+        AND tasks.status = 'in_progress'
+        AND tasks.thread_id = task_ai_starts.thread_id
+        AND ai_chat_runs.status = 'running'
+        AND ai_chat_runs.thread_id = task_ai_starts.thread_id
+        AND ai_chat_threads.origin_issue_id = tasks.id
+        AND ai_chat_threads.origin_project_id = tasks.project_id
+      LIMIT 1
+    `).get(taskId, runId);
+    return row ? {
+      taskId: row.task_id,
+      threadId: row.thread_id,
+      runId: row.run_id,
+      claimToken: row.claim_token,
+    } : null;
+  }
+
   deleteTaskAiStartClaim(id, claimToken) {
     this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
       .run(id, claimToken);
@@ -5245,6 +5351,15 @@ export class TaskboardDatabase {
     return row ? taskArtifactWorkFromRow(row) : null;
   }
 
+  getTaskArtifactForRun(taskId, runId) {
+    const row = this.database.prepare(`
+      SELECT * FROM task_artifacts
+      WHERE task_id = ? AND run_id = ?
+      LIMIT 1
+    `).get(taskId, runId);
+    return row ? taskArtifactFromRow(row) : null;
+  }
+
   createTaskArtifact(taskId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -5257,21 +5372,53 @@ export class TaskboardDatabase {
           `This task accepts artifacts only while it is ${acceptedStatuses.join(" or ")}`,
         );
       }
-      const existing = this.database.prepare(`
-        SELECT * FROM task_artifacts
-        WHERE task_id = ? AND filename = ? AND sha256 = ?
-        ORDER BY created_at, id
-        LIMIT 1
-      `).get(task.id, input.filename, input.sha256);
+      const runId = input.runId ?? null;
+      if (input.sourceMode === "driver_report") {
+        const requiredRunClaim = input.requiredRunClaim;
+        const activeClaim = requiredRunClaim?.runId === runId
+          ? this.getTaskAiStartForArtifactReport(task.id, runId)
+          : null;
+        if (!activeClaim || activeClaim.claimToken !== requiredRunClaim?.claimToken) {
+          throw new ApiError(
+            409,
+            "TASK_START_STATE_CHANGED",
+            "Task start state changed before storing the run artifact",
+          );
+        }
+      }
+      const existing = input.sourceMode === "driver_report"
+        ? this.database.prepare(`
+          SELECT * FROM task_artifacts
+          WHERE task_id = ? AND run_id = ?
+          LIMIT 1
+        `).get(task.id, runId)
+        : this.database.prepare(`
+          SELECT * FROM task_artifacts
+          WHERE task_id = ? AND run_id IS NULL AND filename = ? AND sha256 = ?
+          ORDER BY created_at, id
+          LIMIT 1
+        `).get(task.id, input.filename, input.sha256);
+      if (
+        existing
+        && input.sourceMode === "driver_report"
+        && (existing.filename !== input.filename || existing.sha256 !== input.sha256)
+      ) {
+        throw new ApiError(
+          409,
+          "ARTIFACT_RUN_CONFLICT",
+          "This Codex run already reported a different ZIP artifact",
+        );
+      }
       if (!existing) {
         this.database.prepare(`
           INSERT INTO task_artifacts (
-            id, task_id, storage_key, filename, content_type, size, sha256, source_mode,
-            validation_status, entry_count, draft_root, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            id, task_id, run_id, storage_key, filename, content_type, size, sha256,
+            source_mode, validation_status, entry_count, draft_root, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           input.id,
           task.id,
+          runId,
           input.storageKey,
           input.filename,
           input.contentType,
@@ -5382,6 +5529,10 @@ export class TaskboardDatabase {
     return {
       subjectKey: row.subject_key,
       enqueueMode: upload?.enqueueMode === "automatic" ? "automatic" : "manual",
+      artifactSourceMode: upload?.artifactSourceMode ?? "manual_select",
+      artifactSourcePath: typeof upload?.artifactSourcePath === "string" && upload.artifactSourcePath.trim()
+        ? upload.artifactSourcePath.trim()
+        : null,
       targetId: typeof upload?.targetId === "string" && upload.targetId.trim()
         ? upload.targetId.trim()
         : null,
