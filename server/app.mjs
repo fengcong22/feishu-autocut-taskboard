@@ -2897,6 +2897,31 @@ export function createTaskboardServer(options = {}) {
       : "manual";
   }
 
+  function driverArtifactSourceForMetadata(metadata) {
+    if (
+      !metadata
+      || metadata.subjectKey !== `${metadata.baseToken}:${metadata.tableId}`
+      || !Number.isSafeInteger(metadata.configVersion)
+      || metadata.configVersion < 1
+    ) {
+      return null;
+    }
+    const source = database.getFeishuSubjectUploadTargetByVersion(
+      metadata.subjectKey,
+      metadata.configVersion,
+    );
+    return source?.artifactSourceMode === "driver_report"
+      && typeof source.artifactSourcePath === "string"
+      && path.isAbsolute(source.artifactSourcePath)
+      ? source
+      : null;
+  }
+
+  function localArtifactReportUrl(taskId, runId) {
+    const address = assertLoopbackListenAddress(server.address());
+    return `http://127.0.0.1:${address.port}${routePrefix}/api/local/tasks/${encodeURIComponent(taskId)}/runs/${encodeURIComponent(runId)}/artifact-report`;
+  }
+
   function terminalTaskStatusForRun(run, metadata) {
     if (run?.status === "completed") {
       return "in_progress";
@@ -3255,12 +3280,21 @@ export function createTaskboardServer(options = {}) {
         message: packageConfig.prompt,
       }, {
         taskClaimedByServer: true,
-        onRunCreated: (createdRun) => database.bindTaskAiStartRun(
-          claimedTask.id,
-          claimedTask.claimToken,
-          thread.id,
-          createdRun.id,
-        ),
+        onRunCreated: (createdRun) => {
+          database.bindTaskAiStartRun(
+            claimedTask.id,
+            claimedTask.claimToken,
+            thread.id,
+            createdRun.id,
+          );
+          if (!driverArtifactSourceForMetadata(metadata)) return null;
+          return {
+            artifactReport: {
+              url: localArtifactReportUrl(claimedTask.id, createdRun.id),
+              token: claimedTask.claimToken,
+            },
+          };
+        },
       });
     } catch (error) {
       unsubscribeRun?.();

@@ -23,6 +23,10 @@ const SANDBOXES = new Set(["read-only", "workspace-write", "danger-full-access"]
 const ERROR_CONTENT_LIMIT = 65_536;
 const AGENT_DISPATCH_PROTOCOL = "taskboard.agent.v1";
 const SKILL_MARKER = "\uFFFC";
+const ARTIFACT_REPORT_ENVIRONMENT_KEYS = new Set([
+  "CODEX_AUTOCUT_ARTIFACT_REPORT_URL",
+  "CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN",
+]);
 const CODEX_IMAGE_TYPES = new Set([
   "image/gif",
   "image/jpeg",
@@ -144,7 +148,10 @@ export class AiChatService {
     this.codexExecutable = options.codexExecutable;
     this.codexStatePath = options.codexStatePath;
     this.manageTaskboardSkillPath = options.manageTaskboardSkillPath;
-    this.processEnv = options.processEnv ?? process.env;
+    this.processEnv = Object.fromEntries(
+      Object.entries(options.processEnv ?? process.env)
+        .filter(([name]) => !ARTIFACT_REPORT_ENVIRONMENT_KEYS.has(name.toUpperCase())),
+    );
     this.killGraceMs = options.killGraceMs ?? 1_000;
     this.appServer = options.appServer ?? new CodexAppServer({
       executable: this.codexExecutable,
@@ -525,6 +532,21 @@ export class AiChatService {
       const args = buildCodexArgs(thread, resolved.addDirectories, imagePaths, {
         skipGitRepoCheck: resolved.skipGitRepoCheck === true,
       });
+      const run = this.database.createAiChatRun({ threadId });
+      let runContext = null;
+      try {
+        if (onRunCreated) runContext = await onRunCreated(run);
+        if (runContext?.artifactReport && taskClaimedByServer !== true) {
+          throw new ApiError(
+            409,
+            "TRUSTED_AUTOCUT_CONTEXT_REQUIRED",
+            "Artifact report capabilities require a server-claimed Auto-Cut turn",
+          );
+        }
+      } catch (error) {
+        this.database.deleteAiChatRun(run.id);
+        throw error;
+      }
       const prompt = buildCodexPrompt(
         thread,
         {
@@ -534,19 +556,13 @@ export class AiChatService {
         },
         this.manageTaskboardSkillPath,
         {
+          artifactReportEnabled: Boolean(runContext?.artifactReport),
           includeManageTaskboardSkill: taskClaimedByServer !== true,
           trustedAutoCutSource: taskClaimedByServer === true
             ? resolved.trustedAutoCutSource
             : null,
         },
       );
-      const run = this.database.createAiChatRun({ threadId });
-      try {
-        if (onRunCreated) await onRunCreated(run);
-      } catch (error) {
-        this.database.deleteAiChatRun(run.id);
-        throw error;
-      }
       this.#emit(threadId, { type: "ai.run", run });
       const userEventData = {};
       if (skillIds.length > 0) userEventData.skillIds = skillIds;
@@ -576,7 +592,13 @@ export class AiChatService {
         executable: this.codexExecutable,
         args,
         prompt,
-        env: this.processEnv,
+        env: runContext?.artifactReport
+          ? {
+              ...this.processEnv,
+              CODEX_AUTOCUT_ARTIFACT_REPORT_URL: runContext.artifactReport.url,
+              CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN: runContext.artifactReport.token,
+            }
+          : this.processEnv,
         onRawEvent: (raw) => {
           const normalized = normalizeCodexEvent(raw);
           if (!normalized) return;
