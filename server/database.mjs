@@ -976,6 +976,11 @@ export class TaskboardDatabase {
       CREATE INDEX IF NOT EXISTS task_artifacts_task_created
         ON task_artifacts(task_id, created_at, id);
 
+      CREATE TABLE IF NOT EXISTS task_completion_artifacts (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        artifact_id TEXT NOT NULL UNIQUE REFERENCES task_artifacts(id) ON DELETE CASCADE
+      );
+
       CREATE TABLE IF NOT EXISTS feishu_task_origins (
         task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
         metadata_json TEXT NOT NULL,
@@ -4498,6 +4503,7 @@ export class TaskboardDatabase {
       `).run(current.id, claimToken, timestamp, timestamp);
       this.database.prepare("UPDATE task_ai_starts SET claimed_activity_rowid = ? WHERE task_id = ? AND claim_token = ?")
         .run(Number(activity.lastInsertRowid), current.id, claimToken);
+      this.database.prepare("DELETE FROM task_completion_artifacts WHERE task_id = ?").run(current.id);
       this.database.exec("COMMIT");
       return attachAiStartClaim(this.getTask(current.id), claimToken);
     } catch (error) {
@@ -4686,7 +4692,7 @@ export class TaskboardDatabase {
     return current;
   }
 
-  settleTaskAiStart(id, claimToken, runId, status, actor) {
+  settleTaskAiStart(id, claimToken, runId, status, actor, completionArtifactId = undefined) {
     if (!["in_progress", "in_review", "done", "blocked"].includes(status)) {
       throw new ApiError(400, "INVALID_FIELD", "Invalid AI start terminal status");
     }
@@ -4708,7 +4714,6 @@ export class TaskboardDatabase {
       }
       if (
         current.archivedAt !== null
-        || current.status !== "in_progress"
         || current.threadId !== claim.thread_id
       ) {
         this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
@@ -4716,14 +4721,54 @@ export class TaskboardDatabase {
         this.database.exec("COMMIT");
         return current;
       }
+      let completionArtifact = null;
+      if (completionArtifactId !== undefined && completionArtifactId !== null) {
+        completionArtifact = this.database.prepare(`
+          SELECT id, run_id FROM task_artifacts
+          WHERE id = ?
+            AND task_id = ?
+            AND run_id = ?
+            AND source_mode = 'driver_report'
+            AND validation_status = 'verified'
+          LIMIT 1
+        `).get(completionArtifactId, id, runId);
+        if (!completionArtifact) {
+          throw new ApiError(
+            409,
+            "TASK_COMPLETION_ARTIFACT_INVALID",
+            "The completion artifact does not belong to this task and run",
+          );
+        }
+      }
+      const persistCompletionArtifact = () => {
+        if (completionArtifactId === undefined) return;
+        if (completionArtifactId === null) {
+          this.database.prepare("DELETE FROM task_completion_artifacts WHERE task_id = ?").run(id);
+          return;
+        }
+        this.database.prepare(`
+          INSERT INTO task_completion_artifacts (task_id, artifact_id)
+          VALUES (?, ?)
+          ON CONFLICT(task_id) DO UPDATE SET artifact_id = excluded.artifact_id
+        `).run(id, completionArtifact.id);
+      };
+      if (current.status !== "in_progress") {
+        persistCompletionArtifact();
+        this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
+          .run(id, claimToken);
+        this.database.exec("COMMIT");
+        return current;
+      }
       const latestStatusChange = this.latestTaskStatusChange(id, claim.claimed_activity_rowid);
       if (latestStatusChange) {
+        persistCompletionArtifact();
         this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
           .run(id, claimToken);
         this.database.exec("COMMIT");
         return current;
       }
       if (status === "in_progress") {
+        persistCompletionArtifact();
         this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
           .run(id, claimToken);
         this.database.exec("COMMIT");
@@ -4737,6 +4782,7 @@ export class TaskboardDatabase {
       if (result.changes !== 1) {
         throw new ApiError(409, "TASK_START_STATE_CHANGED", "Task start state changed before Codex finished");
       }
+      persistCompletionArtifact();
       this.#recordTaskActivity(current.id, actor, taskFieldChanges(current, { status }), timestamp);
       this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
         .run(id, claimToken);
@@ -5362,6 +5408,18 @@ export class TaskboardDatabase {
       WHERE task_id = ? AND run_id = ?
       LIMIT 1
     `).get(taskId, runId);
+    return row ? taskArtifactFromRow(row) : null;
+  }
+
+  getTaskCompletionArtifact(taskId) {
+    const row = this.database.prepare(`
+      SELECT task_artifacts.*
+      FROM task_completion_artifacts
+      JOIN task_artifacts ON task_artifacts.id = task_completion_artifacts.artifact_id
+      WHERE task_completion_artifacts.task_id = ?
+        AND task_artifacts.task_id = task_completion_artifacts.task_id
+      LIMIT 1
+    `).get(taskId);
     return row ? taskArtifactFromRow(row) : null;
   }
 

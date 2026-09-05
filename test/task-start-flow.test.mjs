@@ -61,6 +61,17 @@ async function waitForTaskUpload(baseUrl, taskId, timeoutMs = 3_000) {
   throw new Error(`Timed out waiting for task '${taskId}' artifact upload`);
 }
 
+async function waitForTaskArtifact(baseUrl, taskId, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await request(baseUrl, `/api/local/tasks/${taskId}/artifacts`);
+    const artifact = result.body.artifacts[0];
+    if (artifact) return artifact;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for task '${taskId}' artifact report`);
+}
+
 async function createFixture({
   packageWorkspacePath,
   packagePrompt = "trusted fixture prompt",
@@ -645,6 +656,171 @@ test("a live Auto-Cut process reports through taskctl before its run completes a
     assert.deepEqual(
       await readFile(path.join(targetPath, "live-driver-report.zip")),
       await readFile(reportedPath),
+    );
+  } finally {
+    await fixture.app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("a live manual acceptance enqueues the exact artifact after its driver run completes", async () => {
+  const fixture = await createFixture({
+    instanceToken: "fixture-live-manual-acceptance-token",
+    reportArtifact: true,
+    turnDelayMs: 1_000,
+  });
+  try {
+    const initialSubject = await enableArtifactSource(fixture, "driver_report");
+    const targetPath = path.join(fixture.directory, "live-manual-acceptance-target");
+    const subjectPath = `/api/local/feishu/workflow/subjects/${encodeURIComponent(initialSubject.subjectKey)}`;
+    const configured = await request(fixture.baseUrl, subjectPath, {
+      method: "PATCH",
+      body: {
+        upload: {
+          ...initialSubject.upload,
+          enqueueMode: "automatic",
+          targetId: "live-manual-acceptance-target",
+          targetPath,
+        },
+      },
+    });
+    assert.equal(configured.response.status, 200);
+    const enabled = await request(fixture.baseUrl, `${subjectPath}/enable`, {
+      method: "POST",
+      body: { expectedVersion: configured.body.subject.configVersion },
+    });
+    assert.equal(enabled.response.status, 200);
+    const subject = enabled.body.subject;
+    await writeFile(fixture.reportedArtifactPath, createStoredZip([
+      { name: "draft/draft_content.json", content: "{\"live\":true}" },
+      { name: "draft/draft_meta_info.json", content: "{}" },
+    ]));
+
+    const created = await request(fixture.baseUrl, "/api/tasks", {
+      method: "POST",
+      body: {
+        projectId: subject.projectId,
+        title: "Live manual driver acceptance",
+        description: feishuDescriptionWith({
+          configVersion: subject.configVersion,
+          executionMode: "manual",
+          mode: "manual",
+          uploadMode: "automatic",
+        }),
+        status: "todo",
+        priority: "high",
+        labels: ["feishu"],
+      },
+    });
+    assert.equal(created.response.status, 201);
+    const started = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    assert.equal(started.response.status, 202);
+    const artifact = await waitForTaskArtifact(fixture.baseUrl, created.body.task.id);
+
+    const current = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}`);
+    const accepted = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}`, {
+      method: "PATCH",
+      body: { version: current.body.task.version, status: "done" },
+    });
+    assert.equal(accepted.response.status, 200);
+    assert.deepEqual(fixture.app.database.listTaskArtifactUploads(created.body.task.id), []);
+
+    const run = await waitForRun(
+      fixture.baseUrl,
+      started.body.thread.id,
+      (candidate) => candidate.status !== "running",
+    );
+    assert.equal(run.status, "completed");
+    await waitForTaskAiStartSettled(fixture.app, created.body.task.id);
+    const upload = await waitForTaskUpload(fixture.baseUrl, created.body.task.id);
+    assert.equal(upload.artifactId, artifact.id);
+  } finally {
+    await fixture.app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("a live Auto-Cut completion rechecks trusted task provenance", async () => {
+  const fixture = await createFixture({
+    instanceToken: "fixture-live-provenance-token",
+    reportArtifact: true,
+    turnDelayMs: 1_000,
+  });
+  try {
+    const initialSubject = await enableArtifactSource(fixture, "driver_report");
+    const subjectPath = `/api/local/feishu/workflow/subjects/${encodeURIComponent(initialSubject.subjectKey)}`;
+    const configured = await request(fixture.baseUrl, subjectPath, {
+      method: "PATCH",
+      body: {
+        execution: { ...initialSubject.execution, mode: "automatic" },
+        upload: {
+          ...initialSubject.upload,
+          enqueueMode: "automatic",
+          targetId: "live-provenance-target",
+          targetPath: path.join(fixture.directory, "live-provenance-upload-target"),
+        },
+      },
+    });
+    assert.equal(configured.response.status, 200);
+    const enabled = await request(fixture.baseUrl, `${subjectPath}/enable`, {
+      method: "POST",
+      body: { expectedVersion: configured.body.subject.configVersion },
+    });
+    assert.equal(enabled.response.status, 200);
+    const subject = enabled.body.subject;
+    await writeFile(fixture.reportedArtifactPath, createStoredZip([
+      { name: "draft/draft_content.json", content: "{\"live\":true}" },
+      { name: "draft/draft_meta_info.json", content: "{}" },
+    ]));
+
+    const created = await request(fixture.baseUrl, "/api/tasks", {
+      method: "POST",
+      body: {
+        projectId: subject.projectId,
+        title: "Live provenance revocation",
+        description: feishuDescriptionWith({
+          configVersion: subject.configVersion,
+          executionMode: "automatic",
+          mode: "automatic",
+          uploadMode: "automatic",
+        }),
+        status: "todo",
+        priority: "high",
+        labels: ["feishu"],
+      },
+    });
+    assert.equal(created.response.status, 201);
+    const started = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    assert.equal(started.response.status, 202);
+    await waitForTaskArtifact(fixture.baseUrl, created.body.task.id);
+
+    const current = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}`);
+    const edited = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}`, {
+      method: "PATCH",
+      body: { version: current.body.task.version, labels: [] },
+    });
+    assert.equal(edited.response.status, 200);
+    const run = await waitForRun(
+      fixture.baseUrl,
+      started.body.thread.id,
+      (candidate) => candidate.status !== "running",
+    );
+    assert.equal(run.status, "completed");
+    await waitForTaskAiStartSettled(fixture.app, created.body.task.id);
+
+    const completed = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}`);
+    assert.equal(completed.body.task.status, "todo");
+    assert.equal(completed.body.task.threadId, null);
+    assert.deepEqual(completed.body.task.labels, []);
+    assert.deepEqual(
+      fixture.app.database.listTaskArtifactUploads(created.body.task.id),
+      [],
     );
   } finally {
     await fixture.app.close();

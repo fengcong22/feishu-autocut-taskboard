@@ -2955,6 +2955,13 @@ export function createTaskboardServer(options = {}) {
     return run?.status === "failed" || run?.status === "interrupted" ? "blocked" : null;
   }
 
+  function completionArtifactIdForRun(status, metadata, artifact) {
+    if (!driverArtifactSourceForMetadata(metadata)) return undefined;
+    return ["done", "in_review"].includes(status) && artifact?.validationStatus === "verified"
+      ? artifact.id
+      : null;
+  }
+
   function completedTaskStatusForMetadata(metadata) {
     return executionModeForMetadata(metadata) === "automatic" ? "done" : "in_review";
   }
@@ -2976,11 +2983,14 @@ export function createTaskboardServer(options = {}) {
 
   function assertTaskCanAcceptArtifact(task) {
     const metadata = assertTaskArtifactEligible(task);
-    if (artifactSourceForMetadata(metadata)?.artifactSourceMode === "driver_report") {
+    if (
+      metadata.configVersion !== undefined
+      && artifactSourceForMetadata(metadata)?.artifactSourceMode !== "manual_select"
+    ) {
       throw new ApiError(
         409,
-        "DRIVER_ARTIFACT_REPORT_REQUIRED",
-        "This task accepts only the ZIP reported by its active Auto-Cut run",
+        "MANUAL_ARTIFACT_SELECTION_REQUIRED",
+        "This task's creation-time ZIP source does not allow manual artifact selection",
       );
     }
     const completedStatus = completedTaskStatusForMetadata(metadata);
@@ -3130,13 +3140,8 @@ export function createTaskboardServer(options = {}) {
 
   function artifactForAutomaticEnqueue(task, metadata) {
     if (artifactSourceForMetadata(metadata)?.artifactSourceMode === "driver_report") {
-      if (!task.threadId) return null;
-      const artifacts = database.listAiChatRuns(task.threadId).flatMap((run) => {
-        if (run.status !== "completed") return [];
-        const artifact = database.getTaskArtifactForRun(task.id, run.id);
-        return artifact?.validationStatus === "verified" ? [artifact] : [];
-      });
-      return artifacts.length === 1 ? artifacts[0] : null;
+      const artifact = database.getTaskCompletionArtifact(task.id);
+      return artifact?.validationStatus === "verified" ? artifact : null;
     }
     const [artifact] = database.listTaskArtifacts(task.id);
     return artifact?.validationStatus === "verified" ? artifact : null;
@@ -3188,9 +3193,6 @@ export function createTaskboardServer(options = {}) {
   }
 
   function reconcileFeishuTaskAfterRun(taskId, threadId, run, actor, metadata, lease = null) {
-    const artifact = run?.id ? database.getTaskArtifactForRun(taskId, run.id) : null;
-    const status = terminalTaskStatusForRun(run, metadata, artifact);
-    if (!status) return;
     const current = database.getTask(taskId);
     if (!current || current.threadId !== threadId) {
       clearFeishuExecutionAfterRun(taskId, lease);
@@ -3207,16 +3209,32 @@ export function createTaskboardServer(options = {}) {
       if (lease) resourceScheduler.release(lease);
       return;
     }
+    const currentMetadata = trustedFeishuTaskOrigin(current, { requirePackage: true });
+    if (!currentMetadata) {
+      const task = database.releaseTaskFromAiStart(taskId, claim.claimToken, actor);
+      clearFeishuExecutionAfterRun(taskId, lease);
+      events.emit("task.updated", { task });
+      if (lease) resourceScheduler.release(lease);
+      return;
+    }
+    const artifact = run?.id ? database.getTaskArtifactForRun(taskId, run.id) : null;
+    const status = terminalTaskStatusForRun(run, currentMetadata, artifact);
+    if (!status) return;
     const task = database.settleTaskAiStart(
       taskId,
       claim.claimToken,
       run.id,
       status,
       actor,
+      completionArtifactIdForRun(status, currentMetadata, artifact),
     );
     clearFeishuExecutionAfterRun(taskId, lease);
     events.emit("task.updated", { task });
-    if (status === "done" && task.status === "done" && artifact?.validationStatus === "verified") {
+    if (
+      ["done", "in_review"].includes(status)
+      && task.status === "done"
+      && artifact?.validationStatus === "verified"
+    ) {
       maybeAutomaticallyEnqueueCompletedTask(task, artifact);
     }
     if (lease) resourceScheduler.release(lease);
@@ -3247,10 +3265,6 @@ export function createTaskboardServer(options = {}) {
         } else {
           try { database.deleteTaskAiStartClaim(claim.taskId, claim.claimToken); } catch {}
         }
-        continue;
-      }
-      if (task.status !== "in_progress") {
-        try { database.releaseTaskFromAiStart(task.id, claim.claimToken, CODEX_AGENT_ACTOR); } catch {}
         continue;
       }
       if (!claim.threadId) {
@@ -3302,7 +3316,12 @@ export function createTaskboardServer(options = {}) {
       }
       const artifact = database.getTaskArtifactForRun(task.id, latest.id);
       const status = terminalTaskStatusForRun(latest, metadata, artifact);
-      if (!status) continue;
+      if (!status) {
+        if (task.status !== "in_progress") {
+          try { database.releaseTaskFromAiStart(task.id, claim.claimToken, CODEX_AGENT_ACTOR); } catch {}
+        }
+        continue;
+      }
       try {
         const updated = database.settleTaskAiStart(
           task.id,
@@ -3310,6 +3329,7 @@ export function createTaskboardServer(options = {}) {
           latest.id,
           status,
           CODEX_AGENT_ACTOR,
+          completionArtifactIdForRun(status, metadata, artifact),
         );
         clearFeishuExecutionAfterRun(task.id);
         events.emit("task.updated", { task: updated });
@@ -4988,6 +5008,18 @@ export function createTaskboardServer(options = {}) {
               );
             }
           }
+          const currentTask = database.getTask(task.id);
+          if (!currentTask || currentTask.archivedAt !== null) {
+            throw new ApiError(409, "TASK_START_STATE_CHANGED", "Task state changed before storing the run artifact");
+          }
+          const currentMetadata = assertTaskArtifactEligible(currentTask);
+          if (!driverArtifactSourceForMetadata(currentMetadata)) {
+            throw new ApiError(
+              409,
+              "TASK_NOT_DRIVER_REPORT_ELIGIBLE",
+              "This task no longer accepts Auto-Cut artifact reports",
+            );
+          }
           artifact = database.createTaskArtifact(task.id, {
             ...stored,
             sourceMode: "driver_report",
@@ -5032,6 +5064,11 @@ export function createTaskboardServer(options = {}) {
           });
           let artifact;
           try {
+            const currentTask = database.getTask(task.id);
+            if (!currentTask) {
+              throw new ApiError(409, "TASK_START_STATE_CHANGED", "Task changed before storing the ZIP artifact");
+            }
+            assertTaskCanAcceptArtifact(currentTask);
             const existing = database.listTaskArtifacts(task.id).find((candidate) => (
               candidate.filename === stored.filename && candidate.sha256 === stored.sha256
             ));

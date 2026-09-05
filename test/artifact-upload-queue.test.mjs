@@ -149,7 +149,7 @@ async function waitForMissingFile(filePath, timeoutMs = 3_000) {
   await assert.rejects(access(filePath));
 }
 
-async function createDriverReportFixture(prefix) {
+async function createDriverReportFixture(prefix, optionOverrides = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), prefix));
   const options = {
     dataDirectory: directory,
@@ -165,6 +165,7 @@ async function createDriverReportFixture(prefix) {
       },
     },
     feishuWorkflowSync: async () => ({ ok: true }),
+    ...optionOverrides,
   };
   const fixture = { app: null, baseUrl: null, directory, options, taskSequence: 0 };
   fixture.start = async () => {
@@ -469,6 +470,103 @@ test("driver report manual execution waits for acceptance before exact automatic
   }
 });
 
+test("manual driver report keeps its exact enqueue artifact after conversation deletion", async () => {
+  const fixture = await createDriverReportFixture("taskboard-driver-report-durable-selection-");
+  try {
+    const registered = await registerArtifactTask(fixture, {
+      baseToken: "bas_driver_durable_selection",
+      executionMode: "manual",
+      enqueueMode: "automatic",
+    });
+    const binding = bindActiveArtifactRun(fixture, registered.task, "durable-selection");
+    const reported = await writeReportedZip(
+      registered.sourceDirectory,
+      "durable-selection.zip",
+      "durable-selection",
+    );
+    const report = await postDriverReport(fixture, binding, reported);
+    assert.equal(report.response.status, 201);
+    fixture.app.database.updateAiChatRun(binding.run.id, {
+      status: "completed",
+      exitCode: 0,
+      finishedAt: "2099-01-01T00:00:01.000Z",
+    });
+    await fixture.restart();
+
+    const awaitingAcceptance = await request(
+      fixture.baseUrl,
+      `/api/tasks/${registered.task.id}`,
+    );
+    assert.equal(awaitingAcceptance.body.task.status, "in_review");
+    const deleted = await request(
+      fixture.baseUrl,
+      `/api/local/ai/threads/${encodeURIComponent(binding.thread.id)}`,
+      { method: "DELETE" },
+    );
+    assert.equal(deleted.response.status, 204);
+    assert.equal(fixture.app.database.getAiChatRun(binding.run.id), null);
+
+    const accepted = await request(fixture.baseUrl, `/api/tasks/${registered.task.id}`, {
+      method: "PATCH",
+      json: { version: awaitingAcceptance.body.task.version, status: "done" },
+    });
+    assert.equal(accepted.response.status, 200);
+    const uploads = await request(
+      fixture.baseUrl,
+      `/api/local/tasks/${registered.task.id}/upload`,
+    );
+    assert.equal(uploads.body.uploads.length, 1);
+    assert.equal(uploads.body.uploads[0].artifactId, report.body.artifact.id);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("manual acceptance during a driver run keeps the exact artifact for recovery", async () => {
+  const fixture = await createDriverReportFixture("taskboard-driver-report-early-acceptance-");
+  try {
+    const registered = await registerArtifactTask(fixture, {
+      baseToken: "bas_driver_early_acceptance",
+      executionMode: "manual",
+      enqueueMode: "automatic",
+    });
+    const binding = bindActiveArtifactRun(fixture, registered.task, "early-acceptance");
+    const reported = await writeReportedZip(
+      registered.sourceDirectory,
+      "early-acceptance.zip",
+      "early-acceptance",
+    );
+    const report = await postDriverReport(fixture, binding, reported);
+    assert.equal(report.response.status, 201);
+
+    const accepted = await request(fixture.baseUrl, `/api/tasks/${registered.task.id}`, {
+      method: "PATCH",
+      json: { version: report.body.task.version, status: "done" },
+    });
+    assert.equal(accepted.response.status, 200);
+    assert.equal(accepted.body.task.status, "done");
+    assert.deepEqual(fixture.app.database.listTaskArtifactUploads(registered.task.id), []);
+
+    fixture.app.database.updateAiChatRun(binding.run.id, {
+      status: "completed",
+      exitCode: 0,
+      finishedAt: "2099-01-01T00:00:01.000Z",
+    });
+    await fixture.restart();
+
+    const recovered = await request(fixture.baseUrl, `/api/tasks/${registered.task.id}`);
+    assert.equal(recovered.body.task.status, "done");
+    const uploads = await request(
+      fixture.baseUrl,
+      `/api/local/tasks/${registered.task.id}/upload`,
+    );
+    assert.equal(uploads.body.uploads.length, 1);
+    assert.equal(uploads.body.uploads[0].artifactId, report.body.artifact.id);
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("driver report rejects forged provenance, wrong ownership, paths, hashes, and binary bypass", async () => {
   const fixture = await createDriverReportFixture("taskboard-driver-report-rejections-");
   try {
@@ -564,6 +662,164 @@ test("driver report rejects forged provenance, wrong ownership, paths, hashes, a
     assert.deepEqual(await readdir(path.join(fixture.directory, "artifacts")), []);
   } finally {
     await fixture.close();
+  }
+});
+
+test("binary artifact upload requires the creation-time manual-select policy", async () => {
+  const fixture = await createDriverReportFixture("taskboard-non-manual-artifact-source-");
+  try {
+    const registered = await registerArtifactTask(fixture, {
+      baseToken: "bas_watch_directory_bypass",
+      artifactSourceMode: "watch_directory",
+      executionMode: "automatic",
+      enqueueMode: "manual",
+    });
+    const processing = await request(fixture.baseUrl, `/api/tasks/${registered.task.id}`, {
+      method: "PATCH",
+      json: { version: registered.task.version, status: "in_progress" },
+    });
+    assert.equal(processing.response.status, 200);
+
+    const upload = await request(
+      fixture.baseUrl,
+      `/api/local/tasks/${encodeURIComponent(registered.task.id)}/artifacts`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/zip",
+          "x-taskboard-filename": encodeURIComponent("watch-directory-bypass.zip"),
+        },
+        body: validJianyingZip("watch-directory-bypass"),
+      },
+    );
+
+    assert.equal(upload.response.status, 409);
+    assert.equal(upload.body.error.code, "MANUAL_ARTIFACT_SELECTION_REQUIRED");
+    assert.deepEqual(fixture.app.database.listTaskArtifacts(registered.task.id), []);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("manual artifact upload rechecks trusted provenance after ZIP ingestion", async () => {
+  const artifactDirectory = await mkdtemp(path.join(os.tmpdir(), "taskboard-manual-artifact-race-artifacts-"));
+  const realArtifactService = createArtifactService({ rootDirectory: artifactDirectory });
+  let releaseIngestion;
+  let signalIngestionComplete;
+  const ingestionComplete = new Promise((resolve) => { signalIngestionComplete = resolve; });
+  const ingestionGate = new Promise((resolve) => { releaseIngestion = resolve; });
+  const artifactService = {
+    ...realArtifactService,
+    async acceptUpload(input) {
+      const stored = await realArtifactService.acceptUpload(input);
+      signalIngestionComplete();
+      await ingestionGate;
+      return stored;
+    },
+  };
+  const fixture = await createDriverReportFixture(
+    "taskboard-manual-artifact-provenance-race-",
+    { artifactService },
+  );
+  try {
+    const registered = await registerArtifactTask(fixture, {
+      baseToken: "bas_manual_provenance_race",
+      artifactSourceMode: "manual_select",
+      executionMode: "manual",
+      enqueueMode: "manual",
+    });
+    const processing = await request(fixture.baseUrl, `/api/tasks/${registered.task.id}`, {
+      method: "PATCH",
+      json: { version: registered.task.version, status: "in_progress" },
+    });
+    assert.equal(processing.response.status, 200);
+
+    const pendingUpload = request(
+      fixture.baseUrl,
+      `/api/local/tasks/${encodeURIComponent(registered.task.id)}/artifacts`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/zip",
+          "x-taskboard-filename": encodeURIComponent("manual-provenance-race.zip"),
+        },
+        body: validJianyingZip("manual-provenance-race"),
+      },
+    );
+    await ingestionComplete;
+
+    const current = await request(fixture.baseUrl, `/api/tasks/${registered.task.id}`);
+    const edited = await request(fixture.baseUrl, `/api/tasks/${registered.task.id}`, {
+      method: "PATCH",
+      json: { version: current.body.task.version, labels: [] },
+    });
+    assert.equal(edited.response.status, 200);
+    releaseIngestion();
+
+    const rejected = await pendingUpload;
+    assert.equal(rejected.response.status, 409);
+    assert.equal(rejected.body.error.code, "TASK_NOT_ARTIFACT_ELIGIBLE");
+    assert.deepEqual(fixture.app.database.listTaskArtifacts(registered.task.id), []);
+    assert.deepEqual(await readdir(artifactDirectory), []);
+  } finally {
+    releaseIngestion?.();
+    await fixture.close();
+    await rm(artifactDirectory, { recursive: true, force: true });
+  }
+});
+
+test("driver report rechecks trusted provenance after ZIP ingestion", async () => {
+  const artifactDirectory = await mkdtemp(path.join(os.tmpdir(), "taskboard-driver-report-race-artifacts-"));
+  const realArtifactService = createArtifactService({ rootDirectory: artifactDirectory });
+  let releaseIngestion;
+  let signalIngestionComplete;
+  const ingestionComplete = new Promise((resolve) => { signalIngestionComplete = resolve; });
+  const ingestionGate = new Promise((resolve) => { releaseIngestion = resolve; });
+  const artifactService = {
+    ...realArtifactService,
+    async acceptUpload(input) {
+      const stored = await realArtifactService.acceptUpload(input);
+      signalIngestionComplete();
+      await ingestionGate;
+      return stored;
+    },
+  };
+  const fixture = await createDriverReportFixture(
+    "taskboard-driver-report-provenance-race-",
+    { artifactService },
+  );
+  try {
+    const registered = await registerArtifactTask(fixture, {
+      baseToken: "bas_driver_provenance_race",
+      executionMode: "automatic",
+      enqueueMode: "automatic",
+    });
+    const binding = bindActiveArtifactRun(fixture, registered.task, "provenance-race");
+    const reported = await writeReportedZip(
+      registered.sourceDirectory,
+      "provenance-race.zip",
+      "provenance-race",
+    );
+    const pendingReport = postDriverReport(fixture, binding, reported);
+    await ingestionComplete;
+
+    const current = await request(fixture.baseUrl, `/api/tasks/${registered.task.id}`);
+    const edited = await request(fixture.baseUrl, `/api/tasks/${registered.task.id}`, {
+      method: "PATCH",
+      json: { version: current.body.task.version, labels: [] },
+    });
+    assert.equal(edited.response.status, 200);
+    releaseIngestion();
+
+    const rejected = await pendingReport;
+    assert.equal(rejected.response.status, 409);
+    assert.equal(rejected.body.error.code, "TASK_NOT_ARTIFACT_ELIGIBLE");
+    assert.deepEqual(fixture.app.database.listTaskArtifacts(registered.task.id), []);
+    assert.deepEqual(await readdir(artifactDirectory), []);
+  } finally {
+    releaseIngestion?.();
+    await fixture.close();
+    await rm(artifactDirectory, { recursive: true, force: true });
   }
 });
 
