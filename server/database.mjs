@@ -4583,6 +4583,7 @@ export class TaskboardDatabase {
       WHERE task_ai_starts.task_id = ?
         AND task_ai_starts.run_id = ?
         AND tasks.status = 'in_progress'
+        AND tasks.archived_at IS NULL
         AND tasks.thread_id = task_ai_starts.thread_id
         AND ai_chat_runs.status = 'running'
         AND ai_chat_runs.thread_id = task_ai_starts.thread_id
@@ -4705,7 +4706,11 @@ export class TaskboardDatabase {
       if (!claim.run_id || claim.run_id !== runId) {
         throw new ApiError(409, "TASK_START_STATE_CHANGED", "Codex run does not own this task start claim");
       }
-      if (current.status !== "in_progress" || current.threadId !== claim.thread_id) {
+      if (
+        current.archivedAt !== null
+        || current.status !== "in_progress"
+        || current.threadId !== claim.thread_id
+      ) {
         this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
           .run(id, claimToken);
         this.database.exec("COMMIT");

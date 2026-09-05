@@ -1134,6 +1134,24 @@ function parseArtifactHeaders(request) {
   return metadata;
 }
 
+function parseArtifactReport(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["path", "sha256"]));
+  if (
+    typeof body.path !== "string"
+    || body.path.length === 0
+    || body.path.length > 4_096
+    || body.path.includes("\0")
+    || !path.isAbsolute(body.path)
+  ) {
+    throw new ApiError(400, "INVALID_ARTIFACT_PATH", "'path' must be an absolute ZIP file path");
+  }
+  if (typeof body.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(body.sha256)) {
+    throw new ApiError(400, "INVALID_ARTIFACT_HASH", "'sha256' must be a lowercase SHA-256 digest");
+  }
+  return { path: body.path, sha256: body.sha256 };
+}
+
 function parseArtifactUploadEnqueue(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set(["artifactId"]));
@@ -2897,7 +2915,7 @@ export function createTaskboardServer(options = {}) {
       : "manual";
   }
 
-  function driverArtifactSourceForMetadata(metadata) {
+  function artifactSourceForMetadata(metadata) {
     if (
       !metadata
       || metadata.subjectKey !== `${metadata.baseToken}:${metadata.tableId}`
@@ -2910,6 +2928,11 @@ export function createTaskboardServer(options = {}) {
       metadata.subjectKey,
       metadata.configVersion,
     );
+    return source;
+  }
+
+  function driverArtifactSourceForMetadata(metadata) {
+    const source = artifactSourceForMetadata(metadata);
     return source?.artifactSourceMode === "driver_report"
       && typeof source.artifactSourcePath === "string"
       && path.isAbsolute(source.artifactSourcePath)
@@ -2922,9 +2945,12 @@ export function createTaskboardServer(options = {}) {
     return `http://127.0.0.1:${address.port}${routePrefix}/api/local/tasks/${encodeURIComponent(taskId)}/runs/${encodeURIComponent(runId)}/artifact-report`;
   }
 
-  function terminalTaskStatusForRun(run, metadata) {
+  function terminalTaskStatusForRun(run, metadata, artifact = null) {
     if (run?.status === "completed") {
-      return "in_progress";
+      return driverArtifactSourceForMetadata(metadata)
+        && artifact?.validationStatus === "verified"
+        ? completedTaskStatusForMetadata(metadata)
+        : "in_progress";
     }
     return run?.status === "failed" || run?.status === "interrupted" ? "blocked" : null;
   }
@@ -2950,6 +2976,13 @@ export function createTaskboardServer(options = {}) {
 
   function assertTaskCanAcceptArtifact(task) {
     const metadata = assertTaskArtifactEligible(task);
+    if (artifactSourceForMetadata(metadata)?.artifactSourceMode === "driver_report") {
+      throw new ApiError(
+        409,
+        "DRIVER_ARTIFACT_REPORT_REQUIRED",
+        "This task accepts only the ZIP reported by its active Auto-Cut run",
+      );
+    }
     const completedStatus = completedTaskStatusForMetadata(metadata);
     if (task.status !== "in_progress" && task.status !== completedStatus) {
       throw new ApiError(
@@ -2969,6 +3002,77 @@ export function createTaskboardServer(options = {}) {
       );
     }
     return metadata;
+  }
+
+  function assertArtifactReportRequest(request, claimToken) {
+    assertLoopbackRequest(request);
+    const authorization = request.headers.authorization;
+    const suppliedToken = typeof authorization === "string" && authorization.startsWith("Bearer ")
+      ? authorization.slice("Bearer ".length)
+      : null;
+    if (
+      request.headers["x-taskboard-client"] !== "taskctl"
+      || !hasMatchingSecret(claimToken, suppliedToken)
+    ) {
+      throw new ApiError(403, "ARTIFACT_REPORT_AUTH_FAILED", "Auto-Cut artifact report authentication failed");
+    }
+  }
+
+  async function acceptReportedArtifact(source, report) {
+    let sourceRoot;
+    let reportedPath;
+    try {
+      [sourceRoot, reportedPath] = await Promise.all([
+        realpath(source.artifactSourcePath),
+        realpath(report.path),
+      ]);
+    } catch (error) {
+      if (["EACCES", "ENOENT", "ENOTDIR", "EPERM"].includes(error?.code)) {
+        throw new ApiError(
+          409,
+          "ARTIFACT_SOURCE_UNAVAILABLE",
+          "The reported ZIP or its configured source root is unavailable",
+        );
+      }
+      throw error;
+    }
+    const relativePath = path.relative(sourceRoot, reportedPath);
+    if (
+      relativePath === ""
+      || relativePath === ".."
+      || relativePath.startsWith(`..${path.sep}`)
+      || path.isAbsolute(relativePath)
+    ) {
+      throw new ApiError(
+        403,
+        "ARTIFACT_OUTSIDE_SOURCE_ROOT",
+        "The reported ZIP is outside this task's configured source root",
+      );
+    }
+    if (!reportedPath.toLowerCase().endsWith(".zip")) {
+      throw new ApiError(400, "INVALID_ARTIFACT_TYPE", "Artifact must be a .zip file");
+    }
+
+    let handle;
+    try {
+      handle = await open(reportedPath, "r");
+      const details = await handle.stat();
+      if (!details.isFile()) {
+        throw new ApiError(400, "INVALID_ARTIFACT_FILE", "The reported artifact must be a regular file");
+      }
+      return await artifactService.acceptUpload({
+        filename: path.basename(reportedPath),
+        contentType: "application/zip",
+        stream: handle.createReadStream({ autoClose: false }),
+      });
+    } catch (error) {
+      if (["EACCES", "ENOENT", "ENOTDIR", "EPERM"].includes(error?.code)) {
+        throw new ApiError(409, "ARTIFACT_SOURCE_UNAVAILABLE", "The reported ZIP is unavailable");
+      }
+      throw error;
+    } finally {
+      await handle?.close().catch(() => {});
+    }
   }
 
   function assertTaskCanEnqueueArtifact(task) {
@@ -3024,12 +3128,28 @@ export function createTaskboardServer(options = {}) {
     return upload;
   }
 
-  function maybeAutomaticallyEnqueueCompletedTask(task) {
+  function artifactForAutomaticEnqueue(task, metadata) {
+    if (artifactSourceForMetadata(metadata)?.artifactSourceMode === "driver_report") {
+      if (!task.threadId) return null;
+      const artifacts = database.listAiChatRuns(task.threadId).flatMap((run) => {
+        if (run.status !== "completed") return [];
+        const artifact = database.getTaskArtifactForRun(task.id, run.id);
+        return artifact?.validationStatus === "verified" ? [artifact] : [];
+      });
+      return artifacts.length === 1 ? artifacts[0] : null;
+    }
+    const [artifact] = database.listTaskArtifacts(task.id);
+    return artifact?.validationStatus === "verified" ? artifact : null;
+  }
+
+  function maybeAutomaticallyEnqueueCompletedTask(task, exactArtifact = null) {
     try {
-      if (task?.status !== "done") return { upload: null, error: null };
+      if (task?.status !== "done" || task.archivedAt !== null) {
+        return { upload: null, error: null };
+      }
       const metadata = trustedFeishuTaskOrigin(task);
       if (!metadata) return { upload: null, error: null };
-      const [artifact] = database.listTaskArtifacts(task.id);
+      const artifact = exactArtifact ?? artifactForAutomaticEnqueue(task, metadata);
       if (!artifact || artifact.validationStatus !== "verified") return { upload: null, error: null };
       return {
         upload: enqueueArtifactUpload(task, metadata, artifact, { automaticOnly: true }),
@@ -3068,7 +3188,8 @@ export function createTaskboardServer(options = {}) {
   }
 
   function reconcileFeishuTaskAfterRun(taskId, threadId, run, actor, metadata, lease = null) {
-    const status = terminalTaskStatusForRun(run, metadata);
+    const artifact = run?.id ? database.getTaskArtifactForRun(taskId, run.id) : null;
+    const status = terminalTaskStatusForRun(run, metadata, artifact);
     if (!status) return;
     const current = database.getTask(taskId);
     if (!current || current.threadId !== threadId) {
@@ -3095,6 +3216,9 @@ export function createTaskboardServer(options = {}) {
     );
     clearFeishuExecutionAfterRun(taskId, lease);
     events.emit("task.updated", { task });
+    if (status === "done" && task.status === "done" && artifact?.validationStatus === "verified") {
+      maybeAutomaticallyEnqueueCompletedTask(task, artifact);
+    }
     if (lease) resourceScheduler.release(lease);
   }
   function reconcileClaimedFeishuTasks() {
@@ -3176,7 +3300,8 @@ export function createTaskboardServer(options = {}) {
         }
         continue;
       }
-      const status = terminalTaskStatusForRun(latest, metadata);
+      const artifact = database.getTaskArtifactForRun(task.id, latest.id);
+      const status = terminalTaskStatusForRun(latest, metadata, artifact);
       if (!status) continue;
       try {
         const updated = database.settleTaskAiStart(
@@ -4805,6 +4930,82 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, 201, { attachment });
         }
         return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
+      const artifactReportRoute = pathname.match(
+        /^\/api\/local\/tasks\/([^/]+)\/runs\/([^/]+)\/artifact-report$/,
+      );
+      if (artifactReportRoute) {
+        assertNoQuery(url.searchParams, "/api/local/tasks/:taskId/runs/:runId/artifact-report");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const taskId = decodeRouteSegment(artifactReportRoute[1], "Task id");
+        const runId = decodeRouteSegment(artifactReportRoute[2], "Run id");
+        const task = database.getTask(taskId);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        if (task.archivedAt !== null) {
+          throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot accept Auto-Cut artifact reports");
+        }
+        const metadata = assertTaskArtifactEligible(task);
+        const source = driverArtifactSourceForMetadata(metadata);
+        if (!source) {
+          throw new ApiError(
+            409,
+            "TASK_NOT_DRIVER_REPORT_ELIGIBLE",
+            "This task was not created with an Auto-Cut driver report source",
+          );
+        }
+        const claim = database.getTaskAiStartForArtifactReport(task.id, runId);
+        if (!claim) {
+          throw new ApiError(
+            409,
+            "ARTIFACT_REPORT_RUN_NOT_ACTIVE",
+            "The specified Auto-Cut run no longer owns an active task claim",
+          );
+        }
+        assertArtifactReportRequest(request, claim.claimToken);
+        const report = parseArtifactReport(await readJson(request));
+        const stored = await acceptReportedArtifact(source, report);
+        let artifact;
+        try {
+          if (stored.sha256 !== report.sha256) {
+            throw new ApiError(
+              409,
+              "ARTIFACT_HASH_MISMATCH",
+              "The reported ZIP changed before Taskboard could verify it",
+            );
+          }
+          const existing = database.getTaskArtifactForRun(task.id, runId);
+          if (existing && existing.filename === stored.filename && existing.sha256 === stored.sha256) {
+            const existingWork = database.getTaskArtifactForWork(existing.id);
+            const existingContent = existingWork
+              ? await artifactService.getStoredArtifactStats(existingWork.storageKey)
+              : null;
+            if (!existingContent?.isFile()) {
+              throw new ApiError(
+                409,
+                "ARTIFACT_CONTENT_MISSING",
+                "This run's ZIP is already registered but its local content is missing",
+              );
+            }
+          }
+          artifact = database.createTaskArtifact(task.id, {
+            ...stored,
+            sourceMode: "driver_report",
+            runId,
+            requiredRunClaim: { runId, claimToken: claim.claimToken },
+            requiredTaskStatus: "in_progress",
+            completedTaskStatus: null,
+            actor: CODEX_AGENT_ACTOR,
+          });
+        } catch (error) {
+          await artifactService.removeStoredArtifact(stored.storageKey);
+          throw error;
+        }
+        const created = artifact.id === stored.id;
+        if (!created) await artifactService.removeStoredArtifact(stored.storageKey);
+        const currentTask = database.getTask(task.id);
+        if (created) events.emit("artifact.created", { artifact, task: currentTask });
+        return sendJson(response, created ? 201 : 200, { artifact, task: currentTask });
       }
 
       const taskArtifactsRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/artifacts$/);
