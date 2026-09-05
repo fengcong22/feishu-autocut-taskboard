@@ -1,4 +1,7 @@
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import assert from "node:assert/strict";
@@ -709,6 +712,123 @@ test("usage errors are stable and never call the service", async () => {
   assert.equal(result.exitCode, 2);
   assert.equal(result.stderr.error.code, "USAGE_ERROR");
   assert.match(result.stderr.error.message, /--title/);
+});
+
+test("artifact report hashes and posts only the exact supplied ZIP", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskctl-artifact-report-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const filename = path.join(directory, "accepted.zip");
+  const bytes = Buffer.from("accepted Auto-Cut artifact", "utf8");
+  await writeFile(filename, bytes);
+
+  let call;
+  const result = await run(
+    ["artifact", "report", "--file", filename],
+    async (url, init) => {
+      call = { url: url.toString(), init };
+      return response({ artifact: { id: "artifact-1" } }, 201);
+    },
+    {
+      env: {
+        CODEX_AUTOCUT_ARTIFACT_REPORT_URL:
+          "http://127.0.0.1:49123/api/local/tasks/task-1/runs/run-1/artifact-report",
+        CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN: "claim-token",
+        CODEX_TASKBOARD_RUNTIME_FILE: "must-not-be-read.json",
+      },
+      readFile: async () => assert.fail("runtime discovery must not run for artifact report"),
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout.artifact.id, "artifact-1");
+  assert.equal(
+    call.url,
+    "http://127.0.0.1:49123/api/local/tasks/task-1/runs/run-1/artifact-report",
+  );
+  assert.equal(call.init.method, "POST");
+  assert.equal(call.init.redirect, "error");
+  assert.equal(call.init.headers.authorization, "Bearer claim-token");
+  assert.equal(call.init.headers["x-taskboard-client"], "taskctl");
+  assert.equal(call.init.headers["content-type"], "application/json");
+  assert.deepEqual(JSON.parse(call.init.body), {
+    path: path.resolve(filename),
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  });
+});
+
+test("artifact report requires its injected URL and token before fetching", async () => {
+  const cases = [
+    {
+      env: { CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN: "claim-token" },
+      message: /CODEX_AUTOCUT_ARTIFACT_REPORT_URL/,
+    },
+    {
+      env: {
+        CODEX_AUTOCUT_ARTIFACT_REPORT_URL:
+          "http://127.0.0.1:49123/api/local/tasks/task-1/runs/run-1/artifact-report",
+      },
+      message: /CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN/,
+    },
+  ];
+
+  for (const { env, message } of cases) {
+    const result = await run(
+      ["artifact", "report", "--file", "accepted.zip"],
+      async () => assert.fail("fetch should not be called"),
+      { env },
+    );
+    assert.equal(result.exitCode, 2);
+    assert.equal(result.stderr.error.code, "USAGE_ERROR");
+    assert.match(result.stderr.error.message, message);
+  }
+});
+
+test("artifact report rejects a non-loopback report URL before fetching", async () => {
+  const result = await run(
+    ["artifact", "report", "--file", "accepted.zip"],
+    async () => assert.fail("fetch should not be called"),
+    {
+      env: {
+        CODEX_AUTOCUT_ARTIFACT_REPORT_URL:
+          "https://tasks.example.test/api/local/tasks/task-1/runs/run-1/artifact-report",
+        CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN: "claim-token",
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 2);
+  assert.equal(result.stderr.error.code, "USAGE_ERROR");
+  assert.match(result.stderr.error.message, /loopback HTTP/);
+});
+
+test("artifact report rejects non-ZIP files and directories before fetching", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskctl-artifact-report-input-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const textFile = path.join(directory, "artifact.txt");
+  const zipDirectory = path.join(directory, "artifact.zip");
+  await writeFile(textFile, "not a ZIP");
+  await mkdir(zipDirectory);
+  const env = {
+    CODEX_AUTOCUT_ARTIFACT_REPORT_URL:
+      "http://127.0.0.1:49123/api/local/tasks/task-1/runs/run-1/artifact-report",
+    CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN: "claim-token",
+  };
+
+  const nonZip = await run(
+    ["artifact", "report", "--file", textFile],
+    async () => assert.fail("fetch should not be called"),
+    { env },
+  );
+  assert.equal(nonZip.exitCode, 2);
+  assert.match(nonZip.stderr.error.message, /\.zip/);
+
+  const directoryResult = await run(
+    ["artifact", "report", "--file", zipDirectory],
+    async () => assert.fail("fetch should not be called"),
+    { env },
+  );
+  assert.equal(directoryResult.exitCode, 2);
+  assert.match(directoryResult.stderr.error.message, /regular file/);
 });
 
 test("attachment upload posts file bytes to a task with filename headers", async () => {
