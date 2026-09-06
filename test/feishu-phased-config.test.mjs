@@ -102,9 +102,9 @@ test("requires an audio source only when replacing the video's original audio", 
   assert.equal(validateSubjectConfig(value).stages.initial.audio.mode, "video_original");
 });
 
-test("requires a ZIP destination for every enabled stage in automatic mode", () => {
+test("requires a ZIP destination for every enabled stage in automatic upload mode", () => {
   const value = subject();
-  value.execution.mode = "automatic";
+  value.upload.enqueueMode = "automatic";
   value.stages.initial.artifactTargetPath = null;
   value.stages.final_review = {
     ...value.stages.final_review,

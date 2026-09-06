@@ -60,6 +60,7 @@ function leaseView(lease) {
     leaseId: lease.leaseId,
     concurrencyGroup: lease.concurrencyGroup,
     maxConcurrent: lease.maxConcurrent,
+    fixedMaxConcurrent: lease.fixedMaxConcurrent === true,
     resourceGroups: [...lease.resourceGroups],
     grantedAt: lease.grantedAt,
   };
@@ -125,6 +126,7 @@ export function createResourceScheduler({ database = null, now = () => new Date(
       leaseId: existing.leaseId ?? randomUUID(),
       concurrencyGroup: entry.concurrencyGroup,
       maxConcurrent: entry.maxConcurrent,
+      fixedMaxConcurrent: entry.fixedMaxConcurrent,
       resourceGroups: [...entry.resourceGroups],
       grantedAt: existing.grantedAt ?? timestamp(now),
     };

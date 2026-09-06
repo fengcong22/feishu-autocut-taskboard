@@ -424,7 +424,7 @@ export function validateSubjectConfig(value) {
   if (isPhasedSubject(value)) {
     try {
       const normalized = validatePhasedSubjectConfig(value);
-      if (value.execution.mode === "automatic") {
+      if (value.upload.enqueueMode === "automatic") {
         const missingDestination = STAGE_IDS.find((stageId) => (
           normalized.stages[stageId].enabled
           && normalized.stages[stageId].artifactTargetPath === null

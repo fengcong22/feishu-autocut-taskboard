@@ -312,7 +312,7 @@ async function writePassingRunResult(run, {
   })}\n`);
   if (includePackageReceipt) {
     await writeFile(`${run.packageZipPath}.receipt.json`, `${JSON.stringify({
-      schema_version: 1,
+      schema_version: 2,
       status: "pass",
       workflow_mode: "lite",
       delivery_mode: "lite_zip",

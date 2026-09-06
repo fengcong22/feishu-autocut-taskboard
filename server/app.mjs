@@ -3485,7 +3485,7 @@ export function createTaskboardServer(options = {}) {
       throw autoCutResultError("autocut_package_receipt_invalid", "Auto-Cut package receipt is invalid");
     }
     if (
-      value.schema_version !== 1
+      value.schema_version !== 2
       || value.status !== "pass"
       || value.workflow_mode !== "lite"
       || value.delivery_mode !== "lite_zip"
