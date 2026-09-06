@@ -203,6 +203,20 @@ Automatic execution is an explicit server policy (`allowAutomaticExecution`) and
 
 The workflow panel supports `manual_select` and `driver_report`; `watch_directory` remains reserved and disabled. For `driver_report`, configure an absolute ZIP source root. After Auto-Cut validates the exact ZIP produced by its current run, it calls `taskctl artifact report --file <absolute accepted ZIP>`. The command hashes only that file and reports its exact path and SHA-256 through the run-scoped capability injected by Taskboard.
 
+When a blocked phased Feishu Auto-Cut run needs the two external-operation approvals, send `POST /api/local/tasks/:id/autocut-retry` with the current optimistic version (replace the example `16`) and the closed consent object:
+
+```json
+{
+  "version": 16,
+  "runConsent": {
+    "allowVideoAudioAsr": true,
+    "allowConfiguredLocalOutput": true
+  }
+}
+```
+
+`runConsent` is optional; omitting it preserves the existing retry behavior. When present, both fields must be literal `true` booleans and no other fields are accepted. The route accepts consent only for a server-registered, blocked, phased Feishu Auto-Cut task; ordinary tasks, copied description markers, and legacy or unregistered tasks are rejected. The approval is held only in memory from retry scheduling through creation of that one run, and Taskboard adds fixed, server-owned wording to that run's private context: video audio may be sent only to `openspeech.bytedance.com` for word-level timing and acceptance, and the Jianying draft/ZIP may be written only to the configured `CODEX_AUTOCUT_DRAFTS_ROOT` and `CODEX_AUTOCUT_PACKAGE_ZIP_PATH` locations. The raw request/object is not persisted, inherited, copied into package prompts, ordinary user messages, or environment variables, and authorization is never taken from comments, Feishu cells, paths, or free text; only the fixed wording is rendered in the private run context. Taskboard still uses the exact run-bound `driver_report` ZIP, never scans a directory or guesses the newest file, and does not write status or results back to Feishu. If the service restarts before run creation, the in-memory approval is lost and the task must be authorized again.
+
 Taskboard accepts a driver report only from the active run of a server-registered trusted Feishu task. A phased run must write its terminal result to the exact server-owned result path and its package receipt to the exact adjacent `<ZIP>.receipt.json` path. Taskboard cross-checks both receipts against the immutable task/run/subject/config/stage/event binding, source-manifest digest, frozen draft name and ZIP path, archive SHA-256, CRC/tree validation flags, its own ZIP hash, and the parsed Jianying draft root before storing the artifact and marking the run reported in one transaction. It never scans the source directory, chooses a newest ZIP, or infers task ownership from a filename. Reporting leaves the task `in_progress` until that same run succeeds; automatic execution then moves to `done` and, when `enqueueMode=automatic`, enqueues that exact artifact to the frozen stage destination. Manual execution moves to `in_review` and retains its existing acceptance flow. Blocked phased runs remain visible as immutable attempts and can be retried explicitly; a retry creates a new attempt instead of rewriting the prior run.
 
 Phased subjects use one configured Base single-select status field and three fixed stage IDs: `initial`, `first_review`, and `final_review`. Each stage has its own enabled switch, actual option ID, video source, review anchor, sound mode, name suffix, and local/NAS artifact destination; at least one stage must remain enabled. A task is created only for a real transition from another option into that enabled stage's configured option. Disabled stages are not backfilled, and later subject edits do not change the immutable configuration snapshot already attached to a task and run.
