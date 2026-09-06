@@ -323,15 +323,17 @@ Taskboard 在登记前验证：
 - 授权只随本次 retry 调度到新 run。服务端生成固定说明，明确只允许从当前受信任清单的视频提取音频并发送至该 ASR 服务，用于字词级定位和验收，同时允许写入该 run 的配置草稿和 ZIP 路径。
 - 不读取 Taskboard 评论、任务描述或飞书单元格作为授权来源，也不修改学科配置或 Auto-Cut 包提示词；评论可以作为审计记录，但不能取得执行资格。
 - 未携带 `runConsent` 的现有重试保持原行为；携带不完整、为 `false`、含未知字段或用于不合格任务的请求在创建新 run 前拒绝。
-- 授权说明只进入该 run 的服务端私有执行上下文，并随 AI run 的用户事件留痕；不得继承到后续 retry、其他课程或其他任务。
+- 授权说明只进入该 run 的服务端私有执行上下文，不拼入包提示词、普通用户消息、环境变量或数据库；不得继承到后续 retry、其他课程或其他任务。用户的当前对话授权和可选 Taskboard 评论承担审计留痕，但评论本身不参与授权判定。
+- 授权仅保存在从 retry 校验到 run 创建的内存调度项中。若 Taskboard 在 run 创建前重启，授权安全丢失，任务再次阻塞并要求重新授权；首版不为这一极短窗口增加持久化迁移。
 
 直接操作路径为：
 
 `POST /api/local/tasks/:id/autocut-retry` 携带 `version + runConsent`
 -> `server/app.mjs` 校验受信任任务、版本和结构化授权
 -> `server/feishu-execution-coordinator.mjs` 在本次调度项中传递授权
--> `server/app.mjs` 的 `startClaimedTaskWithAi` 为新 run 生成固定授权说明
--> `server/ai-chat-process.mjs` 将其放入该 run 的私有 Taskboard 上下文
+-> `server/app.mjs` 的 `startClaimedTaskWithAi` 把结构化授权绑定到新 run
+-> `server/ai-chat.mjs` 验证其仍处于 server-claimed Auto-Cut 上下文
+-> `server/ai-chat-process.mjs` 生成固定说明并放入该 run 的私有 Taskboard 上下文
 -> Auto-Cut 只按 server-owned manifest、执行输入和输出路径运行
 -> 仍由精确 `driver_report` 完成 ZIP 登记和 automatic 上传入队。
 
