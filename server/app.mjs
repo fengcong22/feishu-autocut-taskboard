@@ -657,6 +657,31 @@ function parseVersion(value) {
   return value;
 }
 
+function parseAutoCutRetry(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set(["version", "runConsent"]));
+  const version = parseVersion(value.version);
+  if (value.runConsent === undefined) return { version, autoCutRunConsent: null };
+
+  assertPlainObject(value.runConsent);
+  assertAllowedKeys(value.runConsent, new Set([
+    "allowVideoAudioAsr",
+    "allowConfiguredLocalOutput",
+  ]));
+  for (const key of ["allowVideoAudioAsr", "allowConfiguredLocalOutput"]) {
+    if (value.runConsent[key] !== true) {
+      throw new ApiError(400, "INVALID_FIELD", `'runConsent.${key}' must be true`);
+    }
+  }
+  return {
+    version,
+    autoCutRunConsent: Object.freeze({
+      allowVideoAudioAsr: true,
+      allowConfiguredLocalOutput: true,
+    }),
+  };
+}
+
 function parseWorkflowVersion(value) {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new ApiError(400, "INVALID_FIELD", "'version' must be a non-negative integer");
@@ -4082,7 +4107,15 @@ export function createTaskboardServer(options = {}) {
     );
   }
 
-  async function startClaimedTaskWithAi(claimedTask, actor, metadata, packageConfig, lease, trigger) {
+  async function startClaimedTaskWithAi(
+    claimedTask,
+    actor,
+    metadata,
+    packageConfig,
+    lease,
+    trigger,
+    autoCutRunConsent = null,
+  ) {
     const threadId = randomUUID();
     let thread;
     let unsubscribeRun = null;
@@ -4237,6 +4270,9 @@ export function createTaskboardServer(options = {}) {
                 resultPath: prepared.resultPath,
                 packageZipPath: prepared.packageZipPath,
               },
+              ...(trigger === "retry" && autoCutRunConsent
+                ? { autoCutRunConsent }
+                : {}),
             };
           } catch (error) {
             const failure = blockedPreparationError(error);
@@ -4297,7 +4333,12 @@ export function createTaskboardServer(options = {}) {
     task,
     actor,
     metadata,
-    { trigger = "manual", signal = taskStartAbortController.signal, lease: providedLease = null } = {},
+    {
+      trigger = "manual",
+      signal = taskStartAbortController.signal,
+      lease: providedLease = null,
+      autoCutRunConsent = null,
+    } = {},
   ) {
     if (trigger === "automatic" && !allowAutomaticExecution) {
       throw new ApiError(
@@ -4364,6 +4405,7 @@ export function createTaskboardServer(options = {}) {
         packageConfig,
         lease,
         trigger,
+        autoCutRunConsent,
       );
     } catch (error) {
       if (lease) resourceScheduler.release(lease);
@@ -4386,11 +4428,18 @@ export function createTaskboardServer(options = {}) {
     scheduler: resourceScheduler,
     allowAutomaticExecution,
     onTaskUpdated: (task) => events.emit("task.updated", { task }),
-    startClaimedTask: (task, metadata, lease, trigger, actor) => startTaskWithAi(
+    startClaimedTask: (
+      task,
+      metadata,
+      lease,
+      trigger,
+      actor,
+      autoCutRunConsent,
+    ) => startTaskWithAi(
       task,
       actor ?? CODEX_AGENT_ACTOR,
       metadata,
-      { trigger, lease },
+      { trigger, lease, autoCutRunConsent },
     ),
   });
   reconcileClaimedFeishuTasks();
@@ -5804,10 +5853,7 @@ export function createTaskboardServer(options = {}) {
         assertNoQuery(url.searchParams, "POST /api/local/tasks/:id/autocut-retry");
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         const taskId = decodeRouteSegment(autoCutRetryRoute[1], "Task id");
-        const body = await readJson(request);
-        assertPlainObject(body);
-        assertAllowedKeys(body, new Set(["version"]));
-        const version = parseVersion(body.version);
+        const { version, autoCutRunConsent } = parseAutoCutRetry(await readJson(request));
         const task = database.getTask(taskId);
         if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
         const metadata = requireTrustedFeishuTask(task, { requirePackage: true });
@@ -5821,7 +5867,10 @@ export function createTaskboardServer(options = {}) {
         );
         events.emit("task.updated", { task: ready });
         return sendJson(response, 202, await startTrackedTask(ready.id, () => (
-          executionCoordinator.schedule(ready, metadata, "retry", { actor: actorFromRequest(request) })
+          executionCoordinator.schedule(ready, metadata, "retry", {
+            actor: actorFromRequest(request),
+            autoCutRunConsent,
+          })
         )));
       }
 

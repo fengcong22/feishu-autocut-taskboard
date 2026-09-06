@@ -166,8 +166,22 @@ function createFixture({ packages = {}, maxConcurrent = 1, allowAutomaticExecuti
     now: clock.now,
     timers: clock,
     allowAutomaticExecution,
-    startClaimedTask: async (currentTask, currentMetadata, lease, trigger) => {
-      starts.push({ taskId: currentTask.id, packageAlias: currentMetadata.packageAlias, lease, trigger });
+    startClaimedTask: async (
+      currentTask,
+      currentMetadata,
+      lease,
+      trigger,
+      actor,
+      autoCutRunConsent,
+    ) => {
+      starts.push({
+        taskId: currentTask.id,
+        packageAlias: currentMetadata.packageAlias,
+        lease,
+        trigger,
+        actor,
+        autoCutRunConsent,
+      });
       if (remainingStartFailures > 0) {
         remainingStartFailures -= 1;
         throw Object.assign(new Error("fixture start failure"), { code: "FIXTURE_START_FAILED" });
@@ -209,6 +223,24 @@ test("manual immediate start skips the delay", async () => {
   const result = await fixture.coordinator.schedule(fixture.tasks.get("task-1"), metadata("Auto-cut-copyA"), "manual");
   assert.equal(result.task.status, "in_progress");
   assert.equal(fixture.starts.length, 1);
+});
+
+test("retry scheduling carries consent only on its in-memory entry", async () => {
+  const fixture = createFixture({ packages: { "Auto-cut-copyA": { maxConcurrent: 1 } } });
+  fixture.tasks.set("task-1", task("task-1"));
+  const runConsent = {
+    allowVideoAudioAsr: true,
+    allowConfiguredLocalOutput: true,
+  };
+
+  await fixture.coordinator.schedule(
+    fixture.tasks.get("task-1"),
+    metadata("Auto-cut-copyA"),
+    "retry",
+    { actor: { type: "user", id: "local-user" }, autoCutRunConsent: runConsent },
+  );
+
+  assert.deepEqual(fixture.starts[0].autoCutRunConsent, runConsent);
 });
 
 test("repeated manual scheduling of the same task is idempotent while the first start is pending", async () => {

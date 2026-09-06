@@ -100,7 +100,14 @@ export function createFeishuExecutionCoordinator({
         }, 1_000);
         return executionResult(entry.task.id);
       }
-      const result = await startClaimedTask(currentTask, entry.metadata, lease, entry.trigger, entry.actor);
+      const result = await startClaimedTask(
+        currentTask,
+        entry.metadata,
+        lease,
+        entry.trigger,
+        entry.actor,
+        entry.autoCutRunConsent,
+      );
       const current = database.getFeishuExecution(entry.task.id);
       if (current && current.state !== "running") {
         updateExecution(entry.task.id, "running", { leaseId: lease.leaseId ?? null });
@@ -205,7 +212,12 @@ export function createFeishuExecutionCoordinator({
     return launch(entry, lease);
   }
 
-  async function schedule(task, metadata, trigger = "manual", { actor = null } = {}) {
+  async function schedule(
+    task,
+    metadata,
+    trigger = "manual",
+    { actor = null, autoCutRunConsent = null } = {},
+  ) {
     if (closed) throw new Error("Execution coordinator is closed");
     if (trigger === "automatic" && !allowAutomaticExecution) {
       throw new ApiError(409, "AUTOMATIC_EXECUTION_DISABLED", "Automatic Codex execution is disabled by the local policy");
@@ -262,7 +274,15 @@ export function createFeishuExecutionCoordinator({
       packageRevision: metadata?.packageRevision ?? snapshot?.packageRevision ?? 1,
       trigger,
     });
-    const entry = { task: database.getTask(task.id) ?? task, metadata, trigger, actor, scheduling: true, timer: null };
+    const entry = {
+      task: database.getTask(task.id) ?? task,
+      metadata,
+      trigger,
+      actor,
+      autoCutRunConsent,
+      scheduling: true,
+      timer: null,
+    };
     entries.set(task.id, entry);
     return pump(entry);
   }

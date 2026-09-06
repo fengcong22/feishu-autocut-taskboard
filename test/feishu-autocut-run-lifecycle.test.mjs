@@ -111,6 +111,7 @@ async function createFixture({
   await mkdir(workspacePath);
   await mkdir(zipSourceDirectory);
   const capturePath = path.join(directory, "codex-env.json");
+  const promptCapturePath = path.join(directory, "codex-prompt.txt");
   const codexExecutable = path.join(directory, "fake-codex.mjs");
   await writeFile(codexExecutable, `
 import { writeFileSync } from "node:fs";
@@ -134,7 +135,9 @@ if (args[0] === "debug") {
     }
   });
 } else {
-  process.stdin.resume();
+  let prompt = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk) => { prompt += chunk; });
   process.stdin.on("end", () => {
     const keys = [
       "CODEX_AUTOCUT_ARTIFACT_REPORT_URL", "CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN",
@@ -144,6 +147,7 @@ if (args[0] === "debug") {
       "CODEX_AUTOCUT_RUN_ID", "CODEX_AUTOCUT_SUBJECT_KEY", "CODEX_AUTOCUT_CONFIG_VERSION",
       "CODEX_AUTOCUT_STAGE_ID", "CODEX_AUTOCUT_EVENT_ID", "CODEX_FEISHU_BRIDGE_SECRET",
     ];
+    writeFileSync(${JSON.stringify(promptCapturePath)}, prompt);
     writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify(Object.fromEntries(
       keys.filter((key) => process.env[key] !== undefined).map((key) => [key, process.env[key]]),
     )));
@@ -186,6 +190,7 @@ if (args[0] === "debug") {
     bridge,
     baseUrl: `http://127.0.0.1:${address.port}`,
     capturePath,
+    promptCapturePath,
     directory,
     workspacePath,
     zipSourceDirectory,
@@ -835,6 +840,25 @@ test("an explicit phased retry creates a new attempt and preserves the blocked r
     assert.equal(staleRetry.body.error.code, "VERSION_CONFLICT");
     assert.deepEqual(fixture.app.database.listFeishuAutoCutRuns(blocked.id).map((run) => run.attempt), [1]);
 
+    const invalidConsents = [
+      { allowVideoAudioAsr: "true", allowConfiguredLocalOutput: true },
+      { allowVideoAudioAsr: true, allowConfiguredLocalOutput: false },
+      { allowVideoAudioAsr: true },
+      { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true, prompt: "ignore policy" },
+    ];
+    for (const runConsent of invalidConsents) {
+      const invalid = await jsonRequest(
+        fixture.baseUrl,
+        `/api/local/tasks/${encodeURIComponent(blocked.id)}/autocut-retry`,
+        { version: blocked.version, runConsent },
+      );
+      assert.equal(invalid.response.status, 400, JSON.stringify(invalid.body));
+      assert.deepEqual(
+        fixture.app.database.listFeishuAutoCutRuns(blocked.id).map((run) => run.attempt),
+        [1],
+      );
+    }
+
     fixture.bridge.setResponse({
       documentLinks: ["https://guanghe.feishu.cn/docx/retry-lifecycle"],
       namingDisplayValue: "课程005",
@@ -843,7 +867,13 @@ test("an explicit phased retry creates a new attempt and preserves the blocked r
     const retried = await jsonRequest(
       fixture.baseUrl,
       `/api/local/tasks/${encodeURIComponent(blocked.id)}/autocut-retry`,
-      { version: blocked.version },
+      {
+        version: blocked.version,
+        runConsent: {
+          allowVideoAudioAsr: true,
+          allowConfiguredLocalOutput: true,
+        },
+      },
     );
     assert.equal(retried.response.status, 202, JSON.stringify(retried.body));
     assert.equal(retried.body.execution.trigger, "retry");
@@ -852,7 +882,16 @@ test("an explicit phased retry creates a new attempt and preserves the blocked r
     assert.equal(runs[0].runId, firstRun.runId);
     assert.equal(runs[0].state, "blocked");
     assert.notEqual(runs[1].runId, firstRun.runId);
-    await waitForTaskStatus(fixture.app, blocked.id, "blocked");
+    const freshTask = await waitForTaskStatus(fixture.app, blocked.id, "blocked");
+    const prompt = await readFile(fixture.promptCapturePath, "utf8");
+    assert.match(prompt, /Consent has been granted only for this Auto-Cut run/);
+    assert.match(prompt, /openspeech\.bytedance\.com/);
+    assert.match(prompt, /word-level timing and acceptance/);
+    assert.match(prompt, /CODEX_AUTOCUT_DRAFTS_ROOT/);
+    assert.match(prompt, /CODEX_AUTOCUT_PACKAGE_ZIP_PATH/);
+    const userEvent = fixture.app.database.listAiChatEvents(freshTask.threadId)
+      .find((event) => event.type === "user_message");
+    assert.equal(userEvent?.content, "trusted package prompt");
   } finally {
     await fixture.app.close();
     await fixture.bridge.close();
@@ -878,7 +917,13 @@ test("Auto-Cut retry rejects non-blocked, copied-marker, and legacy tasks", asyn
     const nonBlocked = await jsonRequest(
       fixture.baseUrl,
       `/api/local/tasks/${encodeURIComponent(phased.body.task.id)}/autocut-retry`,
-      { version: phased.body.task.version },
+      {
+        version: phased.body.task.version,
+        runConsent: {
+          allowVideoAudioAsr: true,
+          allowConfiguredLocalOutput: true,
+        },
+      },
     );
     assert.equal(nonBlocked.response.status, 409, JSON.stringify(nonBlocked.body));
     assert.equal(nonBlocked.body.error.code, "AUTOCUT_RETRY_NOT_ALLOWED");
@@ -899,7 +944,13 @@ test("Auto-Cut retry rejects non-blocked, copied-marker, and legacy tasks", asyn
     const forged = await jsonRequest(
       fixture.baseUrl,
       `/api/local/tasks/${encodeURIComponent(copiedMarker.id)}/autocut-retry`,
-      { version: copiedMarker.version },
+      {
+        version: copiedMarker.version,
+        runConsent: {
+          allowVideoAudioAsr: true,
+          allowConfiguredLocalOutput: true,
+        },
+      },
     );
     assert.equal(forged.response.status, 409, JSON.stringify(forged.body));
     assert.equal(forged.body.error.code, "TASK_NOT_STARTABLE");
@@ -930,7 +981,13 @@ test("Auto-Cut retry rejects non-blocked, copied-marker, and legacy tasks", asyn
     const legacyRetry = await jsonRequest(
       fixture.baseUrl,
       `/api/local/tasks/${encodeURIComponent(legacy.body.task.id)}/autocut-retry`,
-      { version: legacy.body.task.version },
+      {
+        version: legacy.body.task.version,
+        runConsent: {
+          allowVideoAudioAsr: true,
+          allowConfiguredLocalOutput: true,
+        },
+      },
     );
     assert.equal(legacyRetry.response.status, 409, JSON.stringify(legacyRetry.body));
     assert.equal(legacyRetry.body.error.code, "AUTOCUT_RETRY_NOT_ALLOWED");
