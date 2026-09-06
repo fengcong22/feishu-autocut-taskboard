@@ -42,7 +42,7 @@ function validateUrl(value) {
   if (
     parsed.protocol !== "https:"
     || !(parsed.hostname === "feishu.cn" || parsed.hostname.endsWith(".feishu.cn"))
-    || !/^\/(?:docx|wiki)\/[^/]+$/u.test(parsed.pathname)
+    || !/^\/(?:docx|wiki)\/[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(parsed.pathname)
     || parsed.username
     || parsed.password
     || parsed.search

@@ -15,8 +15,8 @@
 - One subject has one real single-select status field. The fixed stages are initial, first_review, and final_review; at least one stage is enabled and enabled stages use distinct option IDs.
 - A stage triggers only when the same field changes from a non-target option to its configured target option. Missing or mismatched before/after data is fail-closed; leaving the target and re-entering is required after a disabled period.
 - Stage configuration is frozen into the task and then into each run. A later configuration edit cannot change an existing task or run.
-- A record document field contains exactly one validated HTTPS Feishu Docx URL. Docx anchors use trimmed, exact text matching and include descendants until the next peer or ancestor heading.
-- Docx media is paired in document order. Base attachment sources are opaque field identifiers and must contain exactly one usable attachment. Count, MIME, download, or duration violations block the stage instead of selecting a guess.
+- A record document field contains exactly one validated HTTPS Feishu document URL, using either the `/docx/` or `/wiki/` route. Document anchors use trimmed, exact text matching and include descendants until the next peer or ancestor heading.
+- Document media is paired in document order. Base attachment sources are opaque field identifiers and must contain exactly one usable attachment. Count, MIME, download, or duration violations block the stage instead of selecting a guess.
 - video_original does not read an audio source. replace_original requires one and uses the configured duration tolerance, defaulting to 3 seconds.
 - The three stages start from their own complete inputs and never reuse a prior stage ZIP. Auto-Cut package concurrency is fixed at 1; upload workers retain their independent configured concurrency.
 - ZIP source and destination directories are local configuration values or approved allowlisted bindings, never values promoted from a Feishu cell into a path, command, or prompt.
@@ -565,7 +565,7 @@ Legacy rows keep null stage columns and remain eligible only for their preexisti
 
 In POST /api/local/feishu/tasks, authenticate the loopback Bridge first, parse the canonical request, then load subjectKey + configVersion from feishu_subject_versions. Require that the stored version was enabled at event.occurredAt, stageId exists and was enabled, trigger field/option exactly matches the event edge, projectId equals subjectProjectId(subjectKey), package alias exists and is enabled, and the stage destination belongs to the saved local subject configuration. When occurredAt is absent, accept only the currently active version; otherwise return STALE_STAGE_EVENT. Validate controlledContext only as bounded inert data with the exact documentLinks, namingDisplayValue, and boolean namingValueUnique keys; do not require one link or a non-empty name at registration time. Those source checks run after the attempt row exists, so a trusted task can expose and retry the failure without granting it artifact eligibility.
 
-Derive title, project, labels, executionMode, packageAlias, package revision, enqueueMode, package source root, stage destination, suffix, and prompt from server-owned snapshots. Store controlledContext.documentLinks, controlledContext.namingDisplayValue, and the Bridge-provided namingValueUnique proof only as inert snapshot data for the first attempt, never as a command, local path, package name, or prompt. The run-preparation boundary is responsible for requiring exactly one official Feishu HTTPS Docx URL, a non-empty computed naming value, and namingValueUnique === true.
+Derive title, project, labels, executionMode, packageAlias, package revision, enqueueMode, package source root, stage destination, suffix, and prompt from server-owned snapshots. Store controlledContext.documentLinks, controlledContext.namingDisplayValue, and the Bridge-provided namingValueUnique proof only as inert snapshot data for the first attempt, never as a command, local path, package name, or prompt. The run-preparation boundary is responsible for requiring exactly one official Feishu HTTPS Docx or Wiki document URL, a non-empty computed naming value, and namingValueUnique === true.
 
 - [ ] **Step 5: Implement indexed idempotency in the same transaction**
 
@@ -686,7 +686,7 @@ test("manifest rejects paths, prompts, credentials, and unsupported sources", ()
 });
 ~~~
 
-Also test one official HTTPS Docx URL, exact trimmed anchors, video_original removing source/tolerance, replace_original requiring its source, positive tolerance, fixed stage IDs, and Base attachment field IDs without file paths or attachment-name selection.
+Also test official HTTPS Docx and Wiki document URLs, exact trimmed anchors, video_original removing source/tolerance, replace_original requiring its source, positive tolerance, fixed stage IDs, and Base attachment field IDs without file paths or attachment-name selection.
 
 - [ ] **Step 2: Run tests and verify RED**
 
@@ -698,7 +698,7 @@ Expected: module and run-attempt table do not exist.
 
 - [ ] **Step 3: Implement strict canonical manifest normalization**
 
-Reject unknown keys at every level. Accept document hosts ending in .feishu.cn, an HTTPS protocol, no username/password, and a pathname matching /docx/{opaque-token}. Preserve only origin and pathname; reject query and fragment. Trim anchors only at their edges and keep their remaining code points unchanged. Keep array order stable and never sort source media.
+Reject unknown keys at every level. Accept document hosts ending in .feishu.cn, an HTTPS protocol, no username/password, and a pathname matching either `/docx/{opaque-token}` or `/wiki/{opaque-token}`. Require the opaque token to start with an ASCII letter or digit and contain only ASCII letters, digits, `_`, or `-`. Preserve only origin and pathname; reject query and fragment. Trim anchors only at their edges and keep their remaining code points unchanged. Keep array order stable and never sort source media.
 
 Canonicalize with a recursive key-sort function:
 
@@ -869,7 +869,7 @@ Expected: run input module and source manifest environment do not exist.
 
 Resolve the run root as dataDirectory/autocut-runs/{taskId}/{runId} and the draft root as dataDirectory/autocut-runs/{taskId}/{runId}/drafts. Resolve the frozen package snapshot's absolute zipSourceDirectory with realpath, verify it is a regular configured directory, and place the ZIP at {zipSourceDirectory}/.taskboard-autocut/{taskId}/{runId}/{sanitizedArtifactName}.zip. Validate every identifier and name segment, reject an existing different file, and never let a Feishu value choose any parent directory. Create the run and draft directories with owner-only permissions where supported, write temporary files with flag wx, fsync, then rename to source-manifest.json and execution_input.json.
 
-Require controlledContext.documentLinks to contain exactly one official HTTPS Docx URL, controlledContext.namingValueUnique to be true, and controlledContext.namingDisplayValue to be non-empty after trimming. Build artifact_name by trimming controlledContext.namingDisplayValue, rejecting control-character values, and appending the frozen stage nameSuffix. Use all three only as inert manifest/execution data; do not interpolate them into the Codex instruction text.
+Require controlledContext.documentLinks to contain exactly one official HTTPS Docx or Wiki document URL, controlledContext.namingValueUnique to be true, and controlledContext.namingDisplayValue to be non-empty after trimming. Build artifact_name by trimming controlledContext.namingDisplayValue, rejecting control-character values, and appending the frozen stage nameSuffix. Use all three only as inert manifest/execution data; do not interpolate them into the Codex instruction text.
 
 - [ ] **Step 4: Integrate preparation into onRunCreated**
 
@@ -1479,7 +1479,7 @@ Expected: both test services report 127.0.0.1 listeners, the test package snapsh
 
 - [ ] **Step 6: Demonstrate the successful real operation path**
 
-In a dedicated test Base subject, configure one enabled stage against a real status field, one Docx field, one naming field, exact video/review anchors, and a safe test destination. Move a test record from another option into the configured option and capture:
+In a dedicated test Base subject, configure one enabled stage against a real status field, one Feishu document field, one naming field, exact video/review anchors, and a safe test destination. Move a test record from another option into the configured option and capture:
 
 1. Bridge event ID, before/after option IDs, subject/version/stage decision, and one registration response.
 2. Taskboard task origin, delayed then running state, run/attempt, manifest digest, and package lease.

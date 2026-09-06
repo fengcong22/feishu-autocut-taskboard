@@ -47,15 +47,40 @@ test("creates a stable manifest and digest independent of object insertion order
   assert.equal(first.manifest.binding.stage_id, "initial");
 });
 
-test("accepts an official HTTPS Feishu Wiki document URL", () => {
-  const created = createSourceManifest(input({
-    document: {
-      field_id: "fld_document",
-      url: "https://guanghe.feishu.cn/wiki/WikOpaqueToken",
-    },
-  }));
+test("accepts canonical official HTTPS Feishu Docx and Wiki document URLs", () => {
+  for (const url of [
+    "https://guanghe.feishu.cn/docx/Docx_123-token",
+    "https://guanghe.feishu.cn/wiki/Wiki_123-token",
+  ]) {
+    const created = createSourceManifest(input({
+      document: { field_id: "fld_document", url },
+    }));
+    assert.equal(created.manifest.document.url, url);
+  }
+});
 
-  assert.equal(created.manifest.document.url, "https://guanghe.feishu.cn/wiki/WikOpaqueToken");
+test("rejects a non-canonical Feishu Docx token", () => {
+  assert.throws(
+    () => createSourceManifest(input({
+      document: {
+        field_id: "fld_document",
+        url: "https://guanghe.feishu.cn/docx/token.with-dot",
+      },
+    })),
+    /document\.url must be an HTTPS Feishu Docx or Wiki URL/u,
+  );
+});
+
+test("rejects a non-canonical Feishu Wiki token", () => {
+  assert.throws(
+    () => createSourceManifest(input({
+      document: {
+        field_id: "fld_document",
+        url: "https://guanghe.feishu.cn/wiki/%2F",
+      },
+    })),
+    /document\.url must be an HTTPS Feishu Docx or Wiki URL/u,
+  );
 });
 
 test("rejects non-document Feishu URLs with the allowed document types", () => {
