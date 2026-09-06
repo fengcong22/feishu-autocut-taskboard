@@ -548,6 +548,7 @@ export class AiChatService {
       const run = this.database.createAiChatRun({ threadId });
       let runContext = null;
       let hasPrivateAutoCutInputs = false;
+      let hasAutoCutRunConsent = false;
       try {
         if (onRunCreated) runContext = await onRunCreated(run);
         hasPrivateAutoCutInputs = Boolean(
@@ -556,6 +557,7 @@ export class AiChatService {
           || runContext?.autoCutBinding
           || runContext?.autoCutRuntime,
         );
+        hasAutoCutRunConsent = runContext?.autoCutRunConsent !== undefined;
         if ((runContext?.artifactReport || hasPrivateAutoCutInputs) && taskClaimedByServer !== true) {
           throw new ApiError(
             409,
@@ -568,6 +570,13 @@ export class AiChatService {
             409,
             "TRUSTED_AUTOCUT_CONTEXT_REQUIRED",
             "Run-private Auto-Cut inputs require an artifact report capability",
+          );
+        }
+        if (hasAutoCutRunConsent && (!hasPrivateAutoCutInputs || !runContext?.artifactReport)) {
+          throw new ApiError(
+            409,
+            "TRUSTED_AUTOCUT_CONTEXT_REQUIRED",
+            "Run consent requires bound private Auto-Cut inputs",
           );
         }
         if (
@@ -607,6 +616,7 @@ export class AiChatService {
         {
           artifactReportEnabled: Boolean(runContext?.artifactReport),
           autoCutInputsEnabled: hasPrivateAutoCutInputs,
+          autoCutRunConsent: hasAutoCutRunConsent ? runContext.autoCutRunConsent : null,
           includeManageTaskboardSkill: taskClaimedByServer !== true,
           trustedAutoCutSource: taskClaimedByServer === true
             ? resolved.trustedAutoCutSource

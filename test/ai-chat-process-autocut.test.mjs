@@ -42,3 +42,43 @@ test("trusted Auto-Cut prompt gives the exact run-input and report protocol with
   assert.doesNotMatch(prompt, /guanghe\.feishu\.cn|课程001|录屏|claim-token|C:\\nas/iu);
   assert.doesNotMatch(prompt, /manage-taskboard|issue_identifier/iu);
 });
+
+test("trusted Auto-Cut prompt includes fixed consent only for the consented run", () => {
+  const options = {
+    artifactReportEnabled: true,
+    autoCutInputsEnabled: true,
+    includeManageTaskboardSkill: false,
+    trustedAutoCutSource: {
+      source: "feishu-base",
+      baseToken: "bas_demo",
+      tableId: "tbl_math",
+      recordId: "rec_1",
+    },
+  };
+  const prompt = buildCodexPrompt(
+    thread(),
+    { message: "run package", skills: [], attachmentPaths: [] },
+    "C:\\taskboard\\skills\\manage-taskboard\\SKILL.md",
+    options,
+  );
+  const consented = buildCodexPrompt(
+    thread(),
+    { message: "run package", skills: [], attachmentPaths: [] },
+    "C:\\taskboard\\skills\\manage-taskboard\\SKILL.md",
+    {
+      ...options,
+      autoCutRunConsent: {
+        allowVideoAudioAsr: true,
+        allowConfiguredLocalOutput: true,
+      },
+    },
+  );
+
+  assert.match(consented, /only for this Auto-Cut run/i);
+  assert.match(consented, /openspeech\.bytedance\.com/);
+  assert.match(consented, /word-level timing and acceptance/i);
+  assert.match(consented, /CODEX_AUTOCUT_DRAFTS_ROOT/);
+  assert.match(consented, /CODEX_AUTOCUT_PACKAGE_ZIP_PATH/);
+  assert.doesNotMatch(prompt, /openspeech\.bytedance\.com/);
+  assert.doesNotMatch(prompt, /consent has been granted/i);
+});

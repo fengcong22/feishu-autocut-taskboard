@@ -233,6 +233,7 @@ export function buildCodexPrompt(
   {
     artifactReportEnabled = false,
     autoCutInputsEnabled = false,
+    autoCutRunConsent = null,
     includeManageTaskboardSkill = true,
     trustedAutoCutSource = null,
   } = {},
@@ -280,6 +281,16 @@ export function buildCodexPrompt(
     context.push(
       "turn_attachment_paths:",
       ...turnAttachmentPaths.map((attachmentPath) => `- ${attachmentPath}`),
+    );
+  }
+  if (autoCutRunConsent?.allowVideoAudioAsr === true) {
+    context.push(
+      "Consent has been granted only for this Auto-Cut run to extract audio from the videos selected by the server-owned manifest and send that audio only to openspeech.bytedance.com, only for word-level timing and acceptance.",
+    );
+  }
+  if (autoCutRunConsent?.allowConfiguredLocalOutput === true) {
+    context.push(
+      "Consent has been granted only for this Auto-Cut run to write the Jianying draft and final ZIP only to the server-configured locations represented by CODEX_AUTOCUT_DRAFTS_ROOT and CODEX_AUTOCUT_PACKAGE_ZIP_PATH. Do not derive or choose another output path.",
     );
   }
   context.push(
