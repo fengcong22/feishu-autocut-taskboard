@@ -302,6 +302,39 @@ Taskboard 在登记前验证：
 - 旧 run 只作为审计记录，不被新 ZIP 覆盖；
 - 自动模式的重试也必须由该按钮明确发起。
 
+### 12.1 单次运行的外部 ASR 与本地写入授权
+
+当受信任的 phased Auto-Cut 任务因执行代理缺少逐次授权而阻塞时，重试请求可以额外携带结构化的 `runConsent`：
+
+```json
+{
+  "version": 16,
+  "runConsent": {
+    "allowVideoAudioAsr": true,
+    "allowConfiguredLocalOutput": true
+  }
+}
+```
+
+该授权遵循以下边界：
+
+- 只由 `POST /api/local/tasks/:id/autocut-retry` 接受，且仍须先通过 loopback、任务版本、`blocked` 状态、服务器登记的 Feishu origin 和 phased Auto-Cut 快照校验；普通任务、复制描述标记或 legacy 任务不能使用。
+- 两个字段都只能是布尔值；不接受授权自由文本、服务地址、输出路径、命令或 prompt。服务地址固定为 `openspeech.bytedance.com`，输出位置仍只来自 Taskboard 为该 run 注入的受控路径。
+- 授权只随本次 retry 调度到新 run。服务端生成固定说明，明确只允许从当前受信任清单的视频提取音频并发送至该 ASR 服务，用于字词级定位和验收，同时允许写入该 run 的配置草稿和 ZIP 路径。
+- 不读取 Taskboard 评论、任务描述或飞书单元格作为授权来源，也不修改学科配置或 Auto-Cut 包提示词；评论可以作为审计记录，但不能取得执行资格。
+- 未携带 `runConsent` 的现有重试保持原行为；携带不完整、为 `false`、含未知字段或用于不合格任务的请求在创建新 run 前拒绝。
+- 授权说明只进入该 run 的服务端私有执行上下文，并随 AI run 的用户事件留痕；不得继承到后续 retry、其他课程或其他任务。
+
+直接操作路径为：
+
+`POST /api/local/tasks/:id/autocut-retry` 携带 `version + runConsent`
+-> `server/app.mjs` 校验受信任任务、版本和结构化授权
+-> `server/feishu-execution-coordinator.mjs` 在本次调度项中传递授权
+-> `server/app.mjs` 的 `startClaimedTaskWithAi` 为新 run 生成固定授权说明
+-> `server/ai-chat-process.mjs` 将其放入该 run 的私有 Taskboard 上下文
+-> Auto-Cut 只按 server-owned manifest、执行输入和输出路径运行
+-> 仍由精确 `driver_report` 完成 ZIP 登记和 automatic 上传入队。
+
 Bridge 的事件租约、至少一次投递和 dead-letter 机制继续保留。Taskboard 或 Auto-Cut 重启后只恢复有明确 run 状态的工作，不扫描临时目录或收养孤立 ZIP。
 
 ## 13. API、持久化和组件改动范围
