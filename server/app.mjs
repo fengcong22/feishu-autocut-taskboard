@@ -1,5 +1,6 @@
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
+import { createReadStream } from "node:fs";
 import { chmod, mkdir, open, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { isIP } from "node:net";
@@ -41,6 +42,7 @@ import { STAGE_IDS } from "./feishu-workflow-stages.mjs";
 import { createFeishuWorkflowApi } from "./feishu-workflow-api.mjs";
 import { createResourceScheduler } from "./resource-scheduler.mjs";
 import { createFeishuExecutionCoordinator } from "./feishu-execution-coordinator.mjs";
+import { runLocalAutoCut } from "./autocut-local-runner.mjs";
 import { ArtifactServiceError, createArtifactService } from "./artifact-service.mjs";
 import { createArtifactUploadWorker } from "./upload-worker.mjs";
 import { readCurrentControlledContext } from "./feishu-controlled-context-client.mjs";
@@ -2488,6 +2490,8 @@ export function createTaskboardServer(options = {}) {
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
   const pendingFeishuReconciliations = new Set();
+  const pendingLocalAutoCutRuns = new Set();
+  const autoCutRunner = options.autoCutRunner ?? runLocalAutoCut;
   const artifactService = options.artifactService ?? createArtifactService({
     rootDirectory: resolved.artifactsDirectory,
   });
@@ -3703,6 +3707,40 @@ export function createTaskboardServer(options = {}) {
     }
   }
 
+  async function sha256File(filename) {
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(filename)) hash.update(chunk);
+    return hash.digest("hex");
+  }
+
+  async function reportLocalAutoCutArtifact(run, claimToken) {
+    const result = await readAutoCutResult(run);
+    if (result.status === "blocked") return result;
+    const response = await fetch(localArtifactReportUrl(run.taskId, run.runId), {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${claimToken}`,
+        "content-type": "application/json",
+        "x-taskboard-client": "taskctl",
+      },
+      body: JSON.stringify({
+        path: run.packageZipPath,
+        sha256: await sha256File(run.packageZipPath),
+        manifestSha256: run.manifestSha256,
+      }),
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch {}
+    if (!response.ok) {
+      throw new ApiError(
+        response.status,
+        payload?.error?.code ?? "AUTOCUT_ARTIFACT_REPORT_FAILED",
+        payload?.error?.message ?? "Taskboard could not accept the Auto-Cut ZIP",
+      );
+    }
+    return result;
+  }
+
   function assertTaskCanEnqueueArtifact(task) {
     const metadata = assertTaskArtifactEligible(task);
     if (task.status !== "done") {
@@ -3873,14 +3911,20 @@ export function createTaskboardServer(options = {}) {
         }
       } else if (run?.status === "failed" || run?.status === "interrupted") {
         let failure = autoCutResultError(
-          "autocut_process_failed",
-          "The Auto-Cut process did not complete successfully",
+          autoCutRun.state === "blocked" && autoCutRun.errorCode
+            ? autoCutRun.errorCode
+            : "autocut_process_failed",
+          autoCutRun.state === "blocked" && autoCutRun.errorMessage
+            ? autoCutRun.errorMessage
+            : typeof run?.error === "string" && run.error.trim()
+              ? run.error.trim()
+              : "The Auto-Cut process did not complete successfully",
         );
         try {
           const result = await readAutoCutResult(autoCutRun);
           if (result.status === "blocked") failure = result.error;
         } catch (error) {
-          failure = error;
+          if (error?.code !== "autocut_result_missing") failure = error;
         }
         database.markFeishuAutoCutRunBlocked(autoCutRun.runId, failure);
         status = "blocked";
@@ -4329,6 +4373,198 @@ export function createTaskboardServer(options = {}) {
     };
   }
 
+  async function prepareClaimedPhasedAutoCutRun(claimedTask, actor, metadata, packageConfig) {
+    const threadId = randomUUID();
+    const project = database.getProject(claimedTask.projectId);
+    if (!project) {
+      throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${claimedTask.projectId}' does not exist`);
+    }
+    const thread = database.createAiChatThread({
+      id: threadId,
+      title: `${claimedTask.identifier} · ${metadata.packageAlias}`,
+      origin: {
+        projectId: project.id,
+        projectName: project.name,
+        workspacePath: packageConfig.workspacePath,
+        issueId: claimedTask.id,
+        issueIdentifier: claimedTask.identifier,
+      },
+      model: "local-autocut",
+      reasoningEffort: "none",
+      sandbox: "workspace-write",
+    });
+    const boundTask = database.bindTaskAiStart(
+      claimedTask.id,
+      claimedTask.claimToken,
+      claimedTask.version,
+      thread.id,
+      actor,
+    );
+    events.emit("task.updated", { task: boundTask });
+    const run = database.createAiChatRun({ threadId: thread.id });
+    database.bindTaskAiStartRun(
+      boundTask.id,
+      claimedTask.claimToken,
+      thread.id,
+      run.id,
+    );
+    const origin = trustedFeishuTaskOrigin(database.getTask(boundTask.id), { requirePackage: true });
+    const attempt = database.createFeishuAutoCutRun({
+      runId: run.id,
+      taskId: boundTask.id,
+      subjectKey: origin.subjectKey,
+      configVersion: origin.configVersion,
+      stageId: origin.stageId,
+      eventId: origin.eventId,
+      resultPath: path.join(
+        resolved.dataDirectory,
+        "autocut-runs",
+        boundTask.id,
+        run.id,
+        "result.json",
+      ),
+    });
+    try {
+      if (!driverArtifactSourceForMetadata(origin)) {
+        throw new ApiError(
+          409,
+          "AUTOCUT_DRIVER_REPORT_REQUIRED",
+          "Phased Auto-Cut runs require the driver report artifact source",
+        );
+      }
+      const subjectVersion = database.getFeishuSubjectVersion(origin.subjectKey, origin.configVersion);
+      if (!subjectVersion) {
+        throw new ApiError(409, "AUTOCUT_SUBJECT_SNAPSHOT_MISSING", "The task's subject snapshot is unavailable");
+      }
+      const packageSnapshot = database.getFeishuTaskPackageSnapshot(boundTask.id);
+      if (!packageSnapshot) {
+        throw new ApiError(409, "AUTOCUT_PACKAGE_SNAPSHOT_MISSING", "The task's package snapshot is unavailable");
+      }
+      const controlledContext = await readCurrentControlledContext({
+        bridgeUrl: resolved.feishuBridgeUrl,
+        bridgeSecret: resolved.feishuBridgeSecret,
+        origin,
+      });
+      const prepared = await prepareFeishuRunInputs({
+        dataDirectory: resolved.dataDirectory,
+        task: boundTask,
+        run: attempt,
+        origin,
+        subjectVersion,
+        packageSnapshot,
+        controlledContext,
+      });
+      return {
+        task: database.getTask(boundTask.id),
+        thread,
+        run,
+        autoCutRun: database.markFeishuAutoCutRunPrepared(run.id, prepared),
+      };
+    } catch (error) {
+      const failure = blockedPreparationError(error);
+      database.markFeishuAutoCutRunBlocked(run.id, failure);
+      database.updateAiChatRun(run.id, {
+        status: "failed",
+        exitCode: 1,
+        error: failure.message.slice(0, 65_536),
+        finishedAt: new Date().toISOString(),
+      });
+      const blockedTask = database.settleTaskAiStart(
+        boundTask.id,
+        claimedTask.claimToken,
+        run.id,
+        "blocked",
+        actor,
+      );
+      clearFeishuExecutionAfterRun(boundTask.id);
+      events.emit("task.updated", { task: blockedTask });
+      throw failure;
+    }
+  }
+
+  async function startClaimedTaskWithLocalAutoCut(
+    claimedTask,
+    actor,
+    metadata,
+    packageConfig,
+    lease,
+    trigger,
+    autoCutRunConsent = null,
+  ) {
+    let prepared;
+    try {
+      prepared = await prepareClaimedPhasedAutoCutRun(claimedTask, actor, metadata, packageConfig);
+      database.updateFeishuAutoCutRun(prepared.run.id, { state: "running" });
+    } catch (error) {
+      resourceScheduler.release(lease);
+      if (error?.feishuAutoCutPreparationBlocked !== true) {
+        try {
+          const rollback = database.releaseTaskFromAiStart(
+            claimedTask.id,
+            claimedTask.claimToken,
+            actor,
+          );
+          events.emit("task.updated", { task: rollback });
+        } catch {}
+      }
+      throw error;
+    }
+
+    let operation;
+    operation = (async () => {
+      let terminalRun;
+      try {
+        await autoCutRunner({
+          run: prepared.autoCutRun,
+          packageConfig,
+          environment: codexProcessEnvironment,
+          signal: taskStartAbortController.signal,
+          ...(trigger === "retry" && autoCutRunConsent ? { autoCutRunConsent } : {}),
+        });
+        await reportLocalAutoCutArtifact(prepared.autoCutRun, claimedTask.claimToken);
+        terminalRun = database.updateAiChatRun(prepared.run.id, {
+          status: "completed",
+          exitCode: 0,
+          error: null,
+          finishedAt: new Date().toISOString(),
+        });
+      } catch (error) {
+        database.markFeishuAutoCutRunBlocked(prepared.run.id, error);
+        terminalRun = database.updateAiChatRun(prepared.run.id, {
+          status: error?.name === "AbortError" ? "interrupted" : "failed",
+          exitCode: 1,
+          error: String(error?.message ?? error).slice(0, 65_536),
+          finishedAt: new Date().toISOString(),
+        });
+      }
+      await scheduleFeishuTaskReconciliation(
+        prepared.task.id,
+        prepared.thread.id,
+        terminalRun,
+        actor,
+        metadata,
+        lease,
+      );
+    })();
+    pendingLocalAutoCutRuns.add(operation);
+    void operation.finally(() => pendingLocalAutoCutRuns.delete(operation)).catch(() => {});
+
+    return {
+      task: database.getTask(claimedTask.id),
+      thread: prepared.thread,
+      run: prepared.run,
+      execution: {
+        executionId: lease.requestId,
+        leaseId: lease.leaseId,
+        state: "running",
+        trigger,
+        mode: executionRequestForTask(claimedTask, metadata, packageConfig).mode,
+        concurrencyGroup: lease.concurrencyGroup,
+        resourceGroups: lease.resourceGroups,
+      },
+    };
+  }
+
   async function startTaskWithAi(
     task,
     actor,
@@ -4398,7 +4634,13 @@ export function createTaskboardServer(options = {}) {
     try {
       if (!lease) lease = await resourceScheduler.request(execution);
       assertTaskStartAllowed(signal);
-      return await startClaimedTaskWithAi(
+      const startClaimedTask = trigger === "retry"
+        && autoCutRunConsent?.allowVideoAudioAsr === true
+        && autoCutRunConsent?.allowConfiguredLocalOutput === true
+        && isPhasedAutoCutOrigin(metadata)
+        ? startClaimedTaskWithLocalAutoCut
+        : startClaimedTaskWithAi;
+      return await startClaimedTask(
         claimedTask,
         actor,
         metadata,
@@ -6773,6 +7015,9 @@ export function createTaskboardServer(options = {}) {
       aiEventResponses.clear();
       await executionCoordinator.close();
       await settleTaskStarts();
+      if (pendingLocalAutoCutRuns.size > 0) {
+        await Promise.allSettled([...pendingLocalAutoCutRuns]);
+      }
       await uploadWorker.close();
       await aiChat.close();
       await settleFeishuTaskReconciliations();

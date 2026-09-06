@@ -104,6 +104,7 @@ async function createFixture({
   bridgeStatus = 200,
   turnDelayMs = 0,
   allowAutomaticExecution = false,
+  autoCutRunner = undefined,
 } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-autocut-lifecycle-"));
   const workspacePath = path.join(directory, "workspace");
@@ -183,6 +184,7 @@ if (args[0] === "debug") {
     },
     feishuWorkflowSync: async () => ({ ok: true }),
     allowAutomaticExecution,
+    autoCutRunner,
   });
   const address = await app.listen({ host: "127.0.0.1", port: 0 });
   return {
@@ -356,6 +358,75 @@ async function reportRunArtifact(fixture, run, overrides = {}) {
     },
   );
 }
+
+test("an authorized phased retry runs locally without starting another Codex turn", async () => {
+  const controlledContext = {
+    documentLinks: ["https://guanghe.feishu.cn/docx/taskboard-owned-runner"],
+    namingDisplayValue: "课程000",
+    namingValueUnique: true,
+  };
+  const invocations = [];
+  let fixture;
+  fixture = await createFixture({
+    controlledContext,
+    allowAutomaticExecution: true,
+    autoCutRunner: async ({ run }) => {
+      invocations.push(run.runId);
+      await writePassingRunResult(run);
+      return { exitCode: 0 };
+    },
+  });
+  try {
+    const subject = await registerSubject(fixture, {
+      executionMode: "automatic",
+      enqueueMode: "automatic",
+    });
+    const created = await jsonRequest(
+      fixture.baseUrl,
+      "/api/local/feishu/tasks",
+      registration(subject, controlledContext),
+    );
+    assert.equal(created.response.status, 201, JSON.stringify(created.body));
+    const firstStart = await jsonRequest(
+      fixture.baseUrl,
+      `/api/tasks/${created.body.task.id}/start-ai`,
+      {},
+    );
+    assert.equal(firstStart.response.status, 202, JSON.stringify(firstStart.body));
+    const [firstRun] = await waitForRuns(fixture.app, created.body.task.id, 1);
+    const blocked = await waitForTaskStatus(fixture.app, created.body.task.id, "blocked");
+    assert.deepEqual(invocations, []);
+    assert.equal((await readFile(fixture.promptCapturePath, "utf8")).includes("trusted package prompt"), true);
+
+    const retried = await jsonRequest(
+      fixture.baseUrl,
+      `/api/local/tasks/${encodeURIComponent(blocked.id)}/autocut-retry`,
+      {
+        version: blocked.version,
+        runConsent: {
+          allowVideoAudioAsr: true,
+          allowConfiguredLocalOutput: true,
+        },
+      },
+    );
+    assert.equal(retried.response.status, 202, JSON.stringify(retried.body));
+    assert.equal(retried.body.execution.trigger, "retry");
+    const runs = await waitForRuns(fixture.app, created.body.task.id, 2);
+    const run = runs[1];
+    assert.notEqual(run.runId, firstRun.runId);
+    await waitForTaskStatus(fixture.app, created.body.task.id, "done");
+    assert.deepEqual(invocations, [run.runId]);
+    assert.deepEqual(fixture.app.database.listAiChatEvents(retried.body.thread.id), []);
+    const artifact = fixture.app.database.getTaskArtifactForRun(created.body.task.id, run.runId);
+    assert.equal(artifact?.validationStatus, "verified");
+    assert.equal(fixture.app.database.listTaskArtifactUploads(created.body.task.id).length, 1);
+    assert.equal(fixture.app.database.listAiChatRuns(firstStart.body.thread.id).length, 1);
+  } finally {
+    await fixture.app.close();
+    await fixture.bridge.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
 
 test("a trusted phased Auto-Cut start persists an immutable run and injects private inputs", async () => {
   const controlledContext = {
@@ -808,10 +879,16 @@ test("startup recovery revalidates phased terminal receipts before completing a 
 });
 
 test("an explicit phased retry creates a new attempt and preserves the blocked run", async () => {
+  const invocations = [];
   const fixture = await createFixture({
     controlledContext: "document_link_missing",
     bridgeStatus: 409,
-    turnDelayMs: 1_000,
+    autoCutRunner: async ({ run }) => {
+      invocations.push(run.runId);
+      const error = new Error("fixture local preflight failed");
+      error.code = "fixture_preflight_failed";
+      throw error;
+    },
   });
   try {
     const subject = await registerSubject(fixture);
@@ -882,16 +959,13 @@ test("an explicit phased retry creates a new attempt and preserves the blocked r
     assert.equal(runs[0].runId, firstRun.runId);
     assert.equal(runs[0].state, "blocked");
     assert.notEqual(runs[1].runId, firstRun.runId);
-    const freshTask = await waitForTaskStatus(fixture.app, blocked.id, "blocked");
-    const prompt = await readFile(fixture.promptCapturePath, "utf8");
-    assert.match(prompt, /Consent has been granted only for this Auto-Cut run/);
-    assert.match(prompt, /openspeech\.bytedance\.com/);
-    assert.match(prompt, /word-level timing and acceptance/);
-    assert.match(prompt, /CODEX_AUTOCUT_DRAFTS_ROOT/);
-    assert.match(prompt, /CODEX_AUTOCUT_PACKAGE_ZIP_PATH/);
-    const userEvent = fixture.app.database.listAiChatEvents(freshTask.threadId)
-      .find((event) => event.type === "user_message");
-    assert.equal(userEvent?.content, "trusted package prompt");
+    await waitForTaskStatus(fixture.app, blocked.id, "blocked");
+    const failedRetry = fixture.app.database.getFeishuAutoCutRun(runs[1].runId);
+    assert.deepEqual(invocations, [runs[1].runId]);
+    assert.equal(failedRetry.state, "blocked");
+    assert.equal(failedRetry.errorCode, "fixture_preflight_failed");
+    assert.equal(failedRetry.errorMessage, "fixture local preflight failed");
+    await assert.rejects(readFile(fixture.promptCapturePath, "utf8"), { code: "ENOENT" });
   } finally {
     await fixture.app.close();
     await fixture.bridge.close();
