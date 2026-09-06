@@ -43,6 +43,29 @@ test("trusted Auto-Cut prompt gives the exact run-input and report protocol with
   assert.doesNotMatch(prompt, /manage-taskboard|issue_identifier/iu);
 });
 
+test("run-private Auto-Cut inputs do not ask the agent to reread the trusted Base record", () => {
+  const prompt = buildCodexPrompt(
+    thread(),
+    { message: "run package", skills: [], attachmentPaths: [] },
+    "C:\\taskboard\\skills\\manage-taskboard\\SKILL.md",
+    {
+      artifactReportEnabled: true,
+      autoCutInputsEnabled: true,
+      includeManageTaskboardSkill: false,
+      trustedAutoCutSource: {
+        source: "feishu-base",
+        baseToken: "bas_demo",
+        tableId: "tbl_math",
+        recordId: "rec_1",
+      },
+    },
+  );
+
+  assert.match(prompt, /autocut_source:/);
+  assert.match(prompt, /review-document-run/);
+  assert.doesNotMatch(prompt, /Read this Feishu Base record before executing the package prompt/);
+});
+
 test("trusted Auto-Cut prompt includes fixed consent only for the consented run", () => {
   const options = {
     artifactReportEnabled: true,
