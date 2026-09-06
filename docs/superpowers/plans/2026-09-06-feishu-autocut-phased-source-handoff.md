@@ -167,7 +167,7 @@ Classify the implementation as high risk because it crosses persistence, externa
 - validateSubjectConfig(subject) rejects a missing single-select status field, stale option IDs, duplicate enabled target options, invalid source descriptors, invalid audio mode, and a subject with no enabled stage.
 - Public subjects expose statusField, documentField, namingField, stages, execution, packageRoute, and upload.
 - Bridge synchronization omits each machine-local artifactTargetPath but preserves the stage source descriptors and suffix.
-- Each feishu_subject_versions row records the enabled interval used to decide whether a delayed event occurred while that version was active.
+- Each feishu_subject_versions row records the enabled interval used to decide whether a delayed event occurred while that version was active. Bridge history is durable and queryable by both `(subjectKey, configVersion)` and `(subjectKey, occurredAt)`; disabling or deleting the current subject never removes an old version needed by a delayed event or an explicit retry.
 - Bridge workflow storage appends the same immutable subject version with enabledAt/closedAt and exposes getSubjectVersion(subjectKey, configVersion) plus resolveSubjectVersionAt(subjectKey, occurredAt). It never reconstructs an old version from the current subject.
 - `subject-version-history.mjs` persists a versioned sidecar next to the Bridge workflow config under the same state lock; each entry contains subjectKey, configVersion, enabledAt, closedAt, lifecycle, and the full portable subject snapshot. History writes and current-config writes occur in one serialized store mutation, and an interrupted write leaves the previous pair intact.
 
@@ -784,7 +784,7 @@ git commit -m "feat: persist Auto-Cut run source manifests"
 - runContext.executionInput contains path.
 - runContext.autoCutBinding contains taskId, runId, subjectKey, configVersion, stageId, and eventId copied from the persisted immutable binding.
 - A trusted local Codex process receives CODEX_AUTOCUT_SOURCE_MANIFEST_PATH, CODEX_AUTOCUT_SOURCE_MANIFEST_SHA256, and CODEX_AUTOCUT_EXECUTION_INPUT_PATH.
-- The same process receives server-owned CODEX_AUTOCUT_JOB_ROOT, CODEX_AUTOCUT_DRAFTS_ROOT, CODEX_AUTOCUT_RESULT_PATH, and CODEX_AUTOCUT_PACKAGE_ZIP_PATH. `CODEX_AUTOCUT_DRAFTS_ROOT` is a new run-private directory under the Taskboard data directory. `CODEX_AUTOCUT_PACKAGE_ZIP_PATH` is a new run-specific child of the realpath of the frozen package snapshot's `zipSourceDirectory` (the existing driver-report allowlist); Taskboard creates that child before spawning Auto-Cut and rejects any package without an absolute configured source directory. None comes from a Feishu cell.
+- The same process receives server-owned CODEX_AUTOCUT_JOB_ROOT, CODEX_AUTOCUT_DRAFTS_ROOT, CODEX_AUTOCUT_RESULT_PATH, and CODEX_AUTOCUT_PACKAGE_ZIP_PATH. `CODEX_AUTOCUT_JOB_ROOT`, `CODEX_AUTOCUT_DRAFTS_ROOT`, and `CODEX_AUTOCUT_RESULT_PATH` are created below the Taskboard data directory's run-private root. `CODEX_AUTOCUT_PACKAGE_ZIP_PATH` is a new run-specific child of the realpath of the frozen package snapshot's `zipSourceDirectory` (the existing driver-report allowlist); Taskboard creates that child before spawning Auto-Cut and rejects any package without an absolute configured source directory. The trusted runner invocation passes all four values explicitly (`--job-root`, `--drafts-root`, `--result-path`, and `--package-zip`), and the report route checks the ZIP against that same frozen source root. None comes from a Feishu cell.
 - The same process receives CODEX_AUTOCUT_TASK_ID, CODEX_AUTOCUT_RUN_ID, CODEX_AUTOCUT_SUBJECT_KEY, CODEX_AUTOCUT_CONFIG_VERSION, CODEX_AUTOCUT_STAGE_ID, and CODEX_AUTOCUT_EVENT_ID from the immutable database binding. Auto-Cut compares all six with the manifest before any source read.
 - No user-authored prompt contains the document URL, anchor text, naming value, report token, or local/NAS destination.
 - executionRequestForTask always uses maxConcurrent 1 for phased Auto-Cut, regardless of a larger package value.
@@ -1419,10 +1419,10 @@ Document:
 
 - [ ] **Step 2: Document the Auto-Cut manifest CLI and receipt**
 
-Include this invocation contract without real local paths or tokens:
+Include this source-worktree invocation contract without real local paths or tokens (the packaged deployment uses the equivalent installed command path, but never changes the input contract):
 
 ~~~powershell
-python scripts/jy_wrapper.py review-document-run --source-manifest $env:CODEX_AUTOCUT_SOURCE_MANIFEST_PATH --execution-input $env:CODEX_AUTOCUT_EXECUTION_INPUT_PATH --job-root RUN_PRIVATE_ROOT --drafts-root APPROVED_DRAFT_ROOT --package-zip APPROVED_PACKAGE_PATH --json
+python scripts/jy_wrapper.py review-document-run --source-manifest $env:CODEX_AUTOCUT_SOURCE_MANIFEST_PATH --execution-input $env:CODEX_AUTOCUT_EXECUTION_INPUT_PATH --job-root $env:CODEX_AUTOCUT_JOB_ROOT --drafts-root $env:CODEX_AUTOCUT_DRAFTS_ROOT --result-path $env:CODEX_AUTOCUT_RESULT_PATH --package-zip $env:CODEX_AUTOCUT_PACKAGE_ZIP_PATH --json
 ~~~
 
 State that successful callers must read data.package_zip or data.output_artifacts.package_zip and archive_sha256 from that same JSON response, verify the adjacent receipt, and report exactly that file. State that source-manifest mode requires Feishu default user identity and never falls back to whole-document media ranking.
@@ -1436,7 +1436,7 @@ npm run typecheck
 npm run build:web
 Pop-Location
 Push-Location 'D:\codex\worktrees\feishu-autocut-bridge'
-node --test test/workflow-config.test.mjs test/feishu-base-metadata.test.mjs test/feishu-event.test.mjs test/decide-event.test.mjs test/bridge.test.mjs test/state-store.test.mjs test/feishu-record-reader.test.mjs test/server.test.mjs
+node --test test/workflow-config.test.mjs test/feishu-base-metadata.test.mjs test/feishu-event.test.mjs test/decide-event.test.mjs test/bridge.test.mjs test/state-store.test.mjs test/feishu-record-reader.test.mjs test/server.test.mjs test/taskboard-context-server.test.mjs
 Pop-Location
 Push-Location 'D:\codex\worktrees\feishu-autocut-autocut'
 python -m pytest tests/test_source_manifest.py tests/test_review_document_intake.py tests/test_review_document_runner.py tests/test_review_job_compiler.py tests/test_revision_models.py tests/test_lite_revision.py tests/test_review_job_pipeline.py -q
@@ -1491,7 +1491,7 @@ The proof is the real product path and its durable records, not merely passing t
 
 - [ ] **Step 7: Demonstrate one real fail-closed and retry path**
 
-Use the same test subject with a missing anchor or ambiguous matching anchor. Trigger a fresh status edge and verify: the task becomes blocked, Auto-Cut produces no accepted ZIP, no artifact or upload row is created, and the UI shows the stable reason. Correct the test document (and, in a separate retry fixture, replace an empty/invalid current document-link or naming field while leaving the frozen stage configuration unchanged), click Retry Auto-Cut once, and verify a new run/attempt refreshes the current controlled fields, succeeds, and leaves the blocked run and its manifest visible.
+Use the same test subject with a missing anchor or ambiguous matching anchor. Trigger a fresh status edge and verify: the task becomes blocked, Auto-Cut produces no accepted ZIP, no artifact or upload row is created, and the UI shows the stable reason. Correct the test document (and, in a separate retry fixture, replace an empty/invalid current document-link or naming field while leaving the frozen stage configuration unchanged), click Retry Auto-Cut once, and verify a new run/attempt calls the controlled-context endpoint with the immutable subject version, refreshes the current document link and computed naming result, succeeds, and leaves the blocked run and its manifest visible.
 
 Separately rely on the automated boundary test to prove that an ordinary task/description marker cannot receive automatic execution or artifact capability; do not forge requests against production data.
 
