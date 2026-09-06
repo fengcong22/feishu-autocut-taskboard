@@ -55,6 +55,7 @@ const ATTACHMENT_BODY_LIMIT = 25 * 1024 * 1024;
 const ARTIFACT_MAX_BYTES = 20 * 1024 * 1024 * 1024;
 const AI_CHAT_TURN_BODY_LIMIT = 25 * 1024 * 1024;
 const AI_CHAT_ATTACHMENT_LIMIT = 10;
+const AUTOCUT_RESULT_MAX_BYTES = 1024 * 1024;
 const AI_CHAT_SKILL_MARKER = "\uFFFC";
 const HOST_RUNTIME_TTL_MS = 3_000;
 const CODEX_PLAN_TAIL_BYTES = 16 * 1024 * 1024;
@@ -1140,7 +1141,7 @@ function parseArtifactHeaders(request) {
 
 function parseArtifactReport(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["path", "sha256"]));
+  assertAllowedKeys(body, new Set(["path", "sha256", "manifestSha256"]));
   if (
     typeof body.path !== "string"
     || body.path.length === 0
@@ -1153,7 +1154,21 @@ function parseArtifactReport(body) {
   if (typeof body.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(body.sha256)) {
     throw new ApiError(400, "INVALID_ARTIFACT_HASH", "'sha256' must be a lowercase SHA-256 digest");
   }
-  return { path: body.path, sha256: body.sha256 };
+  if (
+    body.manifestSha256 !== undefined
+    && (typeof body.manifestSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(body.manifestSha256))
+  ) {
+    throw new ApiError(
+      400,
+      "INVALID_ARTIFACT_HASH",
+      "'manifestSha256' must be a lowercase SHA-256 digest",
+    );
+  }
+  return {
+    path: body.path,
+    sha256: body.sha256,
+    ...(body.manifestSha256 === undefined ? {} : { manifestSha256: body.manifestSha256 }),
+  };
 }
 
 function parseArtifactUploadEnqueue(body) {
@@ -2447,6 +2462,7 @@ export function createTaskboardServer(options = {}) {
   );
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
+  const pendingFeishuReconciliations = new Set();
   const artifactService = options.artifactService ?? createArtifactService({
     rootDirectory: resolved.artifactsDirectory,
   });
@@ -2890,7 +2906,11 @@ export function createTaskboardServer(options = {}) {
         response = await fetch(new URL("/api/feishu/base-preview", bridgeUrl), {
           method: "POST",
           redirect: "error",
-          headers: { "content-type": "application/json" },
+          headers: {
+            "content-type": "application/json",
+            "x-feishu-bridge-client": "taskboard",
+            "x-feishu-bridge-secret": resolved.feishuBridgeSecret,
+          },
           body: JSON.stringify({ url }),
         });
       } catch {
@@ -3323,6 +3343,284 @@ export function createTaskboardServer(options = {}) {
     }
   }
 
+  function autoCutResultError(code, message) {
+    return new ApiError(409, code, message);
+  }
+
+  function assertExactResultKeys(value, allowed, name) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw autoCutResultError("autocut_result_invalid", `Auto-Cut ${name} is invalid`);
+    }
+    const unknown = Object.keys(value).find((key) => !allowed.has(key));
+    if (unknown) {
+      throw autoCutResultError("autocut_result_invalid", `Auto-Cut ${name} contains an unsupported field`);
+    }
+  }
+
+  function expectedAutoCutBinding(run) {
+    return {
+      task_id: run.taskId,
+      run_id: run.runId,
+      subject_key: run.subjectKey,
+      config_version: run.configVersion,
+      stage_id: run.stageId,
+      event_id: run.eventId,
+    };
+  }
+
+  function publicAutoCutRun(run) {
+    return {
+      runId: run.runId,
+      taskId: run.taskId,
+      attempt: run.attempt,
+      subjectKey: run.subjectKey,
+      configVersion: run.configVersion,
+      stageId: run.stageId,
+      eventId: run.eventId,
+      manifestSha256: run.manifestSha256,
+      artifactName: run.artifactName,
+      state: run.state,
+      errorCode: run.errorCode,
+      errorMessage: run.errorMessage,
+      createdAt: run.createdAt,
+      updatedAt: run.updatedAt,
+    };
+  }
+
+  function assertAutoCutRunBinding(run, metadata) {
+    if (
+      !run
+      || run.taskId !== metadata?.taskId
+      || run.subjectKey !== metadata?.subjectKey
+      || run.configVersion !== metadata?.configVersion
+      || run.stageId !== metadata?.stageId
+      || run.eventId !== metadata?.eventId
+    ) {
+      throw autoCutResultError(
+        "AUTOCUT_RUN_BINDING_MISMATCH",
+        "The Auto-Cut report does not match this task and run",
+      );
+    }
+  }
+
+  function normalizeAutoCutResult(run, value) {
+    assertExactResultKeys(
+      value,
+      new Set([
+        "schema_version", "binding", "manifest_sha256", "status",
+        "package_zip", "archive_sha256", "draft_name", "error",
+      ]),
+      "result",
+    );
+    if (value.schema_version !== 1 || (value.status !== "pass" && value.status !== "blocked")) {
+      throw autoCutResultError("autocut_result_invalid", "Auto-Cut result schema is invalid");
+    }
+    assertExactResultKeys(
+      value.binding,
+      new Set(["task_id", "run_id", "subject_key", "config_version", "stage_id", "event_id"]),
+      "result binding",
+    );
+    if (canonicalJson(value.binding) !== canonicalJson(expectedAutoCutBinding(run))) {
+      throw autoCutResultError(
+        "AUTOCUT_RUN_BINDING_MISMATCH",
+        "The Auto-Cut result binding does not match this task and run",
+      );
+    }
+    if (value.manifest_sha256 !== run.manifestSha256) {
+      throw autoCutResultError(
+        "AUTOCUT_RUN_BINDING_MISMATCH",
+        "The Auto-Cut result manifest does not match this run",
+      );
+    }
+    if (value.status === "blocked") {
+      if (
+        Object.hasOwn(value, "package_zip")
+        || Object.hasOwn(value, "archive_sha256")
+        || Object.hasOwn(value, "draft_name")
+      ) {
+        throw autoCutResultError("autocut_result_invalid", "A blocked Auto-Cut result cannot contain a package");
+      }
+      assertExactResultKeys(value.error, new Set(["code", "message", "details"]), "result error");
+      if (
+        typeof value.error.code !== "string"
+        || value.error.code.trim() === ""
+        || typeof value.error.message !== "string"
+        || value.error.message.trim() === ""
+      ) {
+        throw autoCutResultError("autocut_result_invalid", "Auto-Cut result error is invalid");
+      }
+      return {
+        ...value,
+        error: {
+          code: value.error.code.trim().slice(0, 256),
+          message: value.error.message.trim().slice(0, 2_000),
+          ...(Object.hasOwn(value.error, "details") ? { details: value.error.details } : {}),
+        },
+      };
+    }
+    if (Object.hasOwn(value, "error")) {
+      throw autoCutResultError("autocut_result_invalid", "A successful Auto-Cut result cannot contain an error");
+    }
+    if (
+      typeof value.package_zip !== "string"
+      || !path.isAbsolute(value.package_zip)
+      || value.package_zip.includes("\0")
+      || value.package_zip.length > 4_096
+      || typeof value.archive_sha256 !== "string"
+      || !/^[a-f0-9]{64}$/u.test(value.archive_sha256)
+      || typeof value.draft_name !== "string"
+      || value.draft_name !== run.artifactName
+      || path.resolve(value.package_zip) !== path.resolve(run.packageZipPath)
+    ) {
+      throw autoCutResultError(
+        "AUTOCUT_RUN_BINDING_MISMATCH",
+        "The Auto-Cut result package does not match this run",
+      );
+    }
+    return value;
+  }
+
+  function normalizeAutoCutPackageReceipt(run, result, value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw autoCutResultError("autocut_package_receipt_invalid", "Auto-Cut package receipt is invalid");
+    }
+    if (
+      value.schema_version !== 1
+      || value.status !== "pass"
+      || value.workflow_mode !== "lite"
+      || value.delivery_mode !== "lite_zip"
+      || value.zip_crc_pass !== true
+      || value.zip_tree_identity_pass !== true
+      || !Array.isArray(value.source_pairs)
+    ) {
+      throw autoCutResultError(
+        "autocut_package_receipt_invalid",
+        "Auto-Cut package receipt does not prove a validated Lite ZIP",
+      );
+    }
+    if (
+      !value.binding
+      || canonicalJson(value.binding) !== canonicalJson(expectedAutoCutBinding(run))
+      || value.source_manifest_sha256 !== run.manifestSha256
+      || value.archive_sha256 !== result.archive_sha256
+      || value.draft_name !== run.artifactName
+      || value.package_root_name !== run.artifactName
+      || typeof value.package_zip !== "string"
+      || typeof value.archive_path !== "string"
+      || !path.isAbsolute(value.package_zip)
+      || !path.isAbsolute(value.archive_path)
+      || path.resolve(value.package_zip) !== path.resolve(run.packageZipPath)
+      || path.resolve(value.archive_path) !== path.resolve(run.packageZipPath)
+    ) {
+      throw autoCutResultError(
+        "AUTOCUT_RUN_BINDING_MISMATCH",
+        "The Auto-Cut package receipt does not match this task and run",
+      );
+    }
+    return value;
+  }
+
+  async function readAutoCutResult(run) {
+    let details;
+    let value;
+    try {
+      details = await stat(run.resultPath);
+      if (!details.isFile() || details.size <= 0 || details.size > AUTOCUT_RESULT_MAX_BYTES) {
+        throw autoCutResultError("autocut_result_invalid", "Auto-Cut result file is invalid");
+      }
+      value = JSON.parse(await readFile(run.resultPath, "utf8"));
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      if (error?.code === "ENOENT") {
+        throw autoCutResultError("autocut_result_missing", "Auto-Cut did not produce its bound result receipt");
+      }
+      throw autoCutResultError("autocut_result_invalid", "Auto-Cut result receipt could not be read");
+    }
+    const result = normalizeAutoCutResult(run, value);
+    if (result.status === "blocked") return result;
+
+    const receiptPath = `${run.packageZipPath}.receipt.json`;
+    let receiptDetails;
+    let receiptValue;
+    try {
+      receiptDetails = await stat(receiptPath);
+      if (!receiptDetails.isFile() || receiptDetails.size <= 0 || receiptDetails.size > AUTOCUT_RESULT_MAX_BYTES) {
+        throw autoCutResultError("autocut_package_receipt_invalid", "Auto-Cut package receipt file is invalid");
+      }
+      receiptValue = JSON.parse(await readFile(receiptPath, "utf8"));
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      if (error?.code === "ENOENT") {
+        throw autoCutResultError(
+          "autocut_package_receipt_missing",
+          "Auto-Cut did not produce the exact adjacent package receipt",
+        );
+      }
+      throw autoCutResultError("autocut_package_receipt_invalid", "Auto-Cut package receipt could not be read");
+    }
+    return {
+      ...result,
+      packageReceipt: normalizeAutoCutPackageReceipt(run, result, receiptValue),
+    };
+  }
+
+  async function phasedArtifactSource(run, metadata, report, result) {
+    assertAutoCutRunBinding(run, metadata);
+    if (!report.manifestSha256 || report.manifestSha256 !== run.manifestSha256) {
+      throw autoCutResultError(
+        "AUTOCUT_RUN_BINDING_MISMATCH",
+        "The reported manifest does not match this Auto-Cut run",
+      );
+    }
+    if (result.status !== "pass" || result.archive_sha256 !== report.sha256) {
+      throw autoCutResultError(
+        "AUTOCUT_RUN_BINDING_MISMATCH",
+        "The reported ZIP does not match the Auto-Cut result receipt",
+      );
+    }
+    const packageSnapshot = database.getFeishuTaskPackageSnapshot(run.taskId);
+    const configuredSource = driverArtifactSourceForMetadata(metadata);
+    if (!packageSnapshot?.zipSourceDirectory || !configuredSource?.artifactSourcePath) {
+      throw autoCutResultError(
+        "AUTOCUT_PACKAGE_SOURCE_UNAVAILABLE",
+        "The frozen Auto-Cut ZIP source is unavailable",
+      );
+    }
+    let packageRoot;
+    let configuredRoot;
+    let expectedPath;
+    let reportedPath;
+    try {
+      [packageRoot, configuredRoot, expectedPath, reportedPath] = await Promise.all([
+        realpath(packageSnapshot.zipSourceDirectory),
+        realpath(configuredSource.artifactSourcePath),
+        realpath(run.packageZipPath),
+        realpath(report.path),
+      ]);
+    } catch {
+      throw autoCutResultError(
+        "ARTIFACT_SOURCE_UNAVAILABLE",
+        "The reported ZIP or its frozen source root is unavailable",
+      );
+    }
+    const relativePath = path.relative(packageRoot, expectedPath);
+    if (
+      packageRoot !== configuredRoot
+      || expectedPath !== reportedPath
+      || relativePath === ""
+      || relativePath === ".."
+      || relativePath.startsWith(`..${path.sep}`)
+      || path.isAbsolute(relativePath)
+      || path.basename(expectedPath) !== `${run.artifactName}.zip`
+    ) {
+      throw autoCutResultError(
+        "AUTOCUT_RUN_BINDING_MISMATCH",
+        "The reported ZIP path does not match this Auto-Cut run",
+      );
+    }
+    return { artifactSourcePath: packageRoot };
+  }
+
   async function acceptReportedArtifact(source, report) {
     let sourceRoot;
     let reportedPath;
@@ -3400,9 +3698,16 @@ export function createTaskboardServer(options = {}) {
     // A task created before upload was configured has an intentionally empty
     // target in its snapshot. Let that task use the subject's current target;
     // once a target was captured, keep the creation-time binding stable.
-    const target = snapshotTarget?.targetPath
-      ? snapshotTarget
-      : database.getFeishuSubjectUploadTargetByOrigin(metadata.baseToken, metadata.tableId);
+    const stageTargetPath = isPhasedAutoCutOrigin(metadata)
+      && typeof metadata.stageSnapshot.artifactTargetPath === "string"
+      && metadata.stageSnapshot.artifactTargetPath.trim()
+      ? metadata.stageSnapshot.artifactTargetPath.trim()
+      : null;
+    const target = isPhasedAutoCutOrigin(metadata)
+      ? snapshotTarget && { ...snapshotTarget, targetPath: stageTargetPath }
+      : snapshotTarget?.targetPath
+        ? snapshotTarget
+        : database.getFeishuSubjectUploadTargetByOrigin(metadata.baseToken, metadata.tableId);
     if (automaticOnly && (snapshotTarget?.enqueueMode ?? target?.enqueueMode) !== "automatic") return null;
     if (!target) {
       throw new ApiError(409, "TASK_UPLOAD_NOT_CONFIGURED", "This task is not linked to a configured subject");
@@ -3487,7 +3792,7 @@ export function createTaskboardServer(options = {}) {
     }
   }
 
-  function reconcileFeishuTaskAfterRun(taskId, threadId, run, actor, metadata, lease = null) {
+  async function reconcileFeishuTaskAfterRun(taskId, threadId, run, actor, metadata, lease = null) {
     const current = database.getTask(taskId);
     if (!current || current.threadId !== threadId) {
       clearFeishuExecutionAfterRun(taskId, lease);
@@ -3513,7 +3818,54 @@ export function createTaskboardServer(options = {}) {
       return;
     }
     const artifact = run?.id ? database.getTaskArtifactForRun(taskId, run.id) : null;
-    const status = terminalTaskStatusForRun(run, currentMetadata, artifact);
+    const autoCutRun = run?.id ? database.getFeishuAutoCutRun(run.id) : null;
+    let status;
+    let completionArtifactId;
+    if (autoCutRun) {
+      if (run?.status === "completed") {
+        try {
+          const result = await readAutoCutResult(autoCutRun);
+          if (result.status === "blocked") {
+            database.markFeishuAutoCutRunBlocked(autoCutRun.runId, result.error);
+            status = "blocked";
+          } else if (
+            autoCutRun.state !== "reported"
+            || artifact?.validationStatus !== "verified"
+            || artifact.sha256 !== result.archive_sha256
+            || artifact.filename !== path.basename(autoCutRun.packageZipPath)
+          ) {
+            throw autoCutResultError(
+              "autocut_artifact_missing",
+              "Auto-Cut completed without its bound verified ZIP",
+            );
+          } else {
+            status = completedTaskStatusForMetadata(currentMetadata);
+            completionArtifactId = artifact.id;
+          }
+        } catch (error) {
+          database.markFeishuAutoCutRunBlocked(autoCutRun.runId, error);
+          status = "blocked";
+        }
+      } else if (run?.status === "failed" || run?.status === "interrupted") {
+        let failure = autoCutResultError(
+          "autocut_process_failed",
+          "The Auto-Cut process did not complete successfully",
+        );
+        try {
+          const result = await readAutoCutResult(autoCutRun);
+          if (result.status === "blocked") failure = result.error;
+        } catch (error) {
+          failure = error;
+        }
+        database.markFeishuAutoCutRunBlocked(autoCutRun.runId, failure);
+        status = "blocked";
+      } else {
+        return;
+      }
+    } else {
+      status = terminalTaskStatusForRun(run, currentMetadata, artifact);
+      completionArtifactId = completionArtifactIdForRun(status, currentMetadata, artifact);
+    }
     if (!status) return;
     const task = database.settleTaskAiStart(
       taskId,
@@ -3521,8 +3873,15 @@ export function createTaskboardServer(options = {}) {
       run.id,
       status,
       actor,
-      completionArtifactIdForRun(status, currentMetadata, artifact),
+      completionArtifactId,
     );
+    if (autoCutRun && ["done", "in_review"].includes(status)) {
+      database.updateFeishuAutoCutRun(autoCutRun.runId, {
+        state: "completed",
+        errorCode: null,
+        errorMessage: null,
+      });
+    }
     clearFeishuExecutionAfterRun(taskId, lease);
     events.emit("task.updated", { task });
     if (
@@ -3534,6 +3893,30 @@ export function createTaskboardServer(options = {}) {
     }
     if (lease) resourceScheduler.release(lease);
   }
+
+  function scheduleFeishuTaskReconciliation(taskId, threadId, run, actor, metadata, lease = null) {
+    const pending = reconcileFeishuTaskAfterRun(
+      taskId,
+      threadId,
+      run,
+      actor,
+      metadata,
+      lease,
+    ).catch((error) => {
+      if (lease) resourceScheduler.release(lease);
+      console.error("Failed to reconcile Feishu task after Codex run", error);
+    });
+    pendingFeishuReconciliations.add(pending);
+    void pending.finally(() => pendingFeishuReconciliations.delete(pending)).catch(() => {});
+    return pending;
+  }
+
+  async function settleFeishuTaskReconciliations() {
+    while (pendingFeishuReconciliations.size > 0) {
+      await Promise.allSettled([...pendingFeishuReconciliations]);
+    }
+  }
+
   function reconcileClaimedFeishuTasks() {
     for (const claim of database.listTaskAiStarts()) {
       const task = database.getTask(claim.taskId);
@@ -3607,6 +3990,19 @@ export function createTaskboardServer(options = {}) {
         } catch (error) {
           console.error("Failed to recover Feishu task before run", error);
         }
+        continue;
+      }
+      if (
+        database.getFeishuAutoCutRun(latest.id)
+        && ["completed", "failed", "interrupted"].includes(latest.status)
+      ) {
+        scheduleFeishuTaskReconciliation(
+          task.id,
+          claim.threadId,
+          latest,
+          CODEX_AGENT_ACTOR,
+          metadata,
+        );
         continue;
       }
       const artifact = database.getTaskArtifactForRun(task.id, latest.id);
@@ -3719,12 +4115,14 @@ export function createTaskboardServer(options = {}) {
         if (event?.type !== "ai.run" || !event.run || event.run.status === "running") return;
         unsubscribeRun?.();
         unsubscribeRun = null;
-        try {
-          reconcileFeishuTaskAfterRun(claimedTask.id, thread.id, event.run, actor, metadata, lease);
-        } catch (error) {
-          resourceScheduler.release(lease);
-          console.error("Failed to reconcile Feishu task after Codex run", error);
-        }
+        scheduleFeishuTaskReconciliation(
+          claimedTask.id,
+          thread.id,
+          event.run,
+          actor,
+          metadata,
+          lease,
+        );
       });
     } catch (error) {
       unsubscribeRun?.();
@@ -5400,6 +5798,49 @@ export function createTaskboardServer(options = {}) {
         return methodNotAllowed(response, ["GET", "POST"]);
       }
 
+      const autoCutRetryRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/autocut-retry$/);
+      if (autoCutRetryRoute) {
+        assertAiLoopbackRequest(request);
+        assertNoQuery(url.searchParams, "POST /api/local/tasks/:id/autocut-retry");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const taskId = decodeRouteSegment(autoCutRetryRoute[1], "Task id");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set(["version"]));
+        const version = parseVersion(body.version);
+        const task = database.getTask(taskId);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        const metadata = requireTrustedFeishuTask(task, { requirePackage: true });
+        if (!isPhasedAutoCutOrigin(metadata)) {
+          throw new ApiError(409, "AUTOCUT_RETRY_NOT_ALLOWED", "Only a blocked phased Auto-Cut task can be retried");
+        }
+        const ready = database.prepareFeishuAutoCutRetry(
+          task.id,
+          version,
+          actorFromRequest(request),
+        );
+        events.emit("task.updated", { task: ready });
+        return sendJson(response, 202, await startTrackedTask(ready.id, () => (
+          executionCoordinator.schedule(ready, metadata, "retry", { actor: actorFromRequest(request) })
+        )));
+      }
+
+      const autoCutRunsRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/autocut-runs$/);
+      if (autoCutRunsRoute) {
+        assertNoQuery(url.searchParams, "/api/local/tasks/:id/autocut-runs");
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        const taskId = decodeRouteSegment(autoCutRunsRoute[1], "Task id");
+        const task = database.getTask(taskId);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        const metadata = assertTaskArtifactEligible(task);
+        if (!isPhasedAutoCutOrigin(metadata)) {
+          throw new ApiError(409, "TASK_NOT_PHASED_AUTOCUT", "This task has no phased Auto-Cut attempts");
+        }
+        return sendJson(response, 200, {
+          runs: database.listFeishuAutoCutRuns(task.id).map(publicAutoCutRun),
+        });
+      }
+
       const artifactReportRoute = pathname.match(
         /^\/api\/local\/tasks\/([^/]+)\/runs\/([^/]+)\/artifact-report$/,
       );
@@ -5414,8 +5855,8 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot accept Auto-Cut artifact reports");
         }
         const metadata = assertTaskArtifactEligible(task);
-        const source = driverArtifactSourceForMetadata(metadata);
-        if (!source) {
+        const configuredSource = driverArtifactSourceForMetadata(metadata);
+        if (!configuredSource) {
           throw new ApiError(
             409,
             "TASK_NOT_DRIVER_REPORT_ELIGIBLE",
@@ -5432,6 +5873,18 @@ export function createTaskboardServer(options = {}) {
         }
         assertArtifactReportRequest(request, claim.claimToken);
         const report = parseArtifactReport(await readJson(request));
+        const autoCutRun = database.getFeishuAutoCutRun(runId);
+        let acceptedResult = null;
+        let source = configuredSource;
+        if (autoCutRun) {
+          acceptedResult = await readAutoCutResult(autoCutRun);
+          source = await phasedArtifactSource(autoCutRun, metadata, report, acceptedResult);
+        } else if (report.manifestSha256 !== undefined) {
+          throw autoCutResultError(
+            "AUTOCUT_RUN_BINDING_MISMATCH",
+            "A legacy Auto-Cut run cannot report a phased manifest",
+          );
+        }
         const stored = await acceptReportedArtifact(source, report);
         let artifact;
         try {
@@ -5440,6 +5893,12 @@ export function createTaskboardServer(options = {}) {
               409,
               "ARTIFACT_HASH_MISMATCH",
               "The reported ZIP changed before Taskboard could verify it",
+            );
+          }
+          if (autoCutRun && stored.draftRoot !== autoCutRun.artifactName) {
+            throw autoCutResultError(
+              "AUTOCUT_RUN_BINDING_MISMATCH",
+              "The reported ZIP draft root does not match this Auto-Cut run",
             );
           }
           const existing = database.getTaskArtifactForRun(task.id, runId);
@@ -5468,11 +5927,25 @@ export function createTaskboardServer(options = {}) {
               "This task no longer accepts Auto-Cut artifact reports",
             );
           }
+          let currentAutoCutRun = null;
+          if (autoCutRun) {
+            currentAutoCutRun = database.getFeishuAutoCutRun(runId);
+            assertAutoCutRunBinding(currentAutoCutRun, currentMetadata);
+            const currentResult = await readAutoCutResult(currentAutoCutRun);
+            await phasedArtifactSource(currentAutoCutRun, currentMetadata, report, currentResult);
+            if (canonicalJson(currentResult) !== canonicalJson(acceptedResult)) {
+              throw autoCutResultError(
+                "AUTOCUT_RUN_BINDING_MISMATCH",
+                "The Auto-Cut result changed while storing its ZIP",
+              );
+            }
+          }
           artifact = database.createTaskArtifact(task.id, {
             ...stored,
             sourceMode: "driver_report",
             runId,
             requiredRunClaim: { runId, claimToken: claim.claimToken },
+            ...(currentAutoCutRun ? { requiredAutoCutRun: currentAutoCutRun } : {}),
             requiredTaskStatus: "in_progress",
             completedTaskStatus: null,
             actor: CODEX_AGENT_ACTOR,
@@ -6253,6 +6726,7 @@ export function createTaskboardServer(options = {}) {
       await settleTaskStarts();
       await uploadWorker.close();
       await aiChat.close();
+      await settleFeishuTaskReconciliations();
       await projectSummary.close();
       await serverClosed;
       listening = false;

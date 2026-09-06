@@ -424,6 +424,19 @@ export function validateSubjectConfig(value) {
   if (isPhasedSubject(value)) {
     try {
       const normalized = validatePhasedSubjectConfig(value);
+      if (value.execution.mode === "automatic") {
+        const missingDestination = STAGE_IDS.find((stageId) => (
+          normalized.stages[stageId].enabled
+          && normalized.stages[stageId].artifactTargetPath === null
+        ));
+        if (missingDestination) {
+          throw new ApiError(
+            400,
+            "INVALID_FIELD",
+            `Enabled automatic stage '${missingDestination}' requires artifactTargetPath`,
+          );
+        }
+      }
       for (const key of ["statusField", "documentField", "namingField", "stages"]) value[key] = normalized[key];
     } catch (error) {
       if (error instanceof ApiError) throw error;

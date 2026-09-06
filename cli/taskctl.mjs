@@ -506,6 +506,14 @@ async function reportArtifact(options, env, overrides) {
   } catch (error) {
     throw fileReadError(filename, error);
   }
+  const body = { path: filename, sha256 };
+  if (env.CODEX_AUTOCUT_SOURCE_MANIFEST_SHA256 !== undefined) {
+    const manifestSha256 = env.CODEX_AUTOCUT_SOURCE_MANIFEST_SHA256;
+    if (typeof manifestSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifestSha256)) {
+      throw usageError("CODEX_AUTOCUT_SOURCE_MANIFEST_SHA256 must be a lowercase SHA-256 digest");
+    }
+    body.manifestSha256 = manifestSha256;
+  }
 
   const fetchImplementation = overrides.fetch ?? globalThis.fetch;
   if (typeof fetchImplementation !== "function") {
@@ -526,7 +534,7 @@ async function reportArtifact(options, env, overrides) {
         "content-type": "application/json",
         "x-taskboard-client": "taskctl",
       },
-      body: JSON.stringify({ path: filename, sha256 }),
+      body: JSON.stringify(body),
     });
   } catch (error) {
     throw new TaskctlError(`Cannot reach taskboard service at ${url.origin}`, {

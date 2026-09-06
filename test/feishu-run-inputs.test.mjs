@@ -87,3 +87,54 @@ test("blocks missing or ambiguous controlled values before writing inputs", asyn
     await rm(fixtureData.packageRoot, { recursive: true, force: true });
   }
 });
+
+test("uses the Auto-Cut filename sanitizer for the frozen artifact name", async () => {
+  const cases = [
+    {
+      namingDisplayValue: "课程:003",
+      nameSuffix: "_初稿",
+      expected: "课程_003_初稿",
+    },
+    {
+      namingDisplayValue: "  课程   004  ",
+      nameSuffix: "_初稿",
+      expected: "课程 004_初稿",
+    },
+    {
+      namingDisplayValue: "CON",
+      nameSuffix: ".zip",
+      expected: "_CON",
+    },
+    {
+      namingDisplayValue: "课程".repeat(100),
+      nameSuffix: "_初稿",
+      expected: "课程".repeat(90),
+    },
+  ];
+
+  for (const [index, item] of cases.entries()) {
+    const fixtureData = await fixture();
+    try {
+      const request = input(fixtureData, {
+        task: { id: `task-${index + 1}` },
+        run: { runId: `run-${index + 1}`, attempt: 1 },
+        controlledContext: {
+          documentLinks: ["https://guanghe.feishu.cn/docx/opaque"],
+          namingDisplayValue: item.namingDisplayValue,
+          namingValueUnique: true,
+        },
+      });
+      request.subjectVersion.stages.initial.nameSuffix = item.nameSuffix;
+      const result = await prepareFeishuRunInputs(request);
+      assert.equal(result.artifactName, item.expected);
+      assert.deepEqual(
+        JSON.parse(await readFile(result.executionInputPath, "utf8")),
+        { schema_version: 1, artifact_name: item.expected },
+      );
+      assert.equal(path.basename(result.packageZipPath), `${item.expected}.zip`);
+    } finally {
+      await rm(fixtureData.dataDirectory, { recursive: true, force: true });
+      await rm(fixtureData.packageRoot, { recursive: true, force: true });
+    }
+  }
+});

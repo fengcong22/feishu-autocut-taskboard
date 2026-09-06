@@ -1077,7 +1077,7 @@ export class TaskboardDatabase {
         ready_at INTEGER NOT NULL,
         package_alias TEXT NOT NULL,
         package_revision INTEGER NOT NULL CHECK (package_revision > 0),
-        trigger TEXT NOT NULL CHECK (trigger IN ('manual', 'move', 'automatic')),
+        trigger TEXT NOT NULL CHECK (trigger IN ('manual', 'move', 'automatic', 'retry')),
         lease_id TEXT,
         version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
         created_at TEXT NOT NULL,
@@ -1393,6 +1393,7 @@ export class TaskboardDatabase {
     `);
 
     this.#migrateTaskArtifacts();
+    this.#migrateFeishuExecutionTriggers();
 
     const feishuBaseColumns = this.database.prepare("PRAGMA table_info(feishu_bases)").all();
     if (!feishuBaseColumns.some((column) => column.name === "removed_at")) {
@@ -4281,6 +4282,58 @@ export class TaskboardDatabase {
     }
   }
 
+  #migrateFeishuExecutionTriggers() {
+    const executionsSql = this.database.prepare(`
+      SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'feishu_task_executions'
+    `).get()?.sql ?? "";
+    if (executionsSql.includes("'retry'")) return;
+
+    this.database.exec("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE");
+    try {
+      this.database.exec(`
+        CREATE TABLE feishu_task_executions_retry_migration (
+          task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+          state TEXT NOT NULL CHECK (state IN ('delayed', 'queued', 'running')),
+          mode TEXT NOT NULL CHECK (mode IN ('manual', 'automatic')),
+          ready_at INTEGER NOT NULL,
+          package_alias TEXT NOT NULL,
+          package_revision INTEGER NOT NULL CHECK (package_revision > 0),
+          trigger TEXT NOT NULL CHECK (trigger IN ('manual', 'move', 'automatic', 'retry')),
+          lease_id TEXT,
+          version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          last_error TEXT
+        );
+
+        INSERT INTO feishu_task_executions_retry_migration (
+          task_id, state, mode, ready_at, package_alias, package_revision, trigger,
+          lease_id, version, created_at, updated_at, last_error
+        )
+        SELECT
+          task_id, state, mode, ready_at, package_alias, package_revision, trigger,
+          lease_id, version, created_at, updated_at, last_error
+        FROM feishu_task_executions;
+
+        DROP TABLE feishu_task_executions;
+        ALTER TABLE feishu_task_executions_retry_migration RENAME TO feishu_task_executions;
+        CREATE INDEX feishu_task_executions_pending
+          ON feishu_task_executions(state, ready_at, created_at, task_id);
+      `);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    } finally {
+      this.database.exec("PRAGMA foreign_keys = ON");
+    }
+
+    const violation = this.database.prepare("PRAGMA foreign_key_check").get();
+    if (violation) {
+      throw new Error(`Feishu execution migration produced a foreign key violation in '${violation.table}'`);
+    }
+  }
+
   getFeishuSubjectVersion(subjectKey, configVersion) {
     if (typeof subjectKey !== "string" || subjectKey.trim() === "") return null;
     if (!Number.isSafeInteger(configVersion) || configVersion < 1) return null;
@@ -4549,7 +4602,7 @@ export class TaskboardDatabase {
     if (!Number.isSafeInteger(input.packageRevision) || input.packageRevision < 1) {
       throw new ApiError(400, "INVALID_FIELD", "packageRevision must be a positive integer");
     }
-    if (!['manual', 'automatic'].includes(input.mode) || !['manual', 'move', 'automatic'].includes(input.trigger)) {
+    if (!['manual', 'automatic'].includes(input.mode) || !['manual', 'move', 'automatic', 'retry'].includes(input.trigger)) {
       throw new ApiError(400, "INVALID_FIELD", "Invalid execution mode or trigger");
     }
     const timestamp = now();
@@ -4641,6 +4694,56 @@ export class TaskboardDatabase {
 
   clearFeishuExecution(taskId) {
     this.database.prepare("DELETE FROM feishu_task_executions WHERE task_id = ?").run(taskId);
+  }
+
+  prepareFeishuAutoCutRetry(taskId, expectedVersion, actor) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.getTask(taskId);
+      if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+      this.#requireVersion(current, expectedVersion);
+      if (current.archivedAt !== null || current.status !== "blocked") {
+        throw new ApiError(409, "AUTOCUT_RETRY_NOT_ALLOWED", "Only a blocked Auto-Cut task can be retried");
+      }
+      const latestRun = this.database.prepare(`
+        SELECT state FROM feishu_autocut_runs
+        WHERE task_id = ?
+        ORDER BY attempt DESC, created_at DESC, run_id DESC
+        LIMIT 1
+      `).get(taskId);
+      const active = this.database.prepare(`
+        SELECT 1
+        FROM feishu_task_executions
+        WHERE task_id = ?
+        UNION ALL
+        SELECT 1
+        FROM task_ai_starts
+        WHERE task_id = ?
+        LIMIT 1
+      `).get(taskId, taskId);
+      if (!latestRun || latestRun.state !== "blocked" || active) {
+        throw new ApiError(409, "AUTOCUT_RETRY_NOT_ALLOWED", "This Auto-Cut task is not ready for retry");
+      }
+      const timestamp = now();
+      const updated = this.database.prepare(`
+        UPDATE tasks
+        SET status = 'todo', thread_id = NULL, version = version + 1, updated_at = ?
+        WHERE id = ? AND version = ? AND status = 'blocked' AND archived_at IS NULL
+      `).run(timestamp, taskId, expectedVersion);
+      if (updated.changes !== 1) this.#throwMissingOrConflict(taskId, expectedVersion);
+      this.#recordTaskActivity(
+        taskId,
+        actor,
+        taskFieldChanges(current, { status: "todo", threadId: null }),
+        timestamp,
+      );
+      this.database.prepare("DELETE FROM task_completion_artifacts WHERE task_id = ?").run(taskId);
+      this.database.exec("COMMIT");
+      return this.getTask(taskId);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   transitionFeishuTaskExecution(taskId, expectedVersion, status, actor = {
@@ -5949,6 +6052,7 @@ export class TaskboardDatabase {
         );
       }
       const runId = input.runId ?? null;
+      const requiredAutoCutRun = input.requiredAutoCutRun ?? null;
       if (input.sourceMode === "driver_report") {
         const requiredRunClaim = input.requiredRunClaim;
         const activeClaim = requiredRunClaim?.runId === runId
@@ -5959,6 +6063,34 @@ export class TaskboardDatabase {
             409,
             "TASK_START_STATE_CHANGED",
             "Task start state changed before storing the run artifact",
+          );
+        }
+      }
+      let autoCutRun = null;
+      if (requiredAutoCutRun) {
+        autoCutRun = this.database.prepare("SELECT * FROM feishu_autocut_runs WHERE run_id = ?").get(runId);
+        const origin = task.feishuOrigin;
+        if (
+          !autoCutRun
+          || autoCutRun.task_id !== task.id
+          || autoCutRun.task_id !== requiredAutoCutRun.taskId
+          || autoCutRun.subject_key !== requiredAutoCutRun.subjectKey
+          || autoCutRun.config_version !== requiredAutoCutRun.configVersion
+          || autoCutRun.stage_id !== requiredAutoCutRun.stageId
+          || autoCutRun.event_id !== requiredAutoCutRun.eventId
+          || autoCutRun.manifest_sha256 !== requiredAutoCutRun.manifestSha256
+          || autoCutRun.package_zip_path !== requiredAutoCutRun.packageZipPath
+          || autoCutRun.artifact_name !== requiredAutoCutRun.artifactName
+          || origin?.subjectKey !== autoCutRun.subject_key
+          || origin?.configVersion !== autoCutRun.config_version
+          || origin?.stageId !== autoCutRun.stage_id
+          || origin?.eventId !== autoCutRun.event_id
+          || !["prepared", "running", "reported"].includes(autoCutRun.state)
+        ) {
+          throw new ApiError(
+            409,
+            "AUTOCUT_RUN_BINDING_MISMATCH",
+            "The Auto-Cut artifact no longer matches this task and run",
           );
         }
       }
@@ -6028,6 +6160,20 @@ export class TaskboardDatabase {
           taskFieldChanges(task, { status: input.completedTaskStatus }),
           timestamp,
         );
+      }
+      if (autoCutRun && autoCutRun.state !== "reported") {
+        const updated = this.database.prepare(`
+          UPDATE feishu_autocut_runs
+          SET state = 'reported', error_code = NULL, error_message = NULL, updated_at = ?
+          WHERE run_id = ? AND state IN ('prepared', 'running')
+        `).run(now(), autoCutRun.run_id);
+        if (updated.changes !== 1) {
+          throw new ApiError(
+            409,
+            "AUTOCUT_RUN_BINDING_MISMATCH",
+            "The Auto-Cut run changed while storing its artifact",
+          );
+        }
       }
       this.database.exec("COMMIT");
       return this.getTaskArtifact(existing?.id ?? input.id);

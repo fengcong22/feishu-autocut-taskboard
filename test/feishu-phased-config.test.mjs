@@ -102,6 +102,27 @@ test("requires an audio source only when replacing the video's original audio", 
   assert.equal(validateSubjectConfig(value).stages.initial.audio.mode, "video_original");
 });
 
+test("requires a ZIP destination for every enabled stage in automatic mode", () => {
+  const value = subject();
+  value.execution.mode = "automatic";
+  value.stages.initial.artifactTargetPath = null;
+  value.stages.final_review = {
+    ...value.stages.final_review,
+    enabled: false,
+    artifactTargetPath: null,
+  };
+
+  assert.throws(
+    () => validateSubjectConfig(value),
+    /enabled automatic stage 'initial'.*artifactTargetPath/i,
+  );
+
+  value.stages.initial.artifactTargetPath = "C:\\approved\\initial";
+  const normalized = validateSubjectConfig(value);
+  assert.equal(normalized.stages.final_review.enabled, false);
+  assert.equal(normalized.stages.final_review.artifactTargetPath, null);
+});
+
 test("normalizes a stage against the selected status field metadata", () => {
   const normalized = normalizeStage(stage("initial", "opt_initial", "初稿"), metadata(), "initial");
   assert.equal(normalized.trigger.fieldId, "fld_status");

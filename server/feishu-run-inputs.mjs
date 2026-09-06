@@ -7,7 +7,14 @@ import {
 } from "./feishu-source-manifest.mjs";
 
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
-const CONTROL = /[\u0000-\u001f\u007f-\u009f]/u;
+const INVALID_ARTIFACT_NAME_CHARS = /[<>:"/\\|?*\u0000-\u001f]+/gu;
+const ARTIFACT_NAME_WHITESPACE = /\s+/gu;
+const WINDOWS_RESERVED_NAMES = new Set([
+  "CON", "PRN", "AUX", "NUL",
+  ...Array.from({ length: 9 }, (_, index) => `COM${index + 1}`),
+  ...Array.from({ length: 9 }, (_, index) => `LPT${index + 1}`),
+]);
+const MAX_ARTIFACT_NAME_CHARS = 180;
 
 function fail(code, message, status = 409) {
   const error = new Error(message);
@@ -30,16 +37,22 @@ function identifier(value, name) {
 }
 
 function safeName(value, name) {
-  const normalized = text(value, name);
-  if (
-    CONTROL.test(normalized)
-    || normalized === "."
-    || normalized === ".."
-    || /[\\/]/u.test(normalized)
-    || normalized.length > 240
-  ) {
-    throw fail("AUTOCUT_NAMING_INVALID", `${name} is invalid`, 409);
+  const requested = text(value, name);
+  let normalized = requested
+    .replace(INVALID_ARTIFACT_NAME_CHARS, "_")
+    .replace(ARTIFACT_NAME_WHITESPACE, " ")
+    .replace(/^[ .]+|[ .]+$/gu, "");
+  while (normalized.includes("..")) normalized = normalized.replaceAll("..", "_");
+  if (normalized.toLowerCase().endsWith(".zip")) {
+    normalized = normalized.slice(0, -4).replace(/[ .]+$/gu, "");
   }
+  const characters = [...normalized];
+  if (characters.length > MAX_ARTIFACT_NAME_CHARS) {
+    normalized = characters.slice(0, MAX_ARTIFACT_NAME_CHARS).join("").replace(/[ .]+$/gu, "");
+  }
+  if (!normalized) normalized = "_";
+  const [stem] = normalized.split(".", 1);
+  if (WINDOWS_RESERVED_NAMES.has(stem.toUpperCase())) normalized = `_${normalized}`;
   return normalized;
 }
 
@@ -121,11 +134,11 @@ export async function prepareFeishuRunInputs({
     || controlledContext.namingDisplayValue.trim() === "") {
     throw fail("naming_value_missing", "The naming field result is empty");
   }
-  const naming = safeName(controlledContext.namingDisplayValue, "namingDisplayValue");
+  const naming = text(controlledContext.namingDisplayValue, "namingDisplayValue");
   if (controlledContext?.namingValueUnique !== true) {
     throw fail("naming_value_not_unique", "The naming field result is not proven unique");
   }
-  const suffix = safeName(stage.nameSuffix ?? stage.name_suffix, "stage.nameSuffix");
+  const suffix = text(stage.nameSuffix ?? stage.name_suffix, "stage.nameSuffix");
   const artifactName = safeName(`${naming}${suffix}`, "artifactName");
   const jobRoot = path.join(root, "autocut-runs", taskId, runId);
   const draftsRoot = path.join(jobRoot, "drafts");

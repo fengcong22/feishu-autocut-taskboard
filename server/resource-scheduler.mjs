@@ -48,6 +48,7 @@ function normalizeRequest(input, extra = {}) {
     requestId: requestId.trim(),
     concurrencyGroup: concurrencyGroup.trim(),
     maxConcurrent,
+    fixedMaxConcurrent: value.fixedMaxConcurrent === true,
     resourceGroups,
     queuePolicy: value.queuePolicy === "per-group" ? "per-group" : "fifo",
   };
@@ -95,6 +96,20 @@ export function createResourceScheduler({ database = null, now = () => new Date(
       // drain/grant decision.
       state.maxConcurrent = maxConcurrent;
     }
+    return state;
+  }
+
+  function refreshGroupLimit(name, fallback) {
+    const state = groupState(name, fallback, { update: false });
+    const limits = [
+      ...[...activeByRequest.values()]
+        .filter(({ entry }) => entry.concurrencyGroup === name)
+        .map(({ entry }) => entry.maxConcurrent),
+      ...queue
+        .filter((entry) => entry.concurrencyGroup === name)
+        .map((entry) => entry.maxConcurrent),
+    ];
+    state.maxConcurrent = limits.length > 0 ? Math.min(...limits) : fallback;
     return state;
   }
 
@@ -159,7 +174,7 @@ export function createResourceScheduler({ database = null, now = () => new Date(
     const pending = pendingByRequest.get(normalized.requestId);
     if (pending) return pending.promise;
 
-    groupState(normalized.concurrencyGroup, normalized.maxConcurrent);
+    groupState(normalized.concurrencyGroup, normalized.maxConcurrent, { update: false });
 
     let resolve;
     let reject;
@@ -170,6 +185,7 @@ export function createResourceScheduler({ database = null, now = () => new Date(
     const entry = { ...normalized, promise, resolve, reject };
     pendingByRequest.set(entry.requestId, entry);
     queue.push(entry);
+    refreshGroupLimit(entry.concurrencyGroup, entry.maxConcurrent);
     drain();
     return promise;
   }
@@ -208,6 +224,7 @@ export function createResourceScheduler({ database = null, now = () => new Date(
       if (count > 0) resourceGroups.set(name, count);
       else resourceGroups.delete(name);
     }
+    refreshGroupLimit(active.entry.concurrencyGroup, active.entry.maxConcurrent);
     drain();
     return true;
   }
@@ -223,6 +240,7 @@ export function createResourceScheduler({ database = null, now = () => new Date(
     const index = queue.indexOf(pending);
     if (index >= 0) queue.splice(index, 1);
     pending.reject(schedulerError("REQUEST_CANCELLED", "Resource request was cancelled before it started"));
+    refreshGroupLimit(pending.concurrencyGroup, pending.maxConcurrent);
     drain();
     return true;
   }
@@ -249,10 +267,12 @@ export function createResourceScheduler({ database = null, now = () => new Date(
         if (index >= 0) queue.splice(index, 1);
         pending.reject(schedulerError("REQUEST_RECOVERED", "Request was recovered while queued"));
       }
-      recovered.push(grant({ ...normalized }, {
+      const lease = grant({ ...normalized }, {
         leaseId: candidate.leaseId,
         grantedAt: candidate.grantedAt,
-      }));
+      });
+      refreshGroupLimit(normalized.concurrencyGroup, normalized.maxConcurrent);
+      recovered.push(lease);
     }
     return Array.isArray(input) || Array.isArray(input.active) ? recovered : recovered[0];
   }
@@ -275,8 +295,17 @@ export function createResourceScheduler({ database = null, now = () => new Date(
 
   function setConcurrencyLimit(name, maxConcurrent) {
     if (typeof name !== "string" || !Number.isSafeInteger(maxConcurrent) || maxConcurrent < 1) return false;
-    const state = groupState(name, maxConcurrent);
-    state.maxConcurrent = maxConcurrent;
+    for (const { entry } of activeByRequest.values()) {
+      if (entry.concurrencyGroup === name && !entry.fixedMaxConcurrent) {
+        entry.maxConcurrent = maxConcurrent;
+      }
+    }
+    for (const entry of queue) {
+      if (entry.concurrencyGroup === name && !entry.fixedMaxConcurrent) {
+        entry.maxConcurrent = maxConcurrent;
+      }
+    }
+    refreshGroupLimit(name, maxConcurrent);
     drain();
     return true;
   }

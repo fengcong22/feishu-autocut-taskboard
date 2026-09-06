@@ -177,6 +177,7 @@ export function createFeishuExecutionCoordinator({
         : Number.isSafeInteger(packageConfig.maxConcurrent) && packageConfig.maxConcurrent > 0
           ? packageConfig.maxConcurrent
           : 1,
+      fixedMaxConcurrent: typeof entry.metadata?.stageId === "string",
       resourceGroups: Array.isArray(entry.metadata.resourceGroups) ? entry.metadata.resourceGroups : [],
       queuePolicy: "per-group",
     };

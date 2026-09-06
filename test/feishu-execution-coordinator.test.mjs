@@ -371,6 +371,7 @@ test("phased runs stay serial even when the package allows wider concurrency", a
 
   assert.equal(first.execution.state, "running");
   assert.equal(second.execution.state, "queued");
+  assert.equal(fixture.scheduler.snapshot().pending[0].fixedMaxConcurrent, true);
   assert.deepEqual(fixture.starts.map((entry) => entry.taskId), ["task-1"]);
 
   await fixture.coordinator.wake("Auto-cut-copyA");

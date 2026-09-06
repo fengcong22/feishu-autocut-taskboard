@@ -756,6 +756,39 @@ test("artifact report hashes and posts only the exact supplied ZIP", async (t) =
   });
 });
 
+test("artifact report includes the injected manifest digest for a phased run", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskctl-phased-artifact-report-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const filename = path.join(directory, "accepted.zip");
+  const bytes = Buffer.from("accepted phased Auto-Cut artifact", "utf8");
+  const manifestSha256 = "a".repeat(64);
+  await writeFile(filename, bytes);
+
+  let body;
+  const result = await run(
+    ["artifact", "report", "--file", filename],
+    async (_url, init) => {
+      body = JSON.parse(init.body);
+      return response({ artifact: { id: "artifact-phased" } }, 201);
+    },
+    {
+      env: {
+        CODEX_AUTOCUT_ARTIFACT_REPORT_URL:
+          "http://127.0.0.1:49123/api/local/tasks/task-1/runs/run-1/artifact-report",
+        CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN: "claim-token",
+        CODEX_AUTOCUT_SOURCE_MANIFEST_SHA256: manifestSha256,
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(body, {
+    path: path.resolve(filename),
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+    manifestSha256,
+  });
+});
+
 test("artifact report requires its injected URL and token before fetching", async () => {
   const cases = [
     {
