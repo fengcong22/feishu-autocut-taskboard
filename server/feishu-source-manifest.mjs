@@ -39,8 +39,10 @@ function validateUrl(value) {
   const raw = text(value, "document.url", { max: 2048 });
   let parsed;
   try { parsed = new URL(raw); } catch { throw error("document.url is invalid"); }
+  const canonicalUrl = parsed.toString();
   if (
-    parsed.protocol !== "https:"
+    canonicalUrl !== raw
+    || parsed.protocol !== "https:"
     || !(parsed.hostname === "feishu.cn" || parsed.hostname.endsWith(".feishu.cn"))
     || !/^\/(?:docx|wiki)\/[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(parsed.pathname)
     || parsed.username
@@ -50,7 +52,7 @@ function validateUrl(value) {
   ) {
     throw error("document.url must be an HTTPS Feishu Docx or Wiki URL");
   }
-  return parsed.toString();
+  return canonicalUrl;
 }
 
 function normalizeSource(value, name, { allowBase = true, record = null } = {}) {

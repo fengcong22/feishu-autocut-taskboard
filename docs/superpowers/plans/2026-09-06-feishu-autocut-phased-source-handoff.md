@@ -698,7 +698,7 @@ Expected: module and run-attempt table do not exist.
 
 - [ ] **Step 3: Implement strict canonical manifest normalization**
 
-Reject unknown keys at every level. Accept document hosts ending in .feishu.cn, an HTTPS protocol, no username/password, and a pathname matching either `/docx/{opaque-token}` or `/wiki/{opaque-token}`. Require the opaque token to start with an ASCII letter or digit and contain only ASCII letters, digits, `_`, or `-`. Preserve only origin and pathname; reject query and fragment. Trim anchors only at their edges and keep their remaining code points unchanged. Keep array order stable and never sort source media.
+Reject unknown keys at every level. Accept document hosts ending in .feishu.cn, an HTTPS protocol, no username/password, and a pathname matching either `/docx/{opaque-token}` or `/wiki/{opaque-token}`. Require the opaque token to start with an ASCII letter or digit and contain only ASCII letters, digits, `_`, or `-`. Reject a raw URL if parsing would rewrite it, including empty userinfo, embedded control characters, or dot segments; also reject query and fragment. Trim anchors only at their edges and keep their remaining code points unchanged. Keep array order stable and never sort source media.
 
 Canonicalize with a recursive key-sort function:
 

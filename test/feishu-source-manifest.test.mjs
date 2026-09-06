@@ -83,6 +83,22 @@ test("rejects a non-canonical Feishu Wiki token", () => {
   );
 });
 
+for (const [name, url] of [
+  ["empty userinfo", "https://@guanghe.feishu.cn/wiki/Token"],
+  ["an authority control character", "https://guanghe.feishu.\tcn/wiki/Token"],
+  ["a dot segment", "https://guanghe.feishu.cn/wiki/Extra/../Token"],
+  ["a doubled slash and dot segment", "https://guanghe.feishu.cn/wiki//../Token"],
+]) {
+  test(`rejects a Feishu document URL containing ${name}`, () => {
+    assert.throws(
+      () => createSourceManifest(input({
+        document: { field_id: "fld_document", url },
+      })),
+      /document\.url must be an HTTPS Feishu Docx or Wiki URL/u,
+    );
+  });
+}
+
 test("rejects non-document Feishu URLs with the allowed document types", () => {
   assert.throws(
     () => createSourceManifest(input({
