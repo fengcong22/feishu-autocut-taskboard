@@ -26,6 +26,19 @@ const SKILL_MARKER = "\uFFFC";
 const ARTIFACT_REPORT_ENVIRONMENT_KEYS = new Set([
   "CODEX_AUTOCUT_ARTIFACT_REPORT_URL",
   "CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN",
+  "CODEX_AUTOCUT_SOURCE_MANIFEST_PATH",
+  "CODEX_AUTOCUT_SOURCE_MANIFEST_SHA256",
+  "CODEX_AUTOCUT_EXECUTION_INPUT_PATH",
+  "CODEX_AUTOCUT_JOB_ROOT",
+  "CODEX_AUTOCUT_DRAFTS_ROOT",
+  "CODEX_AUTOCUT_RESULT_PATH",
+  "CODEX_AUTOCUT_PACKAGE_ZIP_PATH",
+  "CODEX_AUTOCUT_TASK_ID",
+  "CODEX_AUTOCUT_RUN_ID",
+  "CODEX_AUTOCUT_SUBJECT_KEY",
+  "CODEX_AUTOCUT_CONFIG_VERSION",
+  "CODEX_AUTOCUT_STAGE_ID",
+  "CODEX_AUTOCUT_EVENT_ID",
 ]);
 const CODEX_IMAGE_TYPES = new Set([
   "image/gif",
@@ -534,13 +547,27 @@ export class AiChatService {
       });
       const run = this.database.createAiChatRun({ threadId });
       let runContext = null;
+      let hasPrivateAutoCutInputs = false;
       try {
         if (onRunCreated) runContext = await onRunCreated(run);
-        if (runContext?.artifactReport && taskClaimedByServer !== true) {
+        hasPrivateAutoCutInputs = Boolean(
+          runContext?.sourceManifest
+          || runContext?.executionInput
+          || runContext?.autoCutBinding
+          || runContext?.autoCutRuntime,
+        );
+        if ((runContext?.artifactReport || hasPrivateAutoCutInputs) && taskClaimedByServer !== true) {
           throw new ApiError(
             409,
             "TRUSTED_AUTOCUT_CONTEXT_REQUIRED",
             "Artifact report capabilities require a server-claimed Auto-Cut turn",
+          );
+        }
+        if (hasPrivateAutoCutInputs && !runContext?.artifactReport) {
+          throw new ApiError(
+            409,
+            "TRUSTED_AUTOCUT_CONTEXT_REQUIRED",
+            "Run-private Auto-Cut inputs require an artifact report capability",
           );
         }
       } catch (error) {
@@ -557,6 +584,7 @@ export class AiChatService {
         this.manageTaskboardSkillPath,
         {
           artifactReportEnabled: Boolean(runContext?.artifactReport),
+          autoCutInputsEnabled: hasPrivateAutoCutInputs,
           includeManageTaskboardSkill: taskClaimedByServer !== true,
           trustedAutoCutSource: taskClaimedByServer === true
             ? resolved.trustedAutoCutSource
@@ -592,11 +620,32 @@ export class AiChatService {
         executable: this.codexExecutable,
         args,
         prompt,
-        env: runContext?.artifactReport
+        env: (runContext?.artifactReport || hasPrivateAutoCutInputs)
           ? {
               ...this.processEnv,
               CODEX_AUTOCUT_ARTIFACT_REPORT_URL: runContext.artifactReport.url,
               CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN: runContext.artifactReport.token,
+              ...(runContext.sourceManifest ? {
+                CODEX_AUTOCUT_SOURCE_MANIFEST_PATH: runContext.sourceManifest.path,
+                CODEX_AUTOCUT_SOURCE_MANIFEST_SHA256: runContext.sourceManifest.sha256,
+              } : {}),
+              ...(runContext.executionInput ? {
+                CODEX_AUTOCUT_EXECUTION_INPUT_PATH: runContext.executionInput.path,
+              } : {}),
+              ...(runContext.autoCutRuntime ? {
+                CODEX_AUTOCUT_JOB_ROOT: runContext.autoCutRuntime.jobRoot,
+                CODEX_AUTOCUT_DRAFTS_ROOT: runContext.autoCutRuntime.draftsRoot,
+                CODEX_AUTOCUT_RESULT_PATH: runContext.autoCutRuntime.resultPath,
+                CODEX_AUTOCUT_PACKAGE_ZIP_PATH: runContext.autoCutRuntime.packageZipPath,
+              } : {}),
+              ...(runContext.autoCutBinding ? {
+                CODEX_AUTOCUT_TASK_ID: runContext.autoCutBinding.taskId,
+                CODEX_AUTOCUT_RUN_ID: runContext.autoCutBinding.runId,
+                CODEX_AUTOCUT_SUBJECT_KEY: runContext.autoCutBinding.subjectKey,
+                CODEX_AUTOCUT_CONFIG_VERSION: String(runContext.autoCutBinding.configVersion),
+                CODEX_AUTOCUT_STAGE_ID: runContext.autoCutBinding.stageId,
+                CODEX_AUTOCUT_EVENT_ID: runContext.autoCutBinding.eventId,
+              } : {}),
             }
           : this.processEnv,
         onRawEvent: (raw) => {

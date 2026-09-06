@@ -585,8 +585,26 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     return row;
   }
   function saveVersion(row, snapshot, version, timestamp) {
-    db.prepare(`INSERT INTO feishu_subject_versions (subject_key, version, snapshot_json, created_at) VALUES (?, ?, ?, ?)`)
-      .run(row.subject_key, version, JSON.stringify(snapshot), timestamp);
+    const lifecycle = LIFECYCLES.has(snapshot?.lifecycle) ? snapshot.lifecycle : "draft";
+    const timestampMs = Date.parse(timestamp);
+    const enabledAt = Number.isSafeInteger(snapshot?.enabledAt)
+      ? snapshot.enabledAt
+      : lifecycle === "enabled" && Number.isFinite(timestampMs) ? timestampMs : null;
+    const closedAt = Number.isSafeInteger(snapshot?.closedAt)
+      ? snapshot.closedAt
+      : lifecycle === "disabled" && Number.isFinite(timestampMs) ? timestampMs : null;
+    if (lifecycle !== "enabled") {
+      db.prepare(`
+        UPDATE feishu_subject_versions
+        SET closed_at = COALESCE(closed_at, ?)
+        WHERE subject_key = ? AND lifecycle = 'enabled' AND closed_at IS NULL
+      `).run(Number.isFinite(timestampMs) ? timestampMs : null, row.subject_key);
+    }
+    db.prepare(`
+      INSERT INTO feishu_subject_versions (
+        subject_key, version, snapshot_json, lifecycle, enabled_at, closed_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(row.subject_key, version, JSON.stringify(snapshot), lifecycle, enabledAt, closedAt, timestamp);
   }
 
   function requiresBridgeDisableBeforeRemoval(subject) {

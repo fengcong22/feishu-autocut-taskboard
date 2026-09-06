@@ -37,11 +37,15 @@ import { createJiraIntegration } from "./jira-integration.mjs";
 import { ProjectSummaryService } from "./project-summary.mjs";
 import { codexInvocation } from "../shared/codex-invocation.mjs";
 import { createFeishuWorkflowStore, subjectProjectId } from "./feishu-workflow-store.mjs";
+import { STAGE_IDS } from "./feishu-workflow-stages.mjs";
 import { createFeishuWorkflowApi } from "./feishu-workflow-api.mjs";
 import { createResourceScheduler } from "./resource-scheduler.mjs";
 import { createFeishuExecutionCoordinator } from "./feishu-execution-coordinator.mjs";
 import { ArtifactServiceError, createArtifactService } from "./artifact-service.mjs";
 import { createArtifactUploadWorker } from "./upload-worker.mjs";
+import { readCurrentControlledContext } from "./feishu-controlled-context-client.mjs";
+import { prepareFeishuRunInputs } from "./feishu-run-inputs.mjs";
+import { canonicalJson } from "./feishu-source-manifest.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const execFileAsync = promisify(execFile);
@@ -1510,6 +1514,16 @@ function parseFeishuTaskMetadata(description) {
         ? { triggerFieldId: metadata.triggerFieldId.trim() } : {}),
       ...(typeof metadata.triggerValue === "string" && metadata.triggerValue.trim()
         ? { triggerValue: metadata.triggerValue.trim() } : {}),
+      ...(typeof metadata.statusFieldId === "string" && metadata.statusFieldId.trim()
+        ? { statusFieldId: metadata.statusFieldId.trim() } : {}),
+      ...(typeof metadata.beforeOptionId === "string" && metadata.beforeOptionId.trim()
+        ? { beforeOptionId: metadata.beforeOptionId.trim() } : {}),
+      ...(typeof metadata.afterOptionId === "string" && metadata.afterOptionId.trim()
+        ? { afterOptionId: metadata.afterOptionId.trim() } : {}),
+      ...(typeof metadata.stageId === "string" && metadata.stageId.trim()
+        ? { stageId: metadata.stageId.trim() } : {}),
+      ...(Number.isSafeInteger(metadata.eventOccurredAt) && metadata.eventOccurredAt >= 0
+        ? { eventOccurredAt: metadata.eventOccurredAt } : {}),
       mode: metadata.mode === "automatic" ? "automatic" : "manual",
       ...(typeof metadata.subjectKey === "string" && metadata.subjectKey.trim()
         ? { subjectKey: metadata.subjectKey.trim() } : {}),
@@ -1530,6 +1544,76 @@ function parseFeishuTaskMetadata(description) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Parse the dedicated Bridge registration envelope.  The envelope contains
+ * only opaque Feishu identity and inert controlled values; executable policy
+ * is always derived from the Taskboard's stored subject snapshot.
+ */
+function parseFeishuStageRegistrationBody(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["event", "binding", "controlledContext"]));
+  assertPlainObject(body.event);
+  assertAllowedKeys(body.event, new Set([
+    "eventId", "baseToken", "tableId", "recordId", "statusFieldId",
+    "beforeOptionId", "afterOptionId", "occurredAt",
+  ]));
+  const event = {
+    eventId: stringField(body.event.eventId, "event.eventId", { required: true, maxLength: 256 }),
+    baseToken: stringField(body.event.baseToken, "event.baseToken", { required: true, maxLength: 256 }),
+    tableId: stringField(body.event.tableId, "event.tableId", { required: true, maxLength: 256 }),
+    recordId: stringField(body.event.recordId, "event.recordId", { required: true, maxLength: 256 }),
+    statusFieldId: stringField(body.event.statusFieldId, "event.statusFieldId", { required: true, maxLength: 256 }),
+    beforeOptionId: stringField(body.event.beforeOptionId, "event.beforeOptionId", { required: true, maxLength: 256 }),
+    afterOptionId: stringField(body.event.afterOptionId, "event.afterOptionId", { required: true, maxLength: 256 }),
+  };
+  if (body.event.occurredAt !== undefined) {
+    if (!Number.isSafeInteger(body.event.occurredAt) || body.event.occurredAt < 0) {
+      throw new ApiError(400, "INVALID_FIELD", "event.occurredAt must be a non-negative timestamp");
+    }
+    event.occurredAt = body.event.occurredAt;
+  }
+
+  assertPlainObject(body.binding);
+  assertAllowedKeys(body.binding, new Set(["subjectKey", "configVersion", "stageId"]));
+  const binding = {
+    subjectKey: stringField(body.binding.subjectKey, "binding.subjectKey", { required: true, maxLength: 513 }),
+    configVersion: body.binding.configVersion,
+    stageId: stringField(body.binding.stageId, "binding.stageId", { required: true, maxLength: 64 }),
+  };
+  if (!Number.isSafeInteger(binding.configVersion) || binding.configVersion < 1) {
+    throw new ApiError(400, "INVALID_FIELD", "binding.configVersion must be a positive integer");
+  }
+  if (!STAGE_IDS.includes(binding.stageId)) {
+    throw new ApiError(400, "INVALID_FIELD", "binding.stageId is invalid");
+  }
+
+  assertPlainObject(body.controlledContext);
+  assertAllowedKeys(body.controlledContext, new Set([
+    "documentLinks", "namingDisplayValue", "namingValueUnique",
+  ]));
+  if (!Array.isArray(body.controlledContext.documentLinks)
+    || body.controlledContext.documentLinks.length > 32
+    || body.controlledContext.documentLinks.some((link) => (
+      typeof link !== "string" || link.length > 2048 || link.includes("\0")
+    ))) {
+    throw new ApiError(400, "INVALID_FIELD", "controlledContext.documentLinks is invalid");
+  }
+  const namingDisplayValue = stringField(
+    body.controlledContext.namingDisplayValue,
+    "controlledContext.namingDisplayValue",
+    { maxLength: 512 },
+  );
+  if (typeof body.controlledContext.namingValueUnique !== "boolean") {
+    throw new ApiError(400, "INVALID_FIELD", "controlledContext.namingValueUnique must be a boolean");
+  }
+  const controlledContext = {
+    documentLinks: body.controlledContext.documentLinks.map((link) => link.trim()),
+    namingDisplayValue: namingDisplayValue ?? "",
+    namingValueUnique: body.controlledContext.namingValueUnique,
+  };
+  return { event, binding, controlledContext };
 }
 
 function parseStartAiBody(body) {
@@ -2388,7 +2472,8 @@ export function createTaskboardServer(options = {}) {
     if (!marker || !origin) return null;
     for (const key of [
       "version", "source", "eventId", "baseToken", "tableId", "recordId",
-      "triggerField", "triggerFieldId", "triggerValue", "mode", "executionMode",
+      "triggerField", "triggerFieldId", "triggerValue", "statusFieldId", "beforeOptionId",
+      "afterOptionId", "stageId", "eventOccurredAt", "mode", "executionMode",
       "subjectKey", "configVersion", "uploadMode", "packageAlias", "packageSource",
       "concurrencyGroup", "maxConcurrent", "resourceGroups",
     ]) {
@@ -2440,6 +2525,206 @@ export function createTaskboardServer(options = {}) {
         "FEISHU_LABEL_REQUIRED",
         "Feishu tasks must include the feishu label",
       );
+    }
+  }
+
+  function packageSnapshotFromRecord(packageRecord, packageAlias) {
+    if (!packageRecord) return null;
+    return {
+      packageAlias: packageRecord.alias ?? packageAlias,
+      packageRevision: packageRecord.revision ?? 1,
+      name: packageRecord.name ?? packageRecord.projectName ?? packageRecord.alias ?? packageAlias,
+      projectId: packageRecord.projectId ?? null,
+      workspacePath: packageRecord.workspacePath,
+      model: packageRecord.model ?? null,
+      reasoningEffort: packageRecord.reasoningEffort ?? null,
+      prompt: packageRecord.prompt,
+      zipSourceDirectory: packageRecord.zipSourceDirectory ?? packageRecord.artifactSourcePath ?? null,
+      maxConcurrent: packageRecord.maxConcurrent,
+    };
+  }
+
+  function feishuTaskDescriptionMarker(metadata) {
+    const encoded = Buffer.from(JSON.stringify(metadata), "utf8").toString("base64url");
+    return `<!-- feishu-codex-task:v1:${encoded} -->`;
+  }
+
+  function sameControlledContext(left, right) {
+    return canonicalJson(left ?? null) === canonicalJson(right ?? null);
+  }
+
+  function sameStageRegistration(existing, expected) {
+    if (!existing) return false;
+    for (const key of [
+      "source", "eventId", "baseToken", "tableId", "recordId", "statusFieldId",
+      "beforeOptionId", "afterOptionId", "stageId", "eventOccurredAt", "subjectKey",
+      "configVersion", "packageAlias", "executionMode", "uploadMode",
+    ]) {
+      if (JSON.stringify(existing[key]) !== JSON.stringify(expected[key])) return false;
+    }
+    return sameControlledContext(existing.controlledContext, expected.controlledContext);
+  }
+
+  async function createCanonicalFeishuStageTask(registration, actor) {
+    const { event, binding, controlledContext } = registration;
+    const separator = binding.subjectKey.indexOf(":");
+    if (
+      separator <= 0
+      || separator === binding.subjectKey.length - 1
+      || binding.subjectKey.indexOf(":", separator + 1) !== -1
+      || binding.subjectKey.slice(0, separator) !== event.baseToken
+      || binding.subjectKey.slice(separator + 1) !== event.tableId
+    ) {
+      throw new ApiError(409, "FEISHU_SUBJECT_IDENTITY_REQUIRED", "Stage registration identity does not match its Base/table");
+    }
+
+    const subjectVersion = database.getFeishuSubjectVersion(binding.subjectKey, binding.configVersion);
+    if (!subjectVersion) {
+      throw new ApiError(409, "STALE_STAGE_EVENT", "The referenced Feishu workflow version does not exist");
+    }
+    const activeVersion = event.occurredAt === undefined
+      ? subjectVersion.lifecycle === "enabled" ? subjectVersion : null
+      : database.resolveFeishuSubjectVersionAt(binding.subjectKey, event.occurredAt);
+    if (!activeVersion || activeVersion.configVersion !== binding.configVersion) {
+      throw new ApiError(409, "STALE_STAGE_EVENT", "The Feishu event did not occur during the configured workflow version");
+    }
+    if (subjectVersion.baseToken !== event.baseToken || subjectVersion.tableId !== event.tableId) {
+      throw new ApiError(409, "FEISHU_SUBJECT_IDENTITY_REQUIRED", "Stage registration subject identity is invalid");
+    }
+    const stage = subjectVersion.stages?.[binding.stageId];
+    if (!stage || stage.enabled !== true) {
+      throw new ApiError(409, "STAGE_DISABLED", "The referenced Auto-Cut stage is disabled");
+    }
+    if (
+      subjectVersion.statusField?.fieldId !== event.statusFieldId
+      || stage.trigger?.fieldId !== event.statusFieldId
+      || stage.trigger?.optionId !== event.afterOptionId
+      || event.beforeOptionId === event.afterOptionId
+    ) {
+      throw new ApiError(409, "FEISHU_STAGE_BINDING_MISMATCH", "The Feishu status edge does not match the configured stage");
+    }
+
+    const packageAlias = subjectVersion.packageRoute?.packageAlias;
+    const packageRecord = typeof feishuPackages.get === "function"
+      ? await feishuPackages.get(packageAlias)
+      : (await feishuPackages.read())[packageAlias] ?? null;
+    if (!packageRecord) {
+      throw new ApiError(409, "UNKNOWN_PACKAGE_ALIAS", "The configured Auto-Cut package is not available");
+    }
+    if (packageRecord.state && packageRecord.state !== "enabled") {
+      throw new ApiError(409, "PACKAGE_DISABLED", "The configured Auto-Cut package is disabled");
+    }
+    const packageSnapshot = packageSnapshotFromRecord(packageRecord, packageAlias);
+    const executionMode = subjectVersion.execution?.mode === "automatic" ? "automatic" : "manual";
+    const uploadMode = subjectVersion.upload?.enqueueMode === "automatic" ? "automatic" : "manual";
+    const triggerField = subjectVersion.statusField?.fieldName ?? event.statusFieldId;
+    const origin = {
+      version: 1,
+      source: "feishu-base",
+      eventId: event.eventId,
+      baseToken: event.baseToken,
+      tableId: event.tableId,
+      recordId: event.recordId,
+      triggerField,
+      triggerFieldId: event.statusFieldId,
+      triggerValue: stage.trigger.value,
+      statusFieldId: event.statusFieldId,
+      beforeOptionId: event.beforeOptionId,
+      afterOptionId: event.afterOptionId,
+      stageId: binding.stageId,
+      ...(event.occurredAt === undefined ? {} : { eventOccurredAt: event.occurredAt }),
+      mode: executionMode,
+      executionMode,
+      subjectKey: binding.subjectKey,
+      configVersion: binding.configVersion,
+      uploadMode,
+      packageAlias,
+      packageSource: "subject-config",
+      concurrencyGroup: `autocut:${packageAlias}`,
+      maxConcurrent: packageRecord.maxConcurrent,
+      resourceGroups: Array.isArray(subjectVersion.execution?.resourceGroups)
+        ? subjectVersion.execution.resourceGroups
+        : [],
+      stageSnapshot: structuredClone(stage),
+      controlledContext: structuredClone(controlledContext),
+    };
+    const identity = {
+      baseToken: event.baseToken,
+      tableId: event.tableId,
+      recordId: event.recordId,
+      statusFieldId: event.statusFieldId,
+      stageId: binding.stageId,
+      eventId: event.eventId,
+    };
+    const existing = database.findFeishuTaskByRegistration(identity);
+    if (existing) {
+      const existingOrigin = database.getFeishuTaskOrigin(existing.id);
+      if (!sameStageRegistration(existingOrigin, origin)) {
+        throw new ApiError(409, "FEISHU_EVENT_BINDING_CONFLICT", "This Feishu event is already bound to a different task or stage");
+      }
+      return { task: existing, created: false };
+    }
+    const eventRows = database.findFeishuTaskByRegistrationEvent(identity);
+    if (eventRows.some((entry) => !sameStageRegistration(database.getFeishuTaskOrigin(entry.task.id), origin))) {
+      throw new ApiError(409, "FEISHU_EVENT_BINDING_CONFLICT", "This Feishu event is already bound to a different stage");
+    }
+    const marker = {
+      version: 1,
+      source: "feishu-base",
+      eventId: event.eventId,
+      baseToken: event.baseToken,
+      tableId: event.tableId,
+      recordId: event.recordId,
+      triggerField,
+      triggerFieldId: event.statusFieldId,
+      triggerValue: stage.trigger.value,
+      statusFieldId: event.statusFieldId,
+      beforeOptionId: event.beforeOptionId,
+      afterOptionId: event.afterOptionId,
+      stageId: binding.stageId,
+      ...(event.occurredAt === undefined ? {} : { eventOccurredAt: event.occurredAt }),
+      mode: executionMode,
+      executionMode,
+      subjectKey: binding.subjectKey,
+      configVersion: binding.configVersion,
+      uploadMode,
+      packageAlias,
+      packageSource: "subject-config",
+      concurrencyGroup: `autocut:${packageAlias}`,
+      maxConcurrent: packageRecord.maxConcurrent,
+      resourceGroups: origin.resourceGroups,
+    };
+    const taskInput = {
+      projectId: subjectProjectId(binding.subjectKey),
+      title: `${subjectVersion.tableName ?? "Auto-Cut"} · ${event.recordId} · ${stage.nameSuffix}`,
+      description: `${feishuTaskDescriptionMarker(marker)}\n\n${subjectVersion.tableName ?? "Auto-Cut"} ${stage.nameSuffix}`,
+      status: "todo",
+      priority: "high",
+      labels: ["feishu"],
+      sortOrder: undefined,
+      threadId: undefined,
+      threadBinding: undefined,
+      developmentContext: null,
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+      actor,
+      assignee: actor,
+      feishuOrigin: origin,
+      packageSnapshot,
+    };
+    try {
+      const task = database.createTask(taskInput);
+      return { task, created: true };
+    } catch (error) {
+      // A concurrent Bridge delivery may have won the unique event index.
+      const winner = database.findFeishuTaskByRegistration(identity);
+      if (winner) {
+        const winnerOrigin = database.getFeishuTaskOrigin(winner.id);
+        if (sameStageRegistration(winnerOrigin, origin)) return { task: winner, created: false };
+        throw new ApiError(409, "FEISHU_EVENT_BINDING_CONFLICT", "This Feishu event is already bound to a different task or stage");
+      }
+      throw error;
     }
   }
   const resourceScheduler = options.resourceScheduler ?? createResourceScheduler();
@@ -2497,6 +2782,15 @@ export function createTaskboardServer(options = {}) {
       displayEnabled: subject.displayEnabled,
       lifecycle,
       configVersion: subject.configVersion,
+      ...(subject.statusField ? { statusField: structuredClone(subject.statusField) } : {}),
+      ...(subject.documentField ? { documentField: structuredClone(subject.documentField) } : {}),
+      ...(subject.namingField ? { namingField: structuredClone(subject.namingField) } : {}),
+      ...(subject.stages ? {
+        stages: Object.fromEntries(Object.entries(subject.stages).map(([stageId, stage]) => [
+          stageId,
+          stage ? { ...structuredClone(stage), artifactTargetPath: null } : stage,
+        ])),
+      } : {}),
       trigger: subject.trigger,
       title: subject.title,
       execution: subject.execution,
@@ -2517,6 +2811,7 @@ export function createTaskboardServer(options = {}) {
         headers: {
           "content-type": "application/json",
           "x-feishu-bridge-client": "taskboard",
+          ...(resolved.feishuBridgeSecret ? { "x-feishu-bridge-secret": resolved.feishuBridgeSecret } : {}),
         },
         body: JSON.stringify({ lifecycle, expectedVersion, subject: safeSubject }),
       });
@@ -4541,7 +4836,33 @@ export function createTaskboardServer(options = {}) {
       if (pathname === "/api/local/feishu/tasks" && request.method === "POST") {
         assertFeishuBridgeRequest(request, resolved.feishuBridgeSecret);
         const actor = actorFromRequest(request);
-        const { assigneeTarget, ...input } = parseTaskCreate(await readJson(request));
+        const rawBody = await readJson(request);
+        if (
+          rawBody
+          && typeof rawBody === "object"
+          && !Array.isArray(rawBody)
+          && Object.hasOwn(rawBody, "event")
+          && Object.hasOwn(rawBody, "binding")
+          && Object.hasOwn(rawBody, "controlledContext")
+        ) {
+          const registration = parseFeishuStageRegistrationBody(rawBody);
+          const result = await createCanonicalFeishuStageTask(registration, actor);
+          const task = result.task;
+          events.emit(result.created ? "task.created" : "task.updated", { task });
+          if (result.created && allowAutomaticExecution && !closing) {
+            const metadata = trustedFeishuTaskOrigin(task, { requirePackage: true });
+            if (metadata && executionModeForMetadata(metadata) === "automatic") {
+              void startTrackedTask(task.id, () => executionCoordinator.schedule(
+                task, metadata, "automatic", { actor: CODEX_AGENT_ACTOR },
+              )).catch((error) => {
+                if (["SERVER_SHUTTING_DOWN", "REQUEST_CANCELLED"].includes(error?.code)) return;
+                console.error(`Automatic execution failed for task '${task.id}': ${error.code ?? "EXECUTION_FAILED"}`);
+              });
+            }
+          }
+          return sendJson(response, result.created ? 201 : 200, { task });
+        }
+        const { assigneeTarget, ...input } = parseTaskCreate(rawBody);
         const metadata = parseFeishuTaskMetadata(input.description);
         if (!metadata || !metadata.baseToken || !metadata.tableId || !metadata.recordId || !metadata.eventId) {
           throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task description does not contain valid workflow metadata");
