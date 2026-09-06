@@ -230,13 +230,18 @@ process.stdin.on("end", () => {
     keys.filter((key) => process.env[key] !== undefined).map((key) => [key, process.env[key]]),
   )));
   setTimeout(() => {
-    process.stdout.write('{"type":"thread.started","thread_id":"fixture-session"}\n');
-    process.stdout.write('{"type":"turn.completed"}\n');
+    process.stdout.write('{"type":"thread.started","thread_id":"fixture-session"}\\n');
+    process.stdout.write('{"type":"turn.completed"}\\n');
   }, TURN_DELAY_MS);
 });
 ```
 
 In the template literal, replace `PROMPT_CAPTURE_PATH`, `ENV_CAPTURE_PATH`, and `TURN_DELAY_MS` with `${JSON.stringify(promptCapturePath)}`, `${JSON.stringify(capturePath)}`, and `${JSON.stringify(turnDelayMs)}` interpolation expressions respectively.
+
+Read `promptCapturePath` only after the existing
+`await waitForTaskStatus(fixture.app, blocked.id, "blocked")` completes. The
+fake executable writes the prompt before its terminal event, so this ordering
+proves the file exists without racing `onRunCreated`.
 
 In the existing explicit phased retry test, send:
 
@@ -247,7 +252,11 @@ runConsent: {
 },
 ```
 
-After attempt 2 exists, assert the captured subprocess prompt contains the fixed host/purpose/output variables, while the persisted AI user event remains exactly `trusted package prompt`.
+After attempt 2 exists and the task has returned to `blocked`, assert the
+captured subprocess prompt contains the fixed host/purpose/output variables.
+Find the persisted `user_message` with
+`fixture.app.database.listAiChatEvents(freshTask.threadId)` and assert its
+`content` remains exactly `trusted package prompt`.
 
 Add table-driven invalid requests before the valid retry:
 
