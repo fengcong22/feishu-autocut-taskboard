@@ -125,10 +125,10 @@ export async function prepareFeishuRunInputs({
   const recordId = text(origin.recordId, "origin.recordId");
   const links = controlledContext?.documentLinks;
   if (!Array.isArray(links) || links.length === 0) {
-    throw fail("document_link_missing", "Exactly one Feishu Docx document link is required");
+    throw fail("document_link_missing", "Exactly one Feishu Docx or Wiki document link is required");
   }
   if (links.length !== 1) {
-    throw fail("document_link_ambiguous", "Exactly one Feishu Docx document link is required");
+    throw fail("document_link_ambiguous", "Exactly one Feishu Docx or Wiki document link is required");
   }
   if (typeof controlledContext?.namingDisplayValue !== "string"
     || controlledContext.namingDisplayValue.trim() === "") {

@@ -42,13 +42,13 @@ function validateUrl(value) {
   if (
     parsed.protocol !== "https:"
     || !(parsed.hostname === "feishu.cn" || parsed.hostname.endsWith(".feishu.cn"))
-    || !/^\/docx\/[^/]+$/u.test(parsed.pathname)
+    || !/^\/(?:docx|wiki)\/[^/]+$/u.test(parsed.pathname)
     || parsed.username
     || parsed.password
     || parsed.search
     || parsed.hash
   ) {
-    throw error("document.url must be an HTTPS Feishu Docx URL");
+    throw error("document.url must be an HTTPS Feishu Docx or Wiki URL");
   }
   return parsed.toString();
 }

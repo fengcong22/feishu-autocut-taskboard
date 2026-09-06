@@ -47,6 +47,29 @@ test("creates a stable manifest and digest independent of object insertion order
   assert.equal(first.manifest.binding.stage_id, "initial");
 });
 
+test("accepts an official HTTPS Feishu Wiki document URL", () => {
+  const created = createSourceManifest(input({
+    document: {
+      field_id: "fld_document",
+      url: "https://guanghe.feishu.cn/wiki/WikOpaqueToken",
+    },
+  }));
+
+  assert.equal(created.manifest.document.url, "https://guanghe.feishu.cn/wiki/WikOpaqueToken");
+});
+
+test("rejects non-document Feishu URLs with the allowed document types", () => {
+  assert.throws(
+    () => createSourceManifest(input({
+      document: {
+        field_id: "fld_document",
+        url: "https://guanghe.feishu.cn/base/UnsupportedBaseToken",
+      },
+    })),
+    /document\.url must be an HTTPS Feishu Docx or Wiki URL/u,
+  );
+});
+
 test("base attachment sources inherit the canonical record identity used by Auto-Cut", () => {
   const created = createSourceManifest(input({
     binding: {

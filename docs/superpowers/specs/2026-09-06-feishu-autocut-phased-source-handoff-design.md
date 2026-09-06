@@ -14,8 +14,8 @@
 - 每个学科固定一个状态单选字段，并用三个固定阶段区分 `初稿`、`初审修改`、`终审修改`。
 - 三个阶段结构一致、开关和输入规则独立，至少启用一个阶段；同一状态字段上的三个目标选项不能重复。
 - 阶段触发只认“从其他值进入该阶段目标值”。阶段关闭期间不补执行；记录必须先离开目标值，再重新进入才会再次触发。
-- 每条记录的“集合文档”字段只含一个 Docx 链接；三个阶段共用该文档，但各自使用自己的素材和意见位置。
-- 视频、音频可以来自 Docx 指定目录文字，也可以来自 Base 原生附件字段。Docx 内多个媒体按文档从上到下的出现顺序一一对应；数量或时长明显不合理时暂停，不猜测、不按文件名或时长重新排序。
+- 每条记录的“集合文档”字段只含一个飞书文档链接，可以是直接 Docx URL 或 Wiki 文档 URL；三个阶段共用该文档，但各自使用自己的素材和意见位置。
+- 视频、音频可以来自该飞书文档的指定目录文字，也可以来自 Base 原生附件字段。文档内多个媒体按从上到下的出现顺序一一对应；数量或时长明显不合理时暂停，不猜测、不按文件名或时长重新排序。
 - 外部音频替换视频原音时，音频来源必填，默认时长容差为 3 秒且每阶段可调；使用视频原音时不配置音频来源。
 - 三个阶段都从自己的完整输入重新开始，不继承前一阶段的 ZIP。
 - 学科共用执行模式、Auto-Cut 包和上传入队策略；Auto-Cut 包剪辑并发保持 `maxConcurrent=1`，上传队列继续使用独立并发配置。
@@ -126,7 +126,7 @@ Taskboard 根据受信任任务和冻结配置生成一份清单，清单只描�
 ```text
 subject
 ├─ statusField                 共同的状态单选字段及字段/选项快照
-├─ documentField              共同的集合文档字段，只允许一个 Docx 链接
+├─ documentField              共同的集合文档字段，只允许一个 Docx 或 Wiki 文档链接
 ├─ namingField                共同的命名字段
 ├─ stages
 │  ├─ initial                 初稿
@@ -142,7 +142,7 @@ subject
 - `enabled`：独立启用开关；至少一个阶段开启。
 - `trigger`：从共同状态字段实际选项中选取的 option ID 和显示值；三个启用阶段不得选同一 option。
 - `videoSource`：`docx_section(anchorText)` 或 `base_attachment(fieldId)`。
-- `reviewSource`：首版为共同 Docx 中的 `docx_section(anchorText)`；空意见不执行。
+- `reviewSource`：首版为共同飞书文档中的 `docx_section(anchorText)`；空意见不执行。
 - `audio`：`video_original` 或 `replace_original`。替换模式必须有 `docx_section` 或唯一 `base_attachment` 来源及 `durationToleranceSeconds`，默认 3 秒。
 - `artifactTargetPath`：本地白名单/配置中的绝对目录；不来自飞书单元格。
 - `nameSuffix`：该阶段追加到命名字段结果后的后缀。
@@ -219,7 +219,7 @@ Taskboard 为 `(baseToken, tableId, recordId, triggerFieldId, stageId, eventId)`
 
 契约约束：
 
-- `document.url` 只允许经过校验的官方 HTTPS Docx URL；一个字段出现零个或多个链接都阻塞。
+- `document.url` 只允许经过校验的官方 HTTPS 飞书 Docx URL 或 Wiki 文档 URL；一个字段出现零个或多个链接都阻塞。
 - `docx_section.anchor_text` 去除首尾空格后完全匹配，不做模糊、同义词或大小写猜测。
 - Base 来源只传 opaque 标识；附件字段预期唯一，多个附件阻塞，不选第一个。
 - 清单不允许 shell、可执行路径、prompt、凭据或由单元格拼出的目录。
@@ -290,7 +290,7 @@ Taskboard 在登记前验证：
 
 ## 12. 阻塞、重试和恢复
 
-下列问题统一进入阶段级阻塞：状态/配置版本无效、Docx 链接不唯一、锚点不存在、范围无附件、Base 附件不唯一、下载失败、媒体数量不一致、时长异常、意见为空、命名为空/不唯一、manifest/hash/binding 校验失败或 Auto-Cut 验收失败。
+下列问题统一进入阶段级阻塞：状态/配置版本无效、文档链接不唯一、锚点不存在、范围无附件、Base 附件不唯一、下载失败、媒体数量不一致、时长异常、意见为空、命名为空/不唯一、manifest/hash/binding 校验失败或 Auto-Cut 验收失败。
 
 阻塞任务展示：学科、记录、阶段、运行 ID、失败阶段、稳定错误码和可读原因。系统不自动猜测、不从其他阶段借用素材、不自动循环重试、不上传不完整 ZIP。
 

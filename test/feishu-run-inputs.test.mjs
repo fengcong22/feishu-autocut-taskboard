@@ -76,7 +76,26 @@ test("blocks missing or ambiguous controlled values before writing inputs", asyn
   try {
     await assert.rejects(
       prepareFeishuRunInputs(input(fixtureData, { controlledContext: { documentLinks: [], namingDisplayValue: "课程001", namingValueUnique: true } })),
-      (error) => error.code === "document_link_missing",
+      (error) => (
+        error.code === "document_link_missing"
+        && error.message === "Exactly one Feishu Docx or Wiki document link is required"
+      ),
+    );
+    await assert.rejects(
+      prepareFeishuRunInputs(input(fixtureData, {
+        controlledContext: {
+          documentLinks: [
+            "https://guanghe.feishu.cn/docx/opaque",
+            "https://guanghe.feishu.cn/wiki/opaque",
+          ],
+          namingDisplayValue: "课程001",
+          namingValueUnique: true,
+        },
+      })),
+      (error) => (
+        error.code === "document_link_ambiguous"
+        && error.message === "Exactly one Feishu Docx or Wiki document link is required"
+      ),
     );
     await assert.rejects(
       prepareFeishuRunInputs(input(fixtureData, { controlledContext: { documentLinks: ["https://guanghe.feishu.cn/docx/opaque"], namingDisplayValue: "", namingValueUnique: true } })),
