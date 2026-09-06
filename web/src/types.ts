@@ -449,6 +449,53 @@ export interface FeishuFieldMetadata {
   options: FeishuFieldOption[];
 }
 
+export type FeishuStageId = "initial" | "first_review" | "final_review";
+export type FeishuStageSourceKind = "docx_section" | "base_attachment";
+export type FeishuStageAudioMode = "video_original" | "replace_original";
+
+export interface FeishuStageSource {
+  kind: FeishuStageSourceKind;
+  anchorText?: string;
+  fieldId?: string;
+}
+
+export interface FeishuStageConfig {
+  enabled: boolean;
+  trigger: {
+    fieldId: string | null;
+    fieldName?: string | null;
+    optionId: string | null;
+    value: string;
+  };
+  videoSource: FeishuStageSource;
+  reviewSource: FeishuStageSource;
+  audio: {
+    mode: FeishuStageAudioMode;
+    source?: FeishuStageSource | null;
+    durationToleranceSeconds?: number;
+  };
+  artifactTargetPath?: string | null;
+  nameSuffix: string;
+}
+
+export type FeishuStageConfigMap = Record<FeishuStageId, FeishuStageConfig>;
+
+export interface FeishuAutoCutRun {
+  runId: string;
+  taskId: string;
+  attempt: number;
+  subjectKey: string;
+  configVersion: number;
+  stageId: FeishuStageId;
+  eventId: string;
+  manifestSha256: string | null;
+  state: "preparing" | "prepared" | "running" | "blocked" | "reported" | "completed";
+  errorCode: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface FeishuSubjectConfig {
   subjectKey: string;
   baseToken: string;
@@ -459,6 +506,10 @@ export interface FeishuSubjectConfig {
   displayEnabled: boolean;
   lifecycle: "draft" | "enabled" | "disabled";
   configVersion: number;
+  statusField?: { fieldId: string; fieldName: string; type?: string; options?: FeishuFieldOption[] };
+  documentField?: { fieldId: string; fieldName: string; kind?: string };
+  namingField?: { fieldId: string; fieldName: string; kind?: string };
+  stages?: FeishuStageConfigMap;
   trigger?: { fieldId: string; fieldName: string; startValue: string; optionId: string | null };
   title?: { fieldId: string | null; fieldName: string | null };
   execution?: { mode: "manual" | "automatic"; concurrencyGroup: string; maxConcurrent: number; resourceGroups: string[] };
@@ -756,6 +807,9 @@ export interface FeishuTaskOrigin {
   triggerValue?: string;
   subjectKey?: string;
   configVersion?: number;
+  stageId?: FeishuStageId;
+  stageLabel?: string;
+  eventOccurredAt?: number | null;
   mode?: "manual" | "automatic";
   executionMode?: "manual" | "automatic";
   uploadMode?: "manual" | "automatic";
