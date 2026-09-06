@@ -76,6 +76,18 @@ async function seedSubject(baseUrl, baseToken = "bas_share") {
   return subjectKey;
 }
 
+function phasedStage(id, optionId, value) {
+  return {
+    enabled: true,
+    trigger: { fieldId: "fld_status", fieldName: "流程", optionId, value },
+    videoSource: { kind: "docx_section", anchorText: "录屏" },
+    reviewSource: { kind: "docx_section", anchorText: "修改意见" },
+    audio: { mode: "video_original" },
+    artifactTargetPath: `C:\\approved\\${id}`,
+    nameSuffix: `_${value}`,
+  };
+}
+
 test("workflow share export is schema-versioned and redacts machine-local paths", async () => {
   const fixtureData = await fixture();
   try {
@@ -118,6 +130,58 @@ test("workflow share import dry-run returns diagnostics without mutating the cat
     const after = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/catalog");
     assert.deepEqual(after.body.catalog, before.body.catalog);
     assert.equal(subjectKey, "bas_share:tbl_chinese");
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("automatic phased share configuration imports as a draft without local stage targets", async () => {
+  const fixtureData = await fixture();
+  try {
+    const subjectKey = await seedSubject(fixtureData.baseUrl, "bas_phased_share");
+    const configured = await request(
+      fixtureData.baseUrl,
+      `/api/local/feishu/workflow/subjects/${encodeURIComponent(subjectKey)}`,
+      {
+        method: "PATCH",
+        body: {
+          statusField: { fieldId: "fld_status", fieldName: "流程" },
+          documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+          namingField: { fieldId: "fld_name", fieldName: "命名" },
+          stages: {
+            initial: phasedStage("initial", "opt_initial", "初稿"),
+            first_review: phasedStage("first_review", "opt_review", "初审修改"),
+            final_review: phasedStage("final_review", "opt_final", "终审修改"),
+          },
+          execution: { mode: "manual", concurrencyGroup: "autocut", maxConcurrent: 1, resourceGroups: [] },
+          upload: {
+            enqueueMode: "automatic",
+            artifactSourceMode: "driver_report",
+            artifactSourcePath: "C:\\artifacts",
+            targetId: null,
+            targetPath: "C:\\upload",
+            uploadConcurrency: 1,
+          },
+        },
+      },
+    );
+    assert.equal(configured.response.status, 200, JSON.stringify(configured.body));
+
+    const exported = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/export");
+    const sharedSubject = exported.body.configuration.bases[0].subjects[0];
+    assert.equal(sharedSubject.upload.enqueueMode, "automatic");
+    assert.deepEqual(
+      Object.values(sharedSubject.stages).map((stage) => stage.artifactTargetPath),
+      [null, null, null],
+    );
+
+    const imported = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/import", {
+      method: "POST",
+      body: { configuration: exported.body.configuration, dryRun: true },
+    });
+    assert.equal(imported.response.status, 200, JSON.stringify(imported.body));
+    assert.equal(imported.body.configuration.bases[0].subjects[0].lifecycle, "draft");
   } finally {
     await fixtureData.app.close();
     await rm(fixtureData.directory, { recursive: true, force: true });

@@ -104,6 +104,7 @@ test("requires an audio source only when replacing the video's original audio", 
 
 test("requires a ZIP destination for every enabled stage in automatic upload mode", () => {
   const value = subject();
+  value.lifecycle = "enabled";
   value.upload.enqueueMode = "automatic";
   value.stages.initial.artifactTargetPath = null;
   value.stages.final_review = {
