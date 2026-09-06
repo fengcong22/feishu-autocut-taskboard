@@ -542,9 +542,6 @@ export class AiChatService {
       imagePaths,
     } = await this.#writeTurnAttachments(attachments);
     try {
-      const args = buildCodexArgs(thread, resolved.addDirectories, imagePaths, {
-        skipGitRepoCheck: resolved.skipGitRepoCheck === true,
-      });
       const run = this.database.createAiChatRun({ threadId });
       let runContext = null;
       let hasPrivateAutoCutInputs = false;
@@ -605,6 +602,18 @@ export class AiChatService {
         }
         throw error;
       }
+      const autoCutWritableDirectories = runContext?.autoCutRuntime
+        ? [
+            runContext.autoCutRuntime.jobRoot,
+            path.dirname(runContext.autoCutRuntime.packageZipPath),
+          ]
+        : [];
+      const args = buildCodexArgs(
+        thread,
+        [...new Set([...resolved.addDirectories, ...autoCutWritableDirectories])],
+        imagePaths,
+        { skipGitRepoCheck: resolved.skipGitRepoCheck === true },
+      );
       const prompt = buildCodexPrompt(
         thread,
         {
