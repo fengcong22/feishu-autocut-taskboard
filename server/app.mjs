@@ -3647,6 +3647,34 @@ export function createTaskboardServer(options = {}) {
     };
   }
 
+  function isPhasedAutoCutOrigin(origin) {
+    return Boolean(
+      origin
+      && STAGE_IDS.includes(origin.stageId)
+      && origin.packageSource === "subject-config"
+      && origin.stageSnapshot
+      && typeof origin.stageSnapshot === "object"
+      && origin.controlledContext
+      && typeof origin.controlledContext === "object"
+    );
+  }
+
+  function blockedPreparationError(error) {
+    const normalized = error instanceof ApiError
+      ? error
+      : new ApiError(
+          Number.isInteger(error?.status) ? error.status : 409,
+          typeof error?.code === "string" && error.code.trim()
+            ? error.code.trim()
+            : "AUTOCUT_RUN_PREPARATION_FAILED",
+          typeof error?.message === "string" && error.message.trim()
+            ? error.message.trim()
+            : "Auto-Cut run preparation failed",
+        );
+    normalized.feishuAutoCutPreparationBlocked = true;
+    return normalized;
+  }
+
   function normalizePackageModelError(error, packageConfig) {
     if (error?.code !== "INVALID_MODEL" && error?.code !== "INVALID_REASONING_EFFORT") {
       return error;
@@ -3720,38 +3748,135 @@ export function createTaskboardServer(options = {}) {
         message: packageConfig.prompt,
       }, {
         taskClaimedByServer: true,
-        onRunCreated: (createdRun) => {
+        onRunCreated: async (createdRun) => {
           database.bindTaskAiStartRun(
             claimedTask.id,
             claimedTask.claimToken,
             thread.id,
             createdRun.id,
           );
-          if (!driverArtifactSourceForMetadata(metadata)) return null;
-          return {
-            artifactReport: {
-              url: localArtifactReportUrl(claimedTask.id, createdRun.id),
-              token: claimedTask.claimToken,
-            },
-          };
+          const task = database.getTask(claimedTask.id);
+          const origin = trustedFeishuTaskOrigin(task, { requirePackage: true });
+          if (!isPhasedAutoCutOrigin(origin)) {
+            if (!driverArtifactSourceForMetadata(metadata)) return null;
+            return {
+              artifactReport: {
+                url: localArtifactReportUrl(claimedTask.id, createdRun.id),
+                token: claimedTask.claimToken,
+              },
+            };
+          }
+          const attempt = database.createFeishuAutoCutRun({
+            runId: createdRun.id,
+            taskId: task.id,
+            subjectKey: origin.subjectKey,
+            configVersion: origin.configVersion,
+            stageId: origin.stageId,
+            eventId: origin.eventId,
+            resultPath: path.join(
+              resolved.dataDirectory,
+              "autocut-runs",
+              task.id,
+              createdRun.id,
+              "result.json",
+            ),
+          });
+          try {
+            if (!driverArtifactSourceForMetadata(origin)) {
+              throw new ApiError(
+                409,
+                "AUTOCUT_DRIVER_REPORT_REQUIRED",
+                "Phased Auto-Cut runs require the driver report artifact source",
+              );
+            }
+            const subjectVersion = database.getFeishuSubjectVersion(
+              origin.subjectKey,
+              origin.configVersion,
+            );
+            if (!subjectVersion) {
+              throw new ApiError(409, "AUTOCUT_SUBJECT_SNAPSHOT_MISSING", "The task's subject snapshot is unavailable");
+            }
+            const packageSnapshot = database.getFeishuTaskPackageSnapshot(task.id);
+            if (!packageSnapshot) {
+              throw new ApiError(409, "AUTOCUT_PACKAGE_SNAPSHOT_MISSING", "The task's package snapshot is unavailable");
+            }
+            const controlledContext = await readCurrentControlledContext({
+              bridgeUrl: resolved.feishuBridgeUrl,
+              bridgeSecret: resolved.feishuBridgeSecret,
+              origin,
+            });
+            const prepared = await prepareFeishuRunInputs({
+              dataDirectory: resolved.dataDirectory,
+              task,
+              run: attempt,
+              origin,
+              subjectVersion,
+              packageSnapshot,
+              controlledContext,
+            });
+            database.markFeishuAutoCutRunPrepared(createdRun.id, prepared);
+            return {
+              artifactReport: {
+                url: localArtifactReportUrl(task.id, createdRun.id),
+                token: claimedTask.claimToken,
+              },
+              sourceManifest: {
+                path: prepared.manifestPath,
+                sha256: prepared.manifestSha256,
+              },
+              executionInput: { path: prepared.executionInputPath },
+              autoCutBinding: {
+                taskId: task.id,
+                runId: createdRun.id,
+                subjectKey: origin.subjectKey,
+                configVersion: origin.configVersion,
+                stageId: origin.stageId,
+                eventId: origin.eventId,
+              },
+              autoCutRuntime: {
+                jobRoot: prepared.jobRoot,
+                draftsRoot: prepared.draftsRoot,
+                resultPath: prepared.resultPath,
+                packageZipPath: prepared.packageZipPath,
+              },
+            };
+          } catch (error) {
+            const failure = blockedPreparationError(error);
+            database.markFeishuAutoCutRunBlocked(createdRun.id, failure);
+            const blockedTask = database.settleTaskAiStart(
+              task.id,
+              claimedTask.claimToken,
+              createdRun.id,
+              "blocked",
+              actor,
+            );
+            events.emit("task.updated", { task: blockedTask });
+            throw failure;
+          }
         },
       });
+      const preparedAttempt = database.getFeishuAutoCutRun(run.id);
+      if (preparedAttempt?.state === "prepared") {
+        database.updateFeishuAutoCutRun(run.id, { state: "running" });
+      }
     } catch (error) {
       unsubscribeRun?.();
       unsubscribeRun = null;
       resourceScheduler.release(lease);
-      try {
-        const rollback = database.getTask(claimedTask.id)
-          ? database.releaseTaskFromAiStart(
-            claimedTask.id,
-            claimedTask.claimToken,
-            actor,
-          )
-          : null;
-        if (!rollback) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${claimedTask.id}' does not exist`);
-        events.emit("task.updated", { task: rollback });
-      } catch {}
-      try { aiChat.deleteThread(thread.id); } catch {}
+      if (error?.feishuAutoCutPreparationBlocked !== true) {
+        try {
+          const rollback = database.getTask(claimedTask.id)
+            ? database.releaseTaskFromAiStart(
+              claimedTask.id,
+              claimedTask.claimToken,
+              actor,
+            )
+            : null;
+          if (!rollback) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${claimedTask.id}' does not exist`);
+          events.emit("task.updated", { task: rollback });
+        } catch {}
+        try { aiChat.deleteThread(thread.id); } catch {}
+      }
       throw normalizePackageModelError(error, packageConfig);
     }
     return {
@@ -3844,14 +3969,16 @@ export function createTaskboardServer(options = {}) {
       );
     } catch (error) {
       if (lease) resourceScheduler.release(lease);
-      try {
-        const rollback = database.releaseTaskFromAiStart(
-          claimedTask.id,
-          claimedTask.claimToken,
-          actor,
-        );
-        events.emit("task.updated", { task: rollback });
-      } catch {}
+      if (error?.feishuAutoCutPreparationBlocked !== true) {
+        try {
+          const rollback = database.releaseTaskFromAiStart(
+            claimedTask.id,
+            claimedTask.claimToken,
+            actor,
+          );
+          events.emit("task.updated", { task: rollback });
+        } catch {}
+      }
       throw error;
     }
   }

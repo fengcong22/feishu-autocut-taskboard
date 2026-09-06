@@ -53,7 +53,7 @@ function validateUrl(value) {
   return parsed.toString();
 }
 
-function normalizeSource(value, name, { allowBase = true } = {}) {
+function normalizeSource(value, name, { allowBase = true, record = null } = {}) {
   const source = object(value, name);
   assertAllowed(source, new Set(["kind", "anchor_text", "field_id", "base_token", "table_id", "record_id"]), name);
   const kind = text(source.kind, `${name}.kind`, { max: 64 });
@@ -61,11 +61,14 @@ function normalizeSource(value, name, { allowBase = true } = {}) {
     return { kind, anchor_text: text(source.anchor_text, `${name}.anchor_text`, { max: 512 }) };
   }
   if (kind === "base_attachment" && allowBase) {
-    const normalized = { kind, field_id: id(source.field_id, `${name}.field_id`) };
-    for (const [key, label] of [["base_token", "base_token"], ["table_id", "table_id"], ["record_id", "record_id"]]) {
-      if (source[key] !== undefined) normalized[key] = id(source[key], `${name}.${label}`);
-    }
-    return normalized;
+    const identity = record ?? {};
+    return {
+      kind,
+      base_token: id(source.base_token ?? identity.base_token, `${name}.base_token`),
+      table_id: id(source.table_id ?? identity.table_id, `${name}.table_id`),
+      record_id: id(source.record_id ?? identity.record_id, `${name}.record_id`),
+      field_id: id(source.field_id, `${name}.field_id`),
+    };
   }
   throw error(`${name}.kind is invalid`);
 }
@@ -146,26 +149,27 @@ export function normalizeSourceManifest(value) {
   assertAllowed(document, new Set(["field_id", "url"]), "document");
   const sources = object(input.sources, "sources");
   assertAllowed(sources, new Set(["video", "review", "audio"]), "sources");
+  const record = input.record === undefined
+    ? null
+    : (() => {
+        const value = object(input.record, "record");
+        assertAllowed(value, new Set(["base_token", "table_id", "record_id"]), "record");
+        return {
+          base_token: id(value.base_token, "record.base_token"),
+          table_id: id(value.table_id, "record.table_id"),
+          record_id: id(value.record_id, "record.record_id"),
+        };
+      })();
   const normalized = {
     schema_version: SOURCE_MANIFEST_SCHEMA_VERSION,
     binding: normalizeBinding(input.binding),
-    ...(input.record === undefined ? {} : {
-      record: (() => {
-        const record = object(input.record, "record");
-        assertAllowed(record, new Set(["base_token", "table_id", "record_id"]), "record");
-        return {
-          base_token: id(record.base_token, "record.base_token"),
-          table_id: id(record.table_id, "record.table_id"),
-          record_id: id(record.record_id, "record.record_id"),
-        };
-      })(),
-    }),
+    ...(record === null ? {} : { record }),
     document: {
       field_id: id(document.field_id, "document.field_id"),
       url: validateUrl(document.url),
     },
     sources: {
-      video: normalizeSource(sources.video, "sources.video"),
+      video: normalizeSource(sources.video, "sources.video", { record }),
       review: normalizeSource(sources.review, "sources.review", { allowBase: false }),
       audio: null,
     },
@@ -183,7 +187,7 @@ export function normalizeSourceManifest(value) {
     normalized.sources.audio = {
       mode,
       duration_tolerance_seconds: tolerance,
-      source: normalizeSource(audio.source, "sources.audio.source"),
+      source: normalizeSource(audio.source, "sources.audio.source", { record }),
     };
   } else {
     throw error("sources.audio.mode is invalid");

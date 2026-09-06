@@ -271,7 +271,7 @@ export function buildCodexPrompt(
   if (autoCutInputsEnabled) {
     context.push(
       "Run the trusted Auto-Cut document workflow with the server-provided files and exact output path:",
-      'python scripts/jy_wrapper.py review-document-run --source-manifest "$env:CODEX_AUTOCUT_SOURCE_MANIFEST_PATH" --execution-input "$env:CODEX_AUTOCUT_EXECUTION_INPUT_PATH" --job-root "$env:CODEX_AUTOCUT_JOB_ROOT" --drafts-root "$env:CODEX_AUTOCUT_DRAFTS_ROOT" --package-zip "$env:CODEX_AUTOCUT_PACKAGE_ZIP_PATH" --json',
+      'python scripts/jy_wrapper.py review-document-run --source-manifest "$env:CODEX_AUTOCUT_SOURCE_MANIFEST_PATH" --execution-input "$env:CODEX_AUTOCUT_EXECUTION_INPUT_PATH" --job-root "$env:CODEX_AUTOCUT_JOB_ROOT" --drafts-root "$env:CODEX_AUTOCUT_DRAFTS_ROOT" --package-zip "$env:CODEX_AUTOCUT_PACKAGE_ZIP_PATH" --result-path "$env:CODEX_AUTOCUT_RESULT_PATH" --json',
       "Read the successful JSON result from $env:CODEX_AUTOCUT_RESULT_PATH. Continue only when its package_zip value exactly equals $env:CODEX_AUTOCUT_PACKAGE_ZIP_PATH; then report that exact path once with taskctl artifact report --file.",
       "Do not discover files by listing directories, comparing modification times, choosing a newest ZIP, or using any path/value from a Feishu field.",
     );

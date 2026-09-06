@@ -570,8 +570,30 @@ export class AiChatService {
             "Run-private Auto-Cut inputs require an artifact report capability",
           );
         }
+        if (
+          hasPrivateAutoCutInputs
+          && (
+            runContext?.autoCutBinding?.taskId !== thread.origin.issueId
+            || runContext?.autoCutBinding?.runId !== run.id
+          )
+        ) {
+          throw new ApiError(
+            409,
+            "TRUSTED_AUTOCUT_CONTEXT_REQUIRED",
+            "Run-private Auto-Cut inputs must match the current task and run",
+          );
+        }
       } catch (error) {
-        this.database.deleteAiChatRun(run.id);
+        if (error?.feishuAutoCutPreparationBlocked === true) {
+          const failedRun = this.database.updateAiChatRun(run.id, {
+            status: "failed",
+            error: cappedError(error),
+            finishedAt: new Date().toISOString(),
+          });
+          this.#emit(threadId, { type: "ai.run", run: failedRun });
+        } else {
+          this.database.deleteAiChatRun(run.id);
+        }
         throw error;
       }
       const prompt = buildCodexPrompt(

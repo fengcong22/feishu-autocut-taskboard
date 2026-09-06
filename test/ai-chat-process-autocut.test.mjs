@@ -37,6 +37,7 @@ test("trusted Auto-Cut prompt gives the exact run-input and report protocol with
   assert.match(prompt, /CODEX_AUTOCUT_EXECUTION_INPUT_PATH/);
   assert.match(prompt, /CODEX_AUTOCUT_PACKAGE_ZIP_PATH/);
   assert.match(prompt, /CODEX_AUTOCUT_RESULT_PATH/);
+  assert.match(prompt, /--result-path "\$env:CODEX_AUTOCUT_RESULT_PATH"/);
   assert.match(prompt, /taskctl artifact report --file/);
   assert.doesNotMatch(prompt, /guanghe\.feishu\.cn|课程001|录屏|claim-token|C:\\nas/iu);
   assert.doesNotMatch(prompt, /manage-taskboard|issue_identifier/iu);

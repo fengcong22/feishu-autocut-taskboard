@@ -109,6 +109,11 @@ export function createFeishuExecutionCoordinator({
       return result ?? executionResult(entry.task.id);
     } catch (error) {
       scheduler.release(lease);
+      if (error?.feishuAutoCutPreparationBlocked === true) {
+        try { database.clearFeishuExecution(entry.task.id); } catch {}
+        entries.delete(entry.task.id);
+        throw error;
+      }
       try {
         updateExecution(entry.task.id, "delayed", { lastError: error?.code ?? "EXECUTION_FAILED" });
         const current = database.getTask(entry.task.id);
@@ -167,9 +172,11 @@ export function createFeishuExecutionCoordinator({
     const request = {
       requestId: entry.task.id,
       concurrencyGroup: `autocut:${alias}`,
-      maxConcurrent: Number.isSafeInteger(packageConfig.maxConcurrent) && packageConfig.maxConcurrent > 0
-        ? packageConfig.maxConcurrent
-        : 1,
+      maxConcurrent: typeof entry.metadata?.stageId === "string"
+        ? 1
+        : Number.isSafeInteger(packageConfig.maxConcurrent) && packageConfig.maxConcurrent > 0
+          ? packageConfig.maxConcurrent
+          : 1,
       resourceGroups: Array.isArray(entry.metadata.resourceGroups) ? entry.metadata.resourceGroups : [],
       queuePolicy: "per-group",
     };
@@ -292,7 +299,10 @@ export function createFeishuExecutionCoordinator({
       if (packageAlias && alias !== packageAlias) continue;
       const config = await packageFor(alias);
       if (config?.maxConcurrent && typeof scheduler.setConcurrencyLimit === "function") {
-        scheduler.setConcurrencyLimit(`autocut:${alias}`, config.maxConcurrent);
+        scheduler.setConcurrencyLimit(
+          `autocut:${alias}`,
+          typeof entry.metadata?.stageId === "string" ? 1 : config.maxConcurrent,
+        );
       }
       if (entry.leasePending) continue;
       void pump(entry).catch(() => {});

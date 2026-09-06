@@ -36,7 +36,16 @@ async function waitForRun(app, taskId, timeoutMs = 5_000) {
   throw new Error(`Timed out waiting for Auto-Cut run for '${taskId}'`);
 }
 
-async function createBridge(directory, controlledContext, status = 200) {
+async function waitForJsonFile(filename, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try { return JSON.parse(await readFile(filename, "utf8")); } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for '${filename}'`);
+}
+
+async function createBridge(controlledContext, status = 200) {
   const requests = [];
   const bridge = createServer(async (request, response) => {
     if (request.method !== "POST" || request.url !== "/api/feishu/workflow/controlled-context") {
@@ -110,7 +119,7 @@ if (args[0] === "debug") {
 }
 `);
   await chmod(codexExecutable, 0o755);
-  const bridge = await createBridge(directory, controlledContext, bridgeStatus);
+  const bridge = await createBridge(controlledContext, bridgeStatus);
   const app = createTaskboardServer({
     dataDirectory: directory,
     codexExecutable,
@@ -232,7 +241,11 @@ test("a trusted phased Auto-Cut start persists an immutable run and injects priv
   const fixture = await createFixture({ controlledContext });
   try {
     const subject = await registerSubject(fixture);
-    const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+    const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, {
+      documentLinks: ["https://guanghe.feishu.cn/docx/registration-snapshot"],
+      namingDisplayValue: "旧名称",
+      namingValueUnique: true,
+    }));
     assert.equal(created.response.status, 201, JSON.stringify(created.body));
     const started = await jsonRequest(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {});
     assert.equal(started.response.status, 202, JSON.stringify(started.body));
@@ -243,7 +256,7 @@ test("a trusted phased Auto-Cut start persists an immutable run and injects priv
     assert.equal(run.configVersion, subject.configVersion);
     assert.equal(run.stageId, "initial");
     assert.equal(run.eventId, "evt-lifecycle-1");
-    assert.equal(run.state, "prepared");
+    assert.equal(run.state, "running");
     const manifest = JSON.parse(await readFile(run.manifestPath, "utf8"));
     assert.deepEqual(manifest.binding, {
       task_id: created.body.task.id,
@@ -253,13 +266,34 @@ test("a trusted phased Auto-Cut start persists an immutable run and injects priv
       stage_id: "initial",
       event_id: "evt-lifecycle-1",
     });
-    const env = JSON.parse(await readFile(fixture.capturePath, "utf8"));
+    assert.equal(manifest.document.url, controlledContext.documentLinks[0]);
+    assert.equal(run.artifactName, "课程001_初稿");
+    const env = await waitForJsonFile(fixture.capturePath);
+    assert.equal(env.CODEX_AUTOCUT_ARTIFACT_REPORT_URL.endsWith(
+      `/api/local/tasks/${encodeURIComponent(created.body.task.id)}/runs/${encodeURIComponent(started.body.run.id)}/artifact-report`,
+    ), true);
+    assert.ok(env.CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN.length >= 32);
+    assert.equal(env.CODEX_AUTOCUT_SOURCE_MANIFEST_PATH, run.manifestPath);
+    assert.equal(env.CODEX_AUTOCUT_SOURCE_MANIFEST_SHA256, run.manifestSha256);
+    assert.equal(env.CODEX_AUTOCUT_EXECUTION_INPUT_PATH, run.executionInputPath);
+    assert.equal(env.CODEX_AUTOCUT_JOB_ROOT, path.dirname(run.manifestPath));
+    assert.equal(env.CODEX_AUTOCUT_DRAFTS_ROOT, run.draftsRoot);
+    assert.equal(env.CODEX_AUTOCUT_RESULT_PATH, run.resultPath);
+    assert.equal(env.CODEX_AUTOCUT_PACKAGE_ZIP_PATH, run.packageZipPath);
     assert.equal(env.CODEX_AUTOCUT_TASK_ID, created.body.task.id);
     assert.equal(env.CODEX_AUTOCUT_RUN_ID, started.body.run.id);
     assert.equal(env.CODEX_AUTOCUT_SUBJECT_KEY, SUBJECT_KEY);
+    assert.equal(env.CODEX_AUTOCUT_CONFIG_VERSION, String(subject.configVersion));
     assert.equal(env.CODEX_AUTOCUT_STAGE_ID, "initial");
     assert.equal(env.CODEX_AUTOCUT_EVENT_ID, "evt-lifecycle-1");
     assert.equal(env.CODEX_FEISHU_BRIDGE_SECRET, undefined);
+    assert.deepEqual(fixture.bridge.requests, [{
+      subjectKey: SUBJECT_KEY,
+      configVersion: subject.configVersion,
+      baseToken: "bas_lifecycle",
+      tableId: "tbl_math",
+      recordId: "rec_1",
+    }]);
   } finally {
     await fixture.app.close();
     await fixture.bridge.close();
@@ -287,6 +321,8 @@ test("controlled-context preparation failure blocks and preserves the task and A
     const aiRuns = fixture.app.database.listAiChatRuns(task.threadId);
     assert.equal(aiRuns.length, 1);
     assert.equal(aiRuns[0].status, "failed");
+    assert.equal(fixture.app.database.getFeishuExecution(task.id), null);
+    await assert.rejects(() => readFile(fixture.capturePath, "utf8"), /ENOENT/);
   } finally {
     await fixture.app.close();
     await fixture.bridge.close();

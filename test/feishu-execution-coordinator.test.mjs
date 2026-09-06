@@ -42,7 +42,7 @@ function metadata(packageAlias) {
   };
 }
 
-function createFixture({ packages = {}, maxConcurrent = 1, allowAutomaticExecution = true, failStarts = 0 } = {}) {
+function createFixture({ packages = {}, maxConcurrent = 1, allowAutomaticExecution = true, failStarts = 0, startError = null } = {}) {
   const clock = createClock();
   const tasks = new Map();
   const executions = new Map();
@@ -97,7 +97,7 @@ function createFixture({ packages = {}, maxConcurrent = 1, allowAutomaticExecuti
       if (existing) return Promise.resolve(existing.lease);
       const pending = waiters.get(request.requestId);
       if (pending) return pending.promise;
-      const limit = packages[request.concurrencyGroup.slice("autocut:".length)]?.maxConcurrent ?? maxConcurrent;
+      const limit = request.maxConcurrent ?? maxConcurrent;
       const count = [...active.values()].filter((entry) => entry.request.concurrencyGroup === request.concurrencyGroup).length;
       if (count < limit) {
         const lease = { requestId: request.requestId, leaseId: `lease-${++leaseNumber}`, concurrencyGroup: request.concurrencyGroup, resourceGroups: [] };
@@ -172,6 +172,7 @@ function createFixture({ packages = {}, maxConcurrent = 1, allowAutomaticExecuti
         remainingStartFailures -= 1;
         throw Object.assign(new Error("fixture start failure"), { code: "FIXTURE_START_FAILED" });
       }
+      if (startError) throw startError;
       database.setTaskStatus(currentTask.id, "in_progress");
       database.setFeishuExecutionState(currentTask.id, database.getFeishuExecution(currentTask.id).version, "running", { leaseId: lease.leaseId });
       return { task: database.getTask(currentTask.id), execution: database.getFeishuExecution(currentTask.id) };
@@ -335,6 +336,47 @@ test("a transient launch failure retries with a bounded delay", async () => {
   assert.equal(fixture.starts.length, 2);
   assert.equal(fixture.database.getTask("task-1").status, "in_progress");
   assert.equal(fixture.database.getFeishuExecution("task-1").state, "running");
+});
+
+test("a blocked phased preparation is retained without a coordinator retry", async () => {
+  const startError = Object.assign(new Error("document link missing"), {
+    code: "document_link_missing",
+    feishuAutoCutPreparationBlocked: true,
+  });
+  const fixture = createFixture({
+    startError,
+    packages: { "Auto-cut-copyA": { maxConcurrent: 3 } },
+  });
+  fixture.tasks.set("task-1", task("task-1"));
+
+  await assert.rejects(
+    () => fixture.coordinator.schedule(fixture.tasks.get("task-1"), metadata("Auto-cut-copyA"), "manual"),
+    (error) => error === startError,
+  );
+  assert.equal(fixture.database.getFeishuExecution("task-1"), null);
+  assert.equal(fixture.starts.length, 1);
+
+  await fixture.clock.advance(30_000);
+  assert.equal(fixture.starts.length, 1);
+});
+
+test("phased runs stay serial even when the package allows wider concurrency", async () => {
+  const fixture = createFixture({ packages: { "Auto-cut-copyA": { maxConcurrent: 3 } } });
+  fixture.tasks.set("task-1", task("task-1"));
+  fixture.tasks.set("task-2", task("task-2"));
+  const phased = { ...metadata("Auto-cut-copyA"), stageId: "initial" };
+
+  const first = await fixture.coordinator.schedule(fixture.tasks.get("task-1"), phased, "manual");
+  const second = await fixture.coordinator.schedule(fixture.tasks.get("task-2"), phased, "manual");
+
+  assert.equal(first.execution.state, "running");
+  assert.equal(second.execution.state, "queued");
+  assert.deepEqual(fixture.starts.map((entry) => entry.taskId), ["task-1"]);
+
+  await fixture.coordinator.wake("Auto-cut-copyA");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.database.getFeishuExecution("task-2").state, "queued");
+  assert.deepEqual(fixture.starts.map((entry) => entry.taskId), ["task-1"]);
 });
 
 test("retry exhaustion releases the durable execution so a manual retry can start", async () => {
