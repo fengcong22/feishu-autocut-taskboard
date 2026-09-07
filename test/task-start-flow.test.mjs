@@ -4,14 +4,17 @@ import { chmod, mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { createTaskboardServer as createTaskboardServerBase } from "../server/index.mjs";
 import { subjectProjectId } from "../server/feishu-workflow-store.mjs";
 import { createResourceScheduler } from "../server/resource-scheduler.mjs";
+import { createStoredZip } from "./stored-zip-fixture.mjs";
 
 const FEISHU_SUBJECT_KEY = "bas_fixture:tbl_fixture";
 const FEISHU_PROJECT_ID = subjectProjectId(FEISHU_SUBJECT_KEY);
 const TEST_FEISHU_BRIDGE_SECRET = "fixture-feishu-bridge-secret-2026";
+const TASKCTL_PATH = fileURLToPath(new URL("../cli/taskctl.mjs", import.meta.url));
 const createTaskboardServer = (options = {}) => createTaskboardServerBase({
   feishuBridgeSecret: TEST_FEISHU_BRIDGE_SECRET,
   ...options,
@@ -47,6 +50,28 @@ async function waitForTaskAiStartSettled(app, taskId, timeoutMs = 3_000) {
   throw new Error(`Timed out waiting for task '${taskId}' AI start to settle`);
 }
 
+async function waitForTaskUpload(baseUrl, taskId, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await request(baseUrl, `/api/local/tasks/${taskId}/upload`);
+    const upload = result.body.uploads[0];
+    if (upload?.status === "uploaded") return upload;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for task '${taskId}' artifact upload`);
+}
+
+async function waitForTaskArtifact(baseUrl, taskId, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await request(baseUrl, `/api/local/tasks/${taskId}/artifacts`);
+    const artifact = result.body.artifacts[0];
+    if (artifact) return artifact;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for task '${taskId}' artifact report`);
+}
+
 async function createFixture({
   packageWorkspacePath,
   packagePrompt = "trusted fixture prompt",
@@ -58,9 +83,12 @@ async function createFixture({
   failSkillDiscovery = false,
   failFirstExecBeforeThread = false,
   requireSkipGitRepoCheck = false,
+  reportArtifact = false,
   turnDelayMs = 0,
   allowAutomaticExecution = false,
   feishuPackageStore,
+  instanceToken = null,
+  processEnv,
   resourceScheduler,
 } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-start-flow-"));
@@ -69,8 +97,15 @@ async function createFixture({
   const workspace = await realpath(workspacePath);
   const codexExecutable = path.join(directory, "fake-codex.mjs");
   const promptCapturePath = path.join(directory, "codex-prompt.txt");
+  const artifactReportContextCapturePath = path.join(directory, "artifact-report-context.json");
+  const reportedArtifactPath = path.join(
+    directory,
+    "accepted-autocut-zips",
+    "live-driver-report.zip",
+  );
   const firstExecFailureMarker = path.join(directory, "first-exec-failure");
   await writeFile(codexExecutable, `
+import { spawnSync } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
 if (args[0] === "debug") {
@@ -103,9 +138,22 @@ if (args[0] === "debug") {
   process.stdin.on("data", (chunk) => { prompt += chunk; });
   process.stdin.on("end", () => {
     writeFileSync(${JSON.stringify(promptCapturePath)}, prompt);
+    writeFileSync(${JSON.stringify(artifactReportContextCapturePath)}, JSON.stringify(Object.fromEntries([
+      ["url", process.env.CODEX_AUTOCUT_ARTIFACT_REPORT_URL],
+      ["token", process.env.CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN],
+    ].filter(([, value]) => value !== undefined))));
+    const report = ${JSON.stringify(reportArtifact)}
+      ? spawnSync(process.execPath, [
+          ${JSON.stringify(TASKCTL_PATH)},
+          "artifact",
+          "report",
+          "--file",
+          ${JSON.stringify(reportedArtifactPath)},
+        ], { encoding: "utf8", env: process.env })
+      : null;
     process.stdout.write('{"type":"thread.started","thread_id":"fixture-session"}\\n');
     setTimeout(() => {
-      process.stdout.write(prompt.includes("FAIL")
+      process.stdout.write(prompt.includes("FAIL") || (report && report.status !== 0)
         ? '{"type":"turn.failed","error":{"message":"fixture failure"}}\\n'
         : '{"type":"turn.completed"}\\n');
     }, ${JSON.stringify(turnDelayMs)});
@@ -134,6 +182,11 @@ if (args[0] === "debug") {
     skillPath: path.join(directory, "AGENTS.md"),
     feishuPackagesPath: packagesPath,
     feishuPackageStore,
+    feishuWorkflowSync: async () => ({ ok: true }),
+    ...(instanceToken
+      ? { instanceToken, instanceSecret: "a".repeat(64) }
+      : {}),
+    processEnv,
     resourceScheduler,
     allowAutomaticExecution,
   });
@@ -145,10 +198,12 @@ if (args[0] === "debug") {
   });
   return {
     app,
-    baseUrl: `http://127.0.0.1:${address.port}`,
+    baseUrl: `http://127.0.0.1:${address.port}${instanceToken ? `/${instanceToken}` : ""}`,
     directory,
     packagesPath,
+    artifactReportContextCapturePath,
     promptCapturePath,
+    reportedArtifactPath,
     workspace,
   };
 }
@@ -263,6 +318,68 @@ function automaticFeishuDescription() {
   };
   const encoded = Buffer.from(JSON.stringify(metadata), "utf8").toString("base64url");
   return `<!-- feishu-codex-task:v1:${encoded} -->\n\nfixture prompt`;
+}
+
+async function enableArtifactSource(fixture, artifactSourceMode, { bindSourcePath = true } = {}) {
+  const artifactSourcePath = artifactSourceMode === "driver_report" && bindSourcePath
+    ? path.join(fixture.directory, "accepted-autocut-zips")
+    : null;
+  if (artifactSourcePath) await mkdir(artifactSourcePath);
+  const catalog = await request(fixture.baseUrl, "/api/local/feishu/workflow/catalog", {
+    method: "POST",
+    body: {
+      baseToken: "bas_fixture",
+      baseName: "Fixture Base",
+      tables: [{
+        tableId: "tbl_fixture",
+        tableName: "Fixture subject",
+        fields: [{
+          fieldId: "fld_status",
+          fieldName: "Status",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [{ id: "opt_ready", name: "Ready" }],
+        }],
+      }],
+    },
+  });
+  assert.equal(catalog.response.status, 201);
+  const subject = catalog.body.catalog[0].subjects[0];
+  const subjectPath = `/api/local/feishu/workflow/subjects/${encodeURIComponent(subject.subjectKey)}`;
+  const draft = await request(fixture.baseUrl, subjectPath, {
+    method: "PATCH",
+    body: {
+      trigger: {
+        fieldId: "fld_status",
+        fieldName: "Status",
+        startValue: "Ready",
+        optionId: "opt_ready",
+      },
+      title: { fieldId: null, fieldName: null },
+      execution: { mode: "manual", concurrencyGroup: "autocut", maxConcurrent: 1, resourceGroups: [] },
+      packageRoute: {
+        routeMode: "fixed",
+        packageAlias: "Auto-cut-copyA",
+        subjectCodeFieldId: null,
+        branchMap: null,
+      },
+      upload: {
+        enqueueMode: "manual",
+        artifactSourceMode,
+        artifactSourcePath,
+        targetId: null,
+        targetPath: null,
+        uploadConcurrency: 1,
+      },
+    },
+  });
+  assert.equal(draft.response.status, 200);
+  const enabled = await request(fixture.baseUrl, `${subjectPath}/enable`, {
+    method: "POST",
+    body: { expectedVersion: draft.body.subject.configVersion },
+  });
+  assert.equal(enabled.response.status, 200);
+  return enabled.body.subject;
 }
 
 test("manual start creates and runs a task-linked local Codex thread", async () => {
@@ -410,6 +527,389 @@ test("server-claimed Auto-Cut prompts do not ask Codex to claim the task again",
     assert.match(prompt, /table_id: tbl_fixture/);
     assert.match(prompt, /record_id: rec_fixture/);
     assert.match(prompt, /<user_message>\s*trusted fixture prompt\s*<\/user_message>/);
+  } finally {
+    await fixture.app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("server-registered driver-report capability is scoped to the exact task and run", async () => {
+  const fixture = await createFixture({ instanceToken: "fixture-instance-token" });
+  try {
+    const subject = await enableArtifactSource(fixture, "driver_report");
+    const task = await request(fixture.baseUrl, "/api/tasks", {
+      method: "POST",
+      body: {
+        projectId: subject.projectId,
+        title: "Driver report Auto-Cut package",
+        description: feishuDescriptionWith({
+          configVersion: subject.configVersion,
+          uploadMode: subject.upload.enqueueMode,
+        }),
+        status: "todo",
+        priority: "high",
+        labels: ["feishu"],
+      },
+    });
+    assert.equal(task.response.status, 201);
+
+    const started = await request(fixture.baseUrl, `/api/tasks/${task.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    assert.equal(started.response.status, 202);
+    await waitForRun(
+      fixture.baseUrl,
+      started.body.thread.id,
+      (current) => current.status === "completed",
+    );
+
+    const context = JSON.parse(await readFile(fixture.artifactReportContextCapturePath, "utf8"));
+    assert.equal(
+      context.url,
+      `${fixture.baseUrl}/api/local/tasks/${encodeURIComponent(task.body.task.id)}/runs/${encodeURIComponent(started.body.run.id)}/artifact-report`,
+    );
+    assert.ok(context.token.length >= 32);
+    const prompt = await readFile(fixture.promptCapturePath, "utf8");
+    assert.match(prompt, /taskctl artifact report --file/);
+    assert.equal(prompt.includes(context.token), false);
+  } finally {
+    await fixture.app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("a live Auto-Cut process reports through taskctl before its run completes and enqueues", async () => {
+  const fixture = await createFixture({
+    instanceToken: "fixture-live-report-token",
+    reportArtifact: true,
+  });
+  try {
+    const initialSubject = await enableArtifactSource(fixture, "driver_report");
+    const targetPath = path.join(fixture.directory, "live-upload-target");
+    const subjectPath = `/api/local/feishu/workflow/subjects/${encodeURIComponent(initialSubject.subjectKey)}`;
+    const configured = await request(fixture.baseUrl, subjectPath, {
+      method: "PATCH",
+      body: {
+        execution: { ...initialSubject.execution, mode: "automatic" },
+        upload: {
+          ...initialSubject.upload,
+          enqueueMode: "automatic",
+          targetId: "live-report-target",
+          targetPath,
+        },
+      },
+    });
+    assert.equal(configured.response.status, 200);
+    const enabled = await request(fixture.baseUrl, `${subjectPath}/enable`, {
+      method: "POST",
+      body: { expectedVersion: configured.body.subject.configVersion },
+    });
+    assert.equal(enabled.response.status, 200);
+    const subject = enabled.body.subject;
+    const reportedPath = fixture.reportedArtifactPath;
+    await writeFile(reportedPath, createStoredZip([
+      { name: "draft/draft_content.json", content: "{\"live\":true}" },
+      { name: "draft/draft_meta_info.json", content: "{}" },
+    ]));
+
+    const task = await request(fixture.baseUrl, "/api/tasks", {
+      method: "POST",
+      body: {
+        projectId: subject.projectId,
+        title: "Live driver report Auto-Cut package",
+        description: feishuDescriptionWith({
+          configVersion: subject.configVersion,
+          executionMode: "automatic",
+          mode: "automatic",
+          uploadMode: "automatic",
+        }),
+        status: "todo",
+        priority: "high",
+        labels: ["feishu"],
+      },
+    });
+    assert.equal(task.response.status, 201);
+    const started = await request(fixture.baseUrl, `/api/tasks/${task.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    assert.equal(started.response.status, 202);
+    const run = await waitForRun(
+      fixture.baseUrl,
+      started.body.thread.id,
+      (current) => current.status !== "running",
+    );
+    assert.equal(run.status, "completed");
+    await waitForTaskAiStartSettled(fixture.app, task.body.task.id);
+
+    const completed = await request(fixture.baseUrl, `/api/tasks/${task.body.task.id}`);
+    assert.equal(completed.body.task.status, "done");
+    const artifacts = await request(
+      fixture.baseUrl,
+      `/api/local/tasks/${task.body.task.id}/artifacts`,
+    );
+    assert.equal(artifacts.body.artifacts.length, 1);
+    assert.equal(artifacts.body.artifacts[0].runId, started.body.run.id);
+    const upload = await waitForTaskUpload(fixture.baseUrl, task.body.task.id);
+    assert.equal(upload.artifactId, artifacts.body.artifacts[0].id);
+    assert.deepEqual(
+      await readFile(path.join(targetPath, "live-driver-report.zip")),
+      await readFile(reportedPath),
+    );
+  } finally {
+    await fixture.app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("a live manual acceptance enqueues the exact artifact after its driver run completes", async () => {
+  const fixture = await createFixture({
+    instanceToken: "fixture-live-manual-acceptance-token",
+    reportArtifact: true,
+    turnDelayMs: 1_000,
+  });
+  try {
+    const initialSubject = await enableArtifactSource(fixture, "driver_report");
+    const targetPath = path.join(fixture.directory, "live-manual-acceptance-target");
+    const subjectPath = `/api/local/feishu/workflow/subjects/${encodeURIComponent(initialSubject.subjectKey)}`;
+    const configured = await request(fixture.baseUrl, subjectPath, {
+      method: "PATCH",
+      body: {
+        upload: {
+          ...initialSubject.upload,
+          enqueueMode: "automatic",
+          targetId: "live-manual-acceptance-target",
+          targetPath,
+        },
+      },
+    });
+    assert.equal(configured.response.status, 200);
+    const enabled = await request(fixture.baseUrl, `${subjectPath}/enable`, {
+      method: "POST",
+      body: { expectedVersion: configured.body.subject.configVersion },
+    });
+    assert.equal(enabled.response.status, 200);
+    const subject = enabled.body.subject;
+    await writeFile(fixture.reportedArtifactPath, createStoredZip([
+      { name: "draft/draft_content.json", content: "{\"live\":true}" },
+      { name: "draft/draft_meta_info.json", content: "{}" },
+    ]));
+
+    const created = await request(fixture.baseUrl, "/api/tasks", {
+      method: "POST",
+      body: {
+        projectId: subject.projectId,
+        title: "Live manual driver acceptance",
+        description: feishuDescriptionWith({
+          configVersion: subject.configVersion,
+          executionMode: "manual",
+          mode: "manual",
+          uploadMode: "automatic",
+        }),
+        status: "todo",
+        priority: "high",
+        labels: ["feishu"],
+      },
+    });
+    assert.equal(created.response.status, 201);
+    const started = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    assert.equal(started.response.status, 202);
+    const artifact = await waitForTaskArtifact(fixture.baseUrl, created.body.task.id);
+
+    const current = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}`);
+    const accepted = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}`, {
+      method: "PATCH",
+      body: { version: current.body.task.version, status: "done" },
+    });
+    assert.equal(accepted.response.status, 200);
+    assert.deepEqual(fixture.app.database.listTaskArtifactUploads(created.body.task.id), []);
+
+    const run = await waitForRun(
+      fixture.baseUrl,
+      started.body.thread.id,
+      (candidate) => candidate.status !== "running",
+    );
+    assert.equal(run.status, "completed");
+    await waitForTaskAiStartSettled(fixture.app, created.body.task.id);
+    const upload = await waitForTaskUpload(fixture.baseUrl, created.body.task.id);
+    assert.equal(upload.artifactId, artifact.id);
+  } finally {
+    await fixture.app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("a live Auto-Cut completion rechecks trusted task provenance", async () => {
+  const fixture = await createFixture({
+    instanceToken: "fixture-live-provenance-token",
+    reportArtifact: true,
+    turnDelayMs: 1_000,
+  });
+  try {
+    const initialSubject = await enableArtifactSource(fixture, "driver_report");
+    const subjectPath = `/api/local/feishu/workflow/subjects/${encodeURIComponent(initialSubject.subjectKey)}`;
+    const configured = await request(fixture.baseUrl, subjectPath, {
+      method: "PATCH",
+      body: {
+        execution: { ...initialSubject.execution, mode: "automatic" },
+        upload: {
+          ...initialSubject.upload,
+          enqueueMode: "automatic",
+          targetId: "live-provenance-target",
+          targetPath: path.join(fixture.directory, "live-provenance-upload-target"),
+        },
+      },
+    });
+    assert.equal(configured.response.status, 200);
+    const enabled = await request(fixture.baseUrl, `${subjectPath}/enable`, {
+      method: "POST",
+      body: { expectedVersion: configured.body.subject.configVersion },
+    });
+    assert.equal(enabled.response.status, 200);
+    const subject = enabled.body.subject;
+    await writeFile(fixture.reportedArtifactPath, createStoredZip([
+      { name: "draft/draft_content.json", content: "{\"live\":true}" },
+      { name: "draft/draft_meta_info.json", content: "{}" },
+    ]));
+
+    const created = await request(fixture.baseUrl, "/api/tasks", {
+      method: "POST",
+      body: {
+        projectId: subject.projectId,
+        title: "Live provenance revocation",
+        description: feishuDescriptionWith({
+          configVersion: subject.configVersion,
+          executionMode: "automatic",
+          mode: "automatic",
+          uploadMode: "automatic",
+        }),
+        status: "todo",
+        priority: "high",
+        labels: ["feishu"],
+      },
+    });
+    assert.equal(created.response.status, 201);
+    const started = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    assert.equal(started.response.status, 202);
+    await waitForTaskArtifact(fixture.baseUrl, created.body.task.id);
+
+    const current = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}`);
+    const edited = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}`, {
+      method: "PATCH",
+      body: { version: current.body.task.version, labels: [] },
+    });
+    assert.equal(edited.response.status, 200);
+    const run = await waitForRun(
+      fixture.baseUrl,
+      started.body.thread.id,
+      (candidate) => candidate.status !== "running",
+    );
+    assert.equal(run.status, "completed");
+    await waitForTaskAiStartSettled(fixture.app, created.body.task.id);
+
+    const completed = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}`);
+    assert.equal(completed.body.task.status, "todo");
+    assert.equal(completed.body.task.threadId, null);
+    assert.deepEqual(completed.body.task.labels, []);
+    assert.deepEqual(
+      fixture.app.database.listTaskArtifactUploads(created.body.task.id),
+      [],
+    );
+  } finally {
+    await fixture.app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("manual-select trusted runs do not receive artifact report capability", async () => {
+  const fixture = await createFixture({
+    processEnv: {
+      ...process.env,
+      codex_autocut_artifact_report_url: "http://127.0.0.1:1/stale-report",
+      codex_autocut_artifact_report_token: "stale-report-token",
+    },
+  });
+  try {
+    const subject = await enableArtifactSource(fixture, "manual_select");
+    const task = await request(fixture.baseUrl, "/api/tasks", {
+      method: "POST",
+      body: {
+        projectId: subject.projectId,
+        title: "Manual artifact Auto-Cut package",
+        description: feishuDescriptionWith({
+          configVersion: subject.configVersion,
+          uploadMode: subject.upload.enqueueMode,
+        }),
+        status: "todo",
+        priority: "high",
+        labels: ["feishu"],
+      },
+    });
+    assert.equal(task.response.status, 201);
+
+    const started = await request(fixture.baseUrl, `/api/tasks/${task.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    assert.equal(started.response.status, 202);
+    await waitForRun(
+      fixture.baseUrl,
+      started.body.thread.id,
+      (current) => current.status === "completed",
+    );
+
+    const context = JSON.parse(await readFile(fixture.artifactReportContextCapturePath, "utf8"));
+    assert.deepEqual(context, {});
+    const prompt = await readFile(fixture.promptCapturePath, "utf8");
+    assert.doesNotMatch(prompt, /taskctl artifact report --file/);
+  } finally {
+    await fixture.app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("driver-report capability requires a creation-time source path", async () => {
+  const fixture = await createFixture();
+  try {
+    const subject = await enableArtifactSource(fixture, "driver_report", { bindSourcePath: false });
+    const task = await request(fixture.baseUrl, "/api/tasks", {
+      method: "POST",
+      body: {
+        projectId: subject.projectId,
+        title: "Unbound driver report Auto-Cut package",
+        description: feishuDescriptionWith({
+          configVersion: subject.configVersion,
+          uploadMode: subject.upload.enqueueMode,
+        }),
+        status: "todo",
+        priority: "high",
+        labels: ["feishu"],
+      },
+    });
+    assert.equal(task.response.status, 201);
+
+    const started = await request(fixture.baseUrl, `/api/tasks/${task.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    assert.equal(started.response.status, 202);
+    await waitForRun(
+      fixture.baseUrl,
+      started.body.thread.id,
+      (current) => current.status === "completed",
+    );
+
+    const context = JSON.parse(await readFile(fixture.artifactReportContextCapturePath, "utf8"));
+    assert.deepEqual(context, {});
+    const prompt = await readFile(fixture.promptCapturePath, "utf8");
+    assert.doesNotMatch(prompt, /taskctl artifact report --file/);
   } finally {
     await fixture.app.close();
     await rm(fixture.directory, { recursive: true, force: true });

@@ -1,10 +1,15 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import type {
   FeishuBaseCatalog,
+  FeishuFieldMetadata,
   FeishuPackageSummary,
+  FeishuStageConfig,
+  FeishuStageConfigMap,
+  FeishuStageId,
   FeishuSubjectConfig,
   FeishuWorkflowShareDiagnostic,
 } from "../types";
+import { FeishuStageEditor, type FeishuStageValue } from "./FeishuStageEditor";
 import {
   addFeishuBaseFromUrl,
   exportFeishuWorkflowShare,
@@ -40,6 +45,48 @@ function statusLabel(subject: FeishuSubjectConfig): string {
   return subject.lifecycle === "enabled" ? "已启用" : subject.lifecycle === "draft" ? "草稿" : "已停用";
 }
 
+const PHASE_IDS: FeishuStageId[] = ["initial", "first_review", "final_review"];
+const PHASE_LABELS: Record<FeishuStageId, string> = {
+  initial: "初稿",
+  first_review: "初审修改",
+  final_review: "终审修改",
+};
+
+function fieldIdOf(field: FeishuFieldMetadata | undefined): string {
+  return field?.fieldId ?? "";
+}
+
+function fieldNameOf(field: FeishuFieldMetadata | undefined): string {
+  return field?.fieldName ?? "";
+}
+
+function stageDefaults(subject: FeishuSubjectConfig, fields: FeishuFieldMetadata[]): FeishuStageConfigMap {
+  const status = subject.statusField;
+  const statusField = fields.find((field) => field.fieldId === status?.fieldId)
+    ?? fields.find((field) => String(field.uiType ?? field.type ?? "").toLowerCase().replace(/[\s_-]/gu, "") === "singleselect");
+  const options = statusField?.options ?? [];
+  const existing = subject.stages;
+  return Object.fromEntries(PHASE_IDS.map((stageId, index) => {
+    const option = options[index] ?? options[0];
+    const old = existing?.[stageId];
+    const fallback: FeishuStageConfig = {
+      enabled: index === 0,
+      trigger: {
+        fieldId: statusField?.fieldId ?? subject.trigger?.fieldId ?? null,
+        fieldName: statusField?.fieldName ?? subject.trigger?.fieldName ?? null,
+        optionId: option?.id ?? (index === 0 ? subject.trigger?.optionId ?? null : null),
+        value: option?.name ?? (index === 0 ? subject.trigger?.startValue ?? "" : ""),
+      },
+      videoSource: { kind: "docx_section", anchorText: "录屏" },
+      reviewSource: { kind: "docx_section", anchorText: "修改意见" },
+      audio: { mode: "video_original" },
+      artifactTargetPath: null,
+      nameSuffix: `_${PHASE_LABELS[stageId]}`,
+    };
+    return [stageId, old ? structuredClone(old) : fallback];
+  })) as FeishuStageConfigMap;
+}
+
 type SubjectForm = {
   triggerFieldId: string;
   triggerFieldName: string;
@@ -58,9 +105,20 @@ type SubjectForm = {
   targetId: string;
   targetPath: string;
   uploadConcurrency: string;
+  statusFieldId: string;
+  statusFieldName: string;
+  documentFieldId: string;
+  documentFieldName: string;
+  namingFieldId: string;
+  namingFieldName: string;
+  stages: FeishuStageConfigMap | null;
 };
 
 function formForSubject(subject: FeishuSubjectConfig): SubjectForm {
+  const fields = subject.metadata?.fields ?? [];
+  const statusField = subject.statusField;
+  const documentField = subject.documentField;
+  const namingField = subject.namingField;
   return {
     triggerFieldId: subject.trigger?.fieldId ?? "",
     triggerFieldName: subject.trigger?.fieldName ?? "",
@@ -79,6 +137,13 @@ function formForSubject(subject: FeishuSubjectConfig): SubjectForm {
     targetId: subject.upload?.targetId ?? "",
     targetPath: subject.upload?.targetPath ?? "",
     uploadConcurrency: String(subject.upload?.uploadConcurrency ?? 1),
+    statusFieldId: statusField?.fieldId ?? "",
+    statusFieldName: statusField?.fieldName ?? "",
+    documentFieldId: documentField?.fieldId ?? "",
+    documentFieldName: documentField?.fieldName ?? "",
+    namingFieldId: namingField?.fieldId ?? "",
+    namingFieldName: namingField?.fieldName ?? "",
+    stages: subject.stages || (statusField || documentField || namingField ? stageDefaults(subject, fields) : null),
   };
 }
 
@@ -137,6 +202,42 @@ export function FeishuWorkflowPanel({
   const subjectFormDirty = Boolean(selected && subjectForm
     && JSON.stringify(subjectForm) !== JSON.stringify(formForSubject(selected)));
   const selectedPackage = packageOptions?.find((item) => item.alias === subjectForm?.packageAlias);
+  const visibleSubjects = (base: FeishuBaseCatalog) => base.subjects.filter((subject) => subject.displayEnabled);
+  const hiddenSubjects = (base: FeishuBaseCatalog) => base.subjects.filter((subject) => !subject.displayEnabled);
+  const triggerFields = selected ? selected.metadata?.fields ?? [] : [];
+  const phased = Boolean(subjectForm?.stages);
+  const selectedStatusField = subjectForm
+    ? triggerFields.find((field) => field.fieldId === subjectForm.statusFieldId)
+    : undefined;
+  const statusOptions = selectedStatusField?.options ?? [];
+  const metadataFieldOptions = triggerFields;
+  const phasedValidationErrors = useMemo(() => {
+    if (!subjectForm?.stages) return [];
+    const errors: string[] = [];
+    const enabledStages = PHASE_IDS.filter((stageId) => subjectForm.stages?.[stageId]?.enabled);
+    if (enabledStages.length === 0) errors.push("至少启用一个阶段");
+    const optionIds = enabledStages
+      .map((stageId) => subjectForm.stages?.[stageId]?.trigger.optionId)
+      .filter((value): value is string => Boolean(value));
+    if (new Set(optionIds).size !== optionIds.length) errors.push("已启用阶段的触发选项不能重复");
+    for (const stageId of PHASE_IDS) {
+      const stage = subjectForm.stages[stageId];
+      if (!stage) continue;
+      const phaseLabel = PHASE_LABELS[stageId];
+      if (stage.enabled && (!stage.trigger.optionId || !stage.trigger.value)) errors.push(`${phaseLabel}需要触发选项`);
+      if (stage.videoSource.kind === "docx_section" && !stage.videoSource.anchorText?.trim()) errors.push(`${phaseLabel}需要视频目录标题`);
+      if (stage.videoSource.kind === "base_attachment" && !stage.videoSource.fieldId) errors.push(`${phaseLabel}需要视频附件字段`);
+      if (!stage.reviewSource.anchorText?.trim()) errors.push(`${phaseLabel}需要剪辑意见目录标题`);
+      if (stage.audio.mode === "replace_original" && !stage.audio.source?.fieldId && !stage.audio.source?.anchorText) errors.push(`${phaseLabel}需要外部音频来源`);
+      if (stage.audio.mode === "replace_original" && (!(stage.audio.durationToleranceSeconds ?? 0) || (stage.audio.durationToleranceSeconds ?? 0) <= 0)) errors.push(`${phaseLabel}的时长误差必须为正数`);
+      if (!stage.nameSuffix.trim()) errors.push(`${phaseLabel}需要命名后缀`);
+      if (subjectForm.enqueueMode === "automatic" && !stage.artifactTargetPath?.trim()) errors.push(`${phaseLabel}需要 ZIP 目标目录`);
+    }
+    if (!subjectForm.statusFieldId) errors.push("请选择状态字段");
+    if (!subjectForm.documentFieldId) errors.push("请选择素材文档字段");
+    if (!subjectForm.namingFieldId) errors.push("请选择命名字段");
+    return [...new Set(errors)];
+  }, [subjectForm]);
   const enableBlockedReason = subjectFormDirty
     ? "请先保存草稿"
     : packageOptions === null
@@ -147,12 +248,13 @@ export function FeishuWorkflowPanel({
           ? "当前包不存在，请重新选择"
           : selectedPackage.state !== "enabled"
             ? "只能启用已启用状态的 Auto-Cut 包"
-            : subjectForm.artifactSourceMode !== "manual_select"
+            : subjectForm.artifactSourceMode === "watch_directory"
               ? "该 ZIP 获取方式将在后续开放"
-              : undefined;
-  const visibleSubjects = (base: FeishuBaseCatalog) => base.subjects.filter((subject) => subject.displayEnabled);
-  const hiddenSubjects = (base: FeishuBaseCatalog) => base.subjects.filter((subject) => !subject.displayEnabled);
-  const triggerFields = selected ? selected.metadata?.fields ?? [] : [];
+              : subjectForm.artifactSourceMode === "driver_report" && !subjectForm.artifactSourcePath.trim()
+                ? "请填写 ZIP 来源根目录"
+                : phased && phasedValidationErrors.length > 0
+                  ? phasedValidationErrors[0]
+                : undefined;
   const selectedTriggerField = subjectForm
     ? triggerFields.find((field) => field.fieldId === subjectForm.triggerFieldId)
     : undefined;
@@ -229,6 +331,47 @@ export function FeishuWorkflowPanel({
     });
   }
 
+  function selectPhasedField(kind: "status" | "document" | "naming", fieldId: string) {
+    if (!subjectForm) return;
+    const field = triggerFields.find((candidate) => candidate.fieldId === fieldId);
+    if (!field) return;
+    if (kind === "status") {
+      const option = field.options?.[0] ?? null;
+      const stages = subjectForm.stages
+        ? Object.fromEntries(PHASE_IDS.map((stageId, index) => {
+          const current = subjectForm.stages?.[stageId];
+          return [stageId, current ? {
+            ...current,
+            trigger: {
+              ...current.trigger,
+              fieldId: field.fieldId,
+              fieldName: field.fieldName,
+              ...(current.trigger.optionId && field.options?.some((candidate) => candidate.id === current.trigger.optionId)
+                ? {}
+                : { optionId: field.options?.[index]?.id ?? option?.id ?? null, value: field.options?.[index]?.name ?? option?.name ?? "" }),
+            },
+          } : current];
+        })) as FeishuStageConfigMap
+        : null;
+      setSubjectForm({ ...subjectForm, statusFieldId: field.fieldId, statusFieldName: field.fieldName, stages });
+      return;
+    }
+    setSubjectForm({
+      ...subjectForm,
+      ...(kind === "document"
+        ? { documentFieldId: field.fieldId, documentFieldName: field.fieldName }
+        : { namingFieldId: field.fieldId, namingFieldName: field.fieldName }),
+    });
+  }
+
+  function updateStage(stageId: FeishuStageId, value: FeishuStageValue) {
+    if (!subjectForm?.stages) return;
+    setSubjectForm({
+      ...subjectForm,
+      stages: { ...subjectForm.stages, [stageId]: value as FeishuStageConfig },
+    });
+  }
+
   async function addBase() {
     if (!baseUrl.trim()) return;
     setBusy(true);
@@ -281,6 +424,12 @@ export function FeishuWorkflowPanel({
           targetPath: subjectForm.targetPath || null,
           uploadConcurrency: Number(subjectForm.uploadConcurrency),
         },
+        ...(subjectForm.stages ? {
+          statusField: { fieldId: subjectForm.statusFieldId || null, fieldName: subjectForm.statusFieldName || null },
+          documentField: { fieldId: subjectForm.documentFieldId || null, fieldName: subjectForm.documentFieldName || null },
+          namingField: { fieldId: subjectForm.namingFieldId || null, fieldName: subjectForm.namingFieldName || null },
+          stages: subjectForm.stages,
+        } : {}),
       };
       const subject = await (onSaveDraft ? onSaveDraft(selected.subjectKey, patch) : saveFeishuWorkflowDraft(selected.subjectKey, patch));
       if (subject) onSubjectChange(subject);
@@ -401,7 +550,62 @@ export function FeishuWorkflowPanel({
         </div>
         <small>配置版本 {selected.configVersion}</small>
       </header>
-      <fieldset disabled={busy}>
+      {phased && subjectForm.stages && <section className="feishu-phased-settings" aria-label="分阶段素材配置">
+        <fieldset disabled={busy}>
+          <legend>字段来源</legend>
+          <div className="feishu-settings-grid">
+            <label>
+              <span>状态字段</span>
+              <select
+                aria-label="状态字段"
+                value={subjectForm.statusFieldId}
+                onChange={(event) => selectPhasedField("status", event.target.value)}
+              >
+                <option value="">选择单选状态字段</option>
+                {triggerFields.filter((field) => {
+                  const kind = String(field.uiType ?? field.type ?? "").toLowerCase().replace(/[\s_-]/gu, "");
+                  return kind === "singleselect" || kind === "select" || kind === "3";
+                }).map((field) => <option key={field.fieldId} value={field.fieldId}>{field.fieldName}</option>)}
+              </select>
+            </label>
+            <label>
+              <span>素材文档字段</span>
+              <select
+                aria-label="素材文档字段"
+                value={subjectForm.documentFieldId}
+                onChange={(event) => selectPhasedField("document", event.target.value)}
+              >
+                <option value="">选择文档字段</option>
+                {metadataFieldOptions.map((field) => <option key={field.fieldId} value={field.fieldId}>{field.fieldName}</option>)}
+              </select>
+            </label>
+            <label>
+              <span>命名字段</span>
+              <select
+                aria-label="命名字段"
+                value={subjectForm.namingFieldId}
+                onChange={(event) => selectPhasedField("naming", event.target.value)}
+              >
+                <option value="">选择命名字段</option>
+                {metadataFieldOptions.map((field) => <option key={field.fieldId} value={field.fieldId}>{field.fieldName}</option>)}
+              </select>
+            </label>
+          </div>
+        </fieldset>
+        <div className="feishu-stage-editors">
+          {PHASE_IDS.map((stageId) => <FeishuStageEditor
+            key={stageId}
+            stageId={stageId}
+            value={subjectForm.stages![stageId]}
+            metadataFields={triggerFields}
+            statusOptions={statusOptions}
+            disabled={busy}
+            onChange={(value) => updateStage(stageId, value)}
+            validationErrors={phasedValidationErrors.filter((error) => error.startsWith(PHASE_LABELS[stageId]))}
+          />)}
+        </div>
+      </section>}
+      {!phased && <fieldset disabled={busy}>
         <legend>触发与执行</legend>
         <div className="feishu-settings-grid">
           <label>触发字段<select value={subjectForm.triggerFieldId} onChange={(event) => selectTriggerField(event.target.value)}>
@@ -426,7 +630,7 @@ export function FeishuWorkflowPanel({
           <label>并发数<input type="number" min={1} step={1} value={subjectForm.maxConcurrent} onChange={(event) => setSubjectForm({ ...subjectForm, maxConcurrent: event.target.value })} /></label>
           <label>资源组<input value={subjectForm.resourceGroups} onChange={(event) => setSubjectForm({ ...subjectForm, resourceGroups: event.target.value })} /></label>
         </div>
-      </fieldset>
+      </fieldset>}
       <fieldset disabled={busy}>
         <legend>Auto-Cut 路由</legend>
         <div className="feishu-settings-grid">
@@ -440,16 +644,16 @@ export function FeishuWorkflowPanel({
       <fieldset disabled={busy}>
         <legend>ZIP 与上传</legend>
         <div className="feishu-settings-grid">
-          <label>ZIP 获取方式<select value={subjectForm.artifactSourceMode} onChange={(event) => setSubjectForm({ ...subjectForm, artifactSourceMode: event.target.value as SubjectForm["artifactSourceMode"] })}><option value="manual_select">手动选择</option><option value="watch_directory" disabled>监控目录（后续）</option><option value="driver_report" disabled>Auto-Cut 上报（后续）</option></select></label>
+          <label>ZIP 获取方式<select value={subjectForm.artifactSourceMode} onChange={(event) => setSubjectForm({ ...subjectForm, artifactSourceMode: event.target.value as SubjectForm["artifactSourceMode"] })}><option value="manual_select">手动选择</option><option value="watch_directory" disabled>监控目录（后续）</option><option value="driver_report">Auto-Cut 上报</option></select></label>
           <label>上传入队<select value={subjectForm.enqueueMode} onChange={(event) => setSubjectForm({ ...subjectForm, enqueueMode: event.target.value as SubjectForm["enqueueMode"] })}><option value="manual">手动</option><option value="automatic">自动</option></select></label>
-          <label className="feishu-settings-wide">ZIP 获取路径<input value={subjectForm.artifactSourcePath} disabled={subjectForm.artifactSourceMode === "manual_select"} onChange={(event) => setSubjectForm({ ...subjectForm, artifactSourcePath: event.target.value })} /></label>
+          <label className="feishu-settings-wide">ZIP 来源根目录<input value={subjectForm.artifactSourcePath} disabled={subjectForm.artifactSourceMode === "manual_select"} onChange={(event) => setSubjectForm({ ...subjectForm, artifactSourcePath: event.target.value })} /></label>
           <label>上传目标别名<input value={subjectForm.targetId} onChange={(event) => setSubjectForm({ ...subjectForm, targetId: event.target.value })} /></label>
           <label>上传并发数<input type="number" min={1} step={1} value={subjectForm.uploadConcurrency} onChange={(event) => setSubjectForm({ ...subjectForm, uploadConcurrency: event.target.value })} /></label>
           <label className="feishu-settings-wide">上传路径<input value={subjectForm.targetPath} onChange={(event) => setSubjectForm({ ...subjectForm, targetPath: event.target.value })} /></label>
         </div>
       </fieldset>
       <div className="feishu-subject-actions">
-        <button type="submit" className="button secondary" disabled={busy}>保存草稿</button>
+        <button type="submit" className="button secondary" disabled={busy || (phased && phasedValidationErrors.length > 0)}>保存草稿</button>
         {selected.lifecycle === "enabled"
           ? <button type="button" className="button secondary" disabled={busy} onClick={() => void transition("disable")}>停用</button>
           : selected.lifecycle === "draft"

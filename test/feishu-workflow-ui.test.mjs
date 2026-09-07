@@ -63,9 +63,14 @@ test("subject settings expose ZIP source, upload policy, and execution routing c
   ]) {
     assert.match(panel, new RegExp(field));
   }
-  assert.match(panel, /manual_select/);
-  assert.match(panel, /watch_directory/);
-  assert.match(panel, /driver_report/);
+  assert.match(panel, /<option value="manual_select">手动选择<\/option>/);
+  assert.match(panel, /<option value="watch_directory" disabled>/);
+  assert.match(panel, /<option value="driver_report">Auto-Cut 上报<\/option>/);
+  assert.doesNotMatch(panel, /<option value="driver_report" disabled>/);
+  assert.match(panel, /subjectForm\.artifactSourceMode === "driver_report"\s*&&\s*!subjectForm\.artifactSourcePath\.trim\(\)/);
+  assert.match(panel, /subjectForm\.artifactSourceMode === "watch_directory"/);
+  assert.match(panel, /artifactSourceMode: subjectForm\.artifactSourceMode/);
+  assert.match(panel, /artifactSourcePath: subjectForm\.artifactSourceMode === "manual_select"\s*\? null/);
   assert.match(panel, /uploadConcurrency/);
   assert.match(panel, /保存草稿/);
 });

@@ -33,6 +33,112 @@ test("requests in one concurrency group wait until an active lease is released",
   assert.equal(scheduler.release(second), true);
 });
 
+test("a wider legacy request cannot raise the limit while a phased package lease is active", async () => {
+  const scheduler = createResourceScheduler();
+  const phased = await request(scheduler, "phased-task", {
+    concurrencyGroup: "autocut:Auto-cut-lite",
+    maxConcurrent: 1,
+  });
+  let legacyStarted = false;
+  const legacyPromise = request(scheduler, "legacy-task", {
+    concurrencyGroup: "autocut:Auto-cut-lite",
+    maxConcurrent: 3,
+  }).then((lease) => {
+    legacyStarted = true;
+    return lease;
+  });
+
+  await Promise.resolve();
+  assert.equal(legacyStarted, false);
+  assert.equal(scheduler.snapshot().pendingCount, 1);
+  assert.equal(
+    scheduler.snapshot().concurrencyGroups.find(({ name }) => name === "autocut:Auto-cut-lite").maxConcurrent,
+    1,
+  );
+
+  scheduler.release(phased);
+  const legacy = await legacyPromise;
+  assert.equal(legacyStarted, true);
+  assert.equal(legacy.requestId, "legacy-task");
+  assert.equal(
+    scheduler.snapshot().concurrencyGroups.find(({ name }) => name === "autocut:Auto-cut-lite").maxConcurrent,
+    3,
+  );
+  scheduler.release(legacy);
+});
+
+test("a live limit refresh cannot override a phased package's fixed serial lease", async () => {
+  const scheduler = createResourceScheduler();
+  const phased = await request(scheduler, "phased-task", {
+    concurrencyGroup: "autocut:Auto-cut-lite",
+    maxConcurrent: 1,
+    fixedMaxConcurrent: true,
+  });
+  let legacyStarted = false;
+  const legacyPromise = request(scheduler, "legacy-task", {
+    concurrencyGroup: "autocut:Auto-cut-lite",
+    maxConcurrent: 3,
+  }).then((lease) => {
+    legacyStarted = true;
+    return lease;
+  });
+
+  await Promise.resolve();
+  assert.equal(legacyStarted, false);
+  assert.equal(scheduler.setConcurrencyLimit("autocut:Auto-cut-lite", 3), true);
+  await Promise.resolve();
+  assert.equal(legacyStarted, false);
+  assert.equal(
+    scheduler.snapshot().concurrencyGroups.find(({ name }) => name === "autocut:Auto-cut-lite").maxConcurrent,
+    1,
+  );
+
+  scheduler.release(phased);
+  const legacy = await legacyPromise;
+  assert.equal(legacyStarted, true);
+  assert.equal(
+    scheduler.snapshot().concurrencyGroups.find(({ name }) => name === "autocut:Auto-cut-lite").maxConcurrent,
+    3,
+  );
+  scheduler.release(legacy);
+});
+
+test("snapshot recovery preserves a phased package's fixed serial lease", async () => {
+  const original = createResourceScheduler();
+  const originalLease = await request(original, "phased-task", {
+    concurrencyGroup: "autocut:Auto-cut-lite",
+    maxConcurrent: 1,
+    fixedMaxConcurrent: true,
+  });
+  const snapshot = original.snapshot();
+  const recovered = createResourceScheduler();
+  const [phased] = recovered.recover(snapshot);
+
+  assert.equal(recovered.setConcurrencyLimit("autocut:Auto-cut-lite", 3), true);
+  let legacyStarted = false;
+  const legacyPromise = request(recovered, "legacy-task", {
+    concurrencyGroup: "autocut:Auto-cut-lite",
+    maxConcurrent: 3,
+  }).then((lease) => {
+    legacyStarted = true;
+    return lease;
+  });
+
+  await Promise.resolve();
+  assert.equal(legacyStarted, false);
+  assert.equal(snapshot.active[0].fixedMaxConcurrent, true);
+  assert.equal(
+    recovered.snapshot().concurrencyGroups.find(({ name }) => name === "autocut:Auto-cut-lite").maxConcurrent,
+    1,
+  );
+
+  recovered.release(phased);
+  const legacy = await legacyPromise;
+  assert.equal(legacyStarted, true);
+  recovered.release(legacy);
+  original.release(originalLease);
+});
+
 test("resource groups serialize otherwise independent concurrency groups", async () => {
   const scheduler = createResourceScheduler();
   const first = await request(scheduler, "task-1", {

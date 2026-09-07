@@ -908,10 +908,20 @@ test("preview API does not return credentials or query secrets from source URLs"
 
 test("Wiki Base preview is proxied unchanged and stored under the resolved Base token", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-wiki-preview-"));
+  const bridgeSecret = "preview-bridge-secret";
   let receivedUrl = null;
+  let receivedClient = null;
+  let receivedSecret = null;
   const bridge = createServer(async (incoming, response) => {
+    receivedClient = incoming.headers["x-feishu-bridge-client"] ?? null;
+    receivedSecret = incoming.headers["x-feishu-bridge-secret"] ?? null;
     const chunks = [];
     for await (const chunk of incoming) chunks.push(chunk);
+    if (receivedClient !== "taskboard" || receivedSecret !== bridgeSecret) {
+      response.writeHead(403, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { code: "BRIDGE_AUTH_REQUIRED" } }));
+      return;
+    }
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     receivedUrl = body.url;
     response.writeHead(200, { "content-type": "application/json" });
@@ -930,6 +940,7 @@ test("Wiki Base preview is proxied unchanged and stored under the resolved Base 
     dataDirectory: directory,
     codexExecutable: process.execPath,
     feishuBridgeUrl: `http://127.0.0.1:${bridgeAddress.port}`,
+    feishuBridgeSecret: bridgeSecret,
     feishuPackages: { packages: {} },
   });
   try {
@@ -942,6 +953,8 @@ test("Wiki Base preview is proxied unchanged and stored under the resolved Base 
     });
 
     assert.equal(result.response.status, 201);
+    assert.equal(receivedClient, "taskboard");
+    assert.equal(receivedSecret, bridgeSecret);
     assert.equal(receivedUrl, wikiUrl);
     assert.equal(result.body.catalog[0].baseToken, "bas_resolved");
     assert.equal(result.body.catalog[0].subjects[0].subjectKey, "bas_resolved:tbl_math");

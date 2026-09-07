@@ -22,6 +22,7 @@ import {
   deleteComment,
   deleteTaskArtifact,
   enqueueTaskArtifactUpload,
+  getTaskAutoCutRuns,
   getTask,
   listAttachments,
   listComments,
@@ -31,6 +32,7 @@ import {
   resolveTaskboardUrl,
   resolvePersistedAttachmentUrl,
   retryTaskArtifactUpload,
+  retryTaskAutoCut,
   uploadAttachment,
   uploadCommentAttachment,
   uploadTaskArtifact,
@@ -56,6 +58,7 @@ import type {
   Recurrence,
   Task,
   TaskArtifact,
+  FeishuAutoCutRun,
   TaskChangeActivity,
   TaskDraft,
   TaskPriority,
@@ -114,8 +117,14 @@ import { postEmbeddedHostMessage } from "../embeddedHost.mjs";
 import copyIdIcon from "../assets/figma-taskboard/copy-id.svg";
 import copyLinkIcon from "../assets/figma-taskboard/copy-link.svg";
 import { DescriptionDocument } from "./DescriptionDocument";
+import { AutoCutRunSummary } from "./AutoCutRunSummary";
 
 type TaskDetailError = string | readonly [string, string];
+
+type FeishuTaskOriginWithStage = NonNullable<Task["feishuOrigin"]> & {
+  stageId?: string;
+  eventOccurredAt?: number | null;
+};
 
 interface TaskDetailProps {
   task: Task;
@@ -456,6 +465,10 @@ export function TaskDetail({
   const [artifacts, setArtifacts] = useState<TaskArtifact[]>([]);
   const [artifactsLoading, setArtifactsLoading] = useState(false);
   const [artifactsError, setArtifactsError] = useState<TaskDetailError | null>(null);
+  const [autoCutRuns, setAutoCutRuns] = useState<FeishuAutoCutRun[]>([]);
+  const [autoCutRunsLoading, setAutoCutRunsLoading] = useState(false);
+  const [autoCutRunsError, setAutoCutRunsError] = useState<TaskDetailError | null>(null);
+  const [retryingAutoCut, setRetryingAutoCut] = useState(false);
   const [uploadingArtifact, setUploadingArtifact] = useState(false);
   const [deletingArtifactId, setDeletingArtifactId] = useState<string | null>(null);
   const [artifactUploads, setArtifactUploads] = useState<ArtifactUpload[]>([]);
@@ -513,6 +526,12 @@ export function TaskDetail({
   const isFeishuAutoCutTask = Boolean(
     feishuMetadata
     && currentTask.labels.includes("feishu")
+  );
+  const isPhasedAutoCutTask = Boolean(
+    isFeishuAutoCutTask
+    && currentTask.feishuOrigin?.subjectKey
+    && (currentTask.feishuOrigin as FeishuTaskOriginWithStage).stageId
+    && (currentTask.feishuOrigin as FeishuTaskOriginWithStage).configVersion,
   );
   const canUploadTaskArtifact = Boolean(
     isFeishuAutoCutTask
@@ -652,6 +671,30 @@ export function TaskDetail({
     );
     return () => controller.abort();
   }, [attachmentsRevision, isFeishuAutoCutTask, task.id]);
+
+  useEffect(() => {
+    if (!isPhasedAutoCutTask) {
+      setAutoCutRuns([]);
+      setAutoCutRunsError(null);
+      setAutoCutRunsLoading(false);
+      return undefined;
+    }
+    const controller = new AbortController();
+    setAutoCutRunsLoading(true);
+    setAutoCutRunsError(null);
+    void getTaskAutoCutRuns(task.id, controller.signal).then(
+      (runs) => {
+        setAutoCutRuns(runs);
+        setAutoCutRunsLoading(false);
+      },
+      (error) => {
+        if ((error as Error).name === "AbortError") return;
+        setAutoCutRunsError(messageFor(error));
+        setAutoCutRunsLoading(false);
+      },
+    );
+    return () => controller.abort();
+  }, [attachmentsRevision, isPhasedAutoCutTask, task.id]);
 
   useEffect(() => {
     if (!isFeishuAutoCutTask) {
@@ -1194,6 +1237,22 @@ export function TaskDetail({
     }
   }
 
+  async function retryAutoCut() {
+    if (!isPhasedAutoCutTask || retryingAutoCut) return;
+    setRetryingAutoCut(true);
+    setAutoCutRunsError(null);
+    try {
+      const result = await retryTaskAutoCut(currentTask.id, currentTask.version);
+      setCurrentTask(result.task);
+      const runs = await getTaskAutoCutRuns(currentTask.id);
+      setAutoCutRuns(runs);
+    } catch (error) {
+      setAutoCutRunsError(messageFor(error));
+    } finally {
+      setRetryingAutoCut(false);
+    }
+  }
+
   function updateArtifactUpload(nextUpload: ArtifactUpload) {
     setArtifactUploads((current) => [
       nextUpload,
@@ -1603,6 +1662,23 @@ export function TaskDetail({
 
             {isFeishuAutoCutTask && (
               <section className="issue-artifacts" aria-labelledby="artifacts-heading">
+                {isPhasedAutoCutTask && (
+                  autoCutRunsLoading
+                    ? <div className="attachments-loading" aria-label={text("正在加载 Auto-Cut 运行", "Loading Auto-Cut runs")} aria-busy="true"><i /><i /></div>
+                    : <AutoCutRunSummary
+                      task={currentTask}
+                      attempts={autoCutRuns}
+                      retrying={retryingAutoCut}
+                      onRetry={() => void retryAutoCut()}
+                    />
+                )}
+                {autoCutRunsError && (
+                  <div className="attachments-error" role="alert">
+                    {typeof autoCutRunsError === "string"
+                      ? autoCutRunsError
+                      : text(autoCutRunsError[0], autoCutRunsError[1])}
+                  </div>
+                )}
                 <header className="attachments-heading">
                   <div>
                     <h2 id="artifacts-heading">{text("剪映草稿 ZIP", "Jianying draft ZIP")}</h2>

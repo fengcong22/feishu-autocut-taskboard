@@ -193,7 +193,13 @@ Bridge 用下面的回环接口做生命周期同步：
 
 自动执行由显式的服务策略（`allowAutomaticExecution`）控制，除非本机部署通过 `CODEX_TASKBOARD_ALLOW_AUTOMATIC_EXECUTION` 主动开启，否则默认关闭。Auto-Cut 成功后任务仍保持“处理中”，直到剪映草稿 ZIP 通过结构校验并计算 SHA-256；验证成功后，手动模式进入“待验收”，自动模式进入“已完成剪辑”。上传配置为自动时，自动任务会在 ZIP 校验后入队，手动任务会在验收进入“已完成剪辑”后入队；上传配置为手动时，则由已完成任务界面手动入队。上传任务会把已验证产物复制到配置好的本地或 UNC/NAS 路径，按学科限制上传并发，并提供手动重试和冲突保护。
 
-当前 ZIP 获取方式只启用“手动选择”：在任务详情中选择 Auto-Cut 生成的完整 ZIP。`watch_directory` 和 `driver_report` 仍是预留配置值，目录采集器和主动上报接入前不会在界面中开放。
+工作流面板支持“手动选择”（`manual_select`）和“Auto-Cut 上报”（`driver_report`）；“监控目录”（`watch_directory`）仍为预留值并保持禁用。使用 `driver_report` 时需要配置绝对的 ZIP 来源根目录。Auto-Cut 验收本次运行生成的准确 ZIP 后，执行 `taskctl artifact report --file <验收通过 ZIP 的绝对路径>`。该命令只读取并计算这个指定文件的 SHA-256，再通过 Taskboard 为本次运行注入的专属能力上报准确路径和哈希。
+
+只有通过 `POST /api/local/tasks/:id/autocut-retry` 发起、同时携带两个字面量 `true` 授权项，并且属于服务端登记的已阻塞 phased Auto-Cut 任务，Taskboard 才直接启动本机已登记的 Auto-Cut runtime；该路径不会再启动新的 Codex turn。初次执行和未携带授权的重试继续使用原有 Codex 路径；普通任务、复制标记、legacy 或未登记任务不能取得本地执行资格。授权只绑定随后创建的这一个 run；run 创建前若服务重启，必须重新授权。
+
+Taskboard 向本机 runtime 传入该 run 独占的素材 manifest、manifest 哈希、结果回执路径和预期 ZIP 路径。runtime 结束后，Taskboard 只对这个预期 ZIP 计算 SHA-256，并通过同一个 task/run 限定的 `artifact-report` 接口登记；接收端继续核对任务来源、不可变配置、run、回执、ZIP 与哈希，不扫描目录、不选择“最新 ZIP”、不根据文件名猜归属。
+
+Taskboard 只接受服务端登记的可信飞书任务当前活动运行所发出的上报。登记产物前，它会验证不可变的飞书来源和学科策略、task/thread/run/token 归属链、文件位于配置根目录内，并独立复算哈希和执行现有剪映 ZIP 结构校验；不会扫描来源目录、选择“最新 ZIP”，也不会根据文件名推断任务归属。上报后任务继续保持“处理中”，直到同一个运行成功结束；自动执行随后进入“已完成剪辑”，且在 `enqueueMode=automatic` 时将该运行的准确产物加入上传队列。手动执行则进入“待验收”，保留现有验收流程。
 
 ### 飞书学科统一流程看板
 

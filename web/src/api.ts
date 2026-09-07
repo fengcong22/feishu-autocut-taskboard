@@ -43,6 +43,7 @@ import type {
   AutoCutPackageDraft,
   FeishuPackage,
   FeishuPackageSummary,
+  FeishuAutoCutRun,
   CreateUnifiedWorkflowViewInput,
   StageDisplayOverride,
   UnifiedWorkflowStage,
@@ -1196,6 +1197,30 @@ export async function retryTaskArtifactUpload(
     { method: "POST", body: JSON.stringify({ uploadId }) },
   );
   return data.upload;
+}
+
+export async function getTaskAutoCutRuns(
+  taskId: string,
+  signal?: AbortSignal,
+): Promise<FeishuAutoCutRun[]> {
+  const data = await request<{ runs: FeishuAutoCutRun[] }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/autocut-runs`,
+    { signal },
+  );
+  return data.runs;
+}
+
+export async function retryTaskAutoCut(
+  taskId: string,
+  version: number,
+): Promise<{ task: Task; execution?: unknown; run?: FeishuAutoCutRun }> {
+  return request<{ task: Task; execution?: unknown; run?: FeishuAutoCutRun }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/autocut-retry`,
+    {
+      method: "POST",
+      body: JSON.stringify({ version }),
+    },
+  );
 }
 
 export async function uploadAttachment(

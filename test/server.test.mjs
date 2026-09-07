@@ -125,6 +125,56 @@ test("health and the default local project are available", async () => {
   assert.equal(result.body.projects[0].issueCount, 0);
 });
 
+test("workflow workspace can be saved through the local project API", async () => {
+  const baseUrl = await startServer();
+  const workspace = {
+    version: 1,
+    tabs: [{ id: "main", name: "Main" }],
+    activeWorkflowId: "main",
+    snapshots: {
+      main: {
+        nodes: [],
+        flow: { version: 2, root: { items: [] } },
+        selectedNodeId: null,
+      },
+    },
+  };
+
+  const saved = await request(baseUrl, "/api/projects/local/workflow-workspace", {
+    method: "PUT",
+    body: { version: 0, workspace },
+  });
+
+  assert.equal(saved.response.status, 200);
+  assert.deepEqual(saved.body.workflow.workspace, workspace);
+  assert.equal(saved.body.workflow.version, 1);
+});
+
+test("workflow workspace preserves a tab named __proto__", async () => {
+  const baseUrl = await startServer();
+  const workspace = {
+    version: 1,
+    tabs: [{ id: "__proto__", name: "Prototype" }],
+    activeWorkflowId: "__proto__",
+    snapshots: {
+      ["__proto__"]: {
+        nodes: [],
+        flow: { version: 2, root: { items: [] } },
+        selectedNodeId: null,
+      },
+    },
+  };
+
+  const saved = await request(baseUrl, "/api/projects/local/workflow-workspace", {
+    method: "PUT",
+    body: { version: 0, workspace },
+  });
+
+  assert.equal(saved.response.status, 200);
+  assert.ok(Object.hasOwn(saved.body.workflow.workspace.snapshots, "__proto__"));
+  assert.deepEqual(saved.body.workflow.workspace.snapshots["__proto__"], workspace.snapshots["__proto__"]);
+});
+
 test("launcher mode proves service identity and hides every route behind its instance token", async () => {
   const instanceToken = "7a6f8d37-78ce-46c9-87a8-08e10db88da2";
   const instanceSecret = "2e587946-96d6-47b5-930a-1ba70214fa88";

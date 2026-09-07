@@ -1,5 +1,6 @@
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
+import { createReadStream } from "node:fs";
 import { chmod, mkdir, open, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { isIP } from "node:net";
@@ -19,6 +20,7 @@ import {
 } from "../shared/domain.mjs";
 import { resolveCodexExecutable } from "../shared/codex-executable.mjs";
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
+import { normalizeWorkflowSnapshot } from "../shared/workflow-control-flow.mjs";
 import { AiChatService } from "./ai-chat.mjs";
 import { discoverAiCatalog, resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
 import { decodeComposerReferenceKey } from "./composer-reference.mjs";
@@ -36,11 +38,16 @@ import { createJiraIntegration } from "./jira-integration.mjs";
 import { ProjectSummaryService } from "./project-summary.mjs";
 import { codexInvocation } from "../shared/codex-invocation.mjs";
 import { createFeishuWorkflowStore, subjectProjectId } from "./feishu-workflow-store.mjs";
+import { STAGE_IDS } from "./feishu-workflow-stages.mjs";
 import { createFeishuWorkflowApi } from "./feishu-workflow-api.mjs";
 import { createResourceScheduler } from "./resource-scheduler.mjs";
 import { createFeishuExecutionCoordinator } from "./feishu-execution-coordinator.mjs";
+import { runLocalAutoCut } from "./autocut-local-runner.mjs";
 import { ArtifactServiceError, createArtifactService } from "./artifact-service.mjs";
 import { createArtifactUploadWorker } from "./upload-worker.mjs";
+import { readCurrentControlledContext } from "./feishu-controlled-context-client.mjs";
+import { prepareFeishuRunInputs } from "./feishu-run-inputs.mjs";
+import { canonicalJson } from "./feishu-source-manifest.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const execFileAsync = promisify(execFile);
@@ -50,6 +57,7 @@ const ATTACHMENT_BODY_LIMIT = 25 * 1024 * 1024;
 const ARTIFACT_MAX_BYTES = 20 * 1024 * 1024 * 1024;
 const AI_CHAT_TURN_BODY_LIMIT = 25 * 1024 * 1024;
 const AI_CHAT_ATTACHMENT_LIMIT = 10;
+const AUTOCUT_RESULT_MAX_BYTES = 1024 * 1024;
 const AI_CHAT_SKILL_MARKER = "\uFFFC";
 const HOST_RUNTIME_TTL_MS = 3_000;
 const CODEX_PLAN_TAIL_BYTES = 16 * 1024 * 1024;
@@ -651,6 +659,112 @@ function parseVersion(value) {
   return value;
 }
 
+function parseAutoCutRetry(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set(["version", "runConsent"]));
+  const version = parseVersion(value.version);
+  if (value.runConsent === undefined) return { version, autoCutRunConsent: null };
+
+  assertPlainObject(value.runConsent);
+  assertAllowedKeys(value.runConsent, new Set([
+    "allowVideoAudioAsr",
+    "allowConfiguredLocalOutput",
+  ]));
+  for (const key of ["allowVideoAudioAsr", "allowConfiguredLocalOutput"]) {
+    if (value.runConsent[key] !== true) {
+      throw new ApiError(400, "INVALID_FIELD", `'runConsent.${key}' must be true`);
+    }
+  }
+  return {
+    version,
+    autoCutRunConsent: Object.freeze({
+      allowVideoAudioAsr: true,
+      allowConfiguredLocalOutput: true,
+    }),
+  };
+}
+
+function parseWorkflowVersion(value) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new ApiError(400, "INVALID_FIELD", "'version' must be a non-negative integer");
+  }
+  return value;
+}
+
+function parseWorkflowWorkspace(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set(["version", "tabs", "activeWorkflowId", "snapshots"]));
+  if (value.version !== 1) {
+    throw new ApiError(400, "INVALID_FIELD", "'workspace.version' must be 1");
+  }
+  if (!Array.isArray(value.tabs) || value.tabs.length === 0 || value.tabs.length > 100) {
+    throw new ApiError(400, "INVALID_FIELD", "'workspace.tabs' must contain 1 to 100 workflows");
+  }
+  const tabs = value.tabs.map((tab, index) => {
+    assertPlainObject(tab);
+    assertAllowedKeys(tab, new Set(["id", "name"]));
+    return {
+      id: stringField(tab.id, `workspace.tabs[${index}].id`, { required: true, maxLength: 128 }),
+      name: stringField(tab.name, `workspace.tabs[${index}].name`, { required: true, maxLength: 120 }),
+    };
+  });
+  if (new Set(tabs.map((tab) => tab.id)).size !== tabs.length) {
+    throw new ApiError(400, "INVALID_FIELD", "'workspace.tabs' ids must be unique");
+  }
+  const activeWorkflowId = stringField(value.activeWorkflowId, "workspace.activeWorkflowId", {
+    required: true,
+    maxLength: 128,
+  });
+  if (!tabs.some((tab) => tab.id === activeWorkflowId)) {
+    throw new ApiError(400, "INVALID_FIELD", "'workspace.activeWorkflowId' must reference a workflow tab");
+  }
+  assertPlainObject(value.snapshots);
+  const snapshots = Object.create(null);
+  for (const tab of tabs) {
+    const snapshot = value.snapshots[tab.id];
+    assertPlainObject(snapshot);
+    assertAllowedKeys(snapshot, new Set(["nodes", "edges", "flow", "selectedNodeId"]));
+    if (!Array.isArray(snapshot.nodes) || snapshot.nodes.length > 10_000) {
+      throw new ApiError(400, "INVALID_FIELD", `'workspace.snapshots.${tab.id}.nodes' must be an array`);
+    }
+    if (snapshot.flow === undefined && (!Array.isArray(snapshot.edges) || snapshot.edges.length > 20_000)) {
+      throw new ApiError(400, "INVALID_FIELD", `'workspace.snapshots.${tab.id}.edges' must be an array`);
+    }
+    if (snapshot.flow !== undefined && snapshot.edges !== undefined) {
+      throw new ApiError(400, "INVALID_FIELD", `'workspace.snapshots.${tab.id}' cannot contain both 'flow' and 'edges'`);
+    }
+    const selectedNodeId = stringField(
+      snapshot.selectedNodeId ?? null,
+      `workspace.snapshots.${tab.id}.selectedNodeId`,
+      { nullable: true, maxLength: 256 },
+    );
+    try {
+      snapshots[tab.id] = normalizeWorkflowSnapshot({
+        nodes: snapshot.nodes,
+        edges: snapshot.edges,
+        flow: snapshot.flow,
+        selectedNodeId,
+      });
+    } catch (error) {
+      throw new ApiError(
+        400,
+        "INVALID_FIELD",
+        `'workspace.snapshots.${tab.id}' is not a valid workflow: ${error.message}`,
+      );
+    }
+  }
+  return { version: 1, tabs, activeWorkflowId, snapshots };
+}
+
+function parseWorkflowWorkspaceSave(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["version", "workspace"]));
+  return {
+    version: parseWorkflowVersion(body.version),
+    workspace: parseWorkflowWorkspace(body.workspace),
+  };
+}
+
 function parseSortOrder(value) {
   if (typeof value !== "number" || !Number.isFinite(value) || Math.abs(value) > 1_000_000_000_000) {
     throw new ApiError(400, "INVALID_FIELD", "'sortOrder' must be a finite number between -1000000000000 and 1000000000000");
@@ -1052,6 +1166,38 @@ function parseArtifactHeaders(request) {
   return metadata;
 }
 
+function parseArtifactReport(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["path", "sha256", "manifestSha256"]));
+  if (
+    typeof body.path !== "string"
+    || body.path.length === 0
+    || body.path.length > 4_096
+    || body.path.includes("\0")
+    || !path.isAbsolute(body.path)
+  ) {
+    throw new ApiError(400, "INVALID_ARTIFACT_PATH", "'path' must be an absolute ZIP file path");
+  }
+  if (typeof body.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(body.sha256)) {
+    throw new ApiError(400, "INVALID_ARTIFACT_HASH", "'sha256' must be a lowercase SHA-256 digest");
+  }
+  if (
+    body.manifestSha256 !== undefined
+    && (typeof body.manifestSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(body.manifestSha256))
+  ) {
+    throw new ApiError(
+      400,
+      "INVALID_ARTIFACT_HASH",
+      "'manifestSha256' must be a lowercase SHA-256 digest",
+    );
+  }
+  return {
+    path: body.path,
+    sha256: body.sha256,
+    ...(body.manifestSha256 === undefined ? {} : { manifestSha256: body.manifestSha256 }),
+  };
+}
+
 function parseArtifactUploadEnqueue(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set(["artifactId"]));
@@ -1410,6 +1556,16 @@ function parseFeishuTaskMetadata(description) {
         ? { triggerFieldId: metadata.triggerFieldId.trim() } : {}),
       ...(typeof metadata.triggerValue === "string" && metadata.triggerValue.trim()
         ? { triggerValue: metadata.triggerValue.trim() } : {}),
+      ...(typeof metadata.statusFieldId === "string" && metadata.statusFieldId.trim()
+        ? { statusFieldId: metadata.statusFieldId.trim() } : {}),
+      ...(typeof metadata.beforeOptionId === "string" && metadata.beforeOptionId.trim()
+        ? { beforeOptionId: metadata.beforeOptionId.trim() } : {}),
+      ...(typeof metadata.afterOptionId === "string" && metadata.afterOptionId.trim()
+        ? { afterOptionId: metadata.afterOptionId.trim() } : {}),
+      ...(typeof metadata.stageId === "string" && metadata.stageId.trim()
+        ? { stageId: metadata.stageId.trim() } : {}),
+      ...(Number.isSafeInteger(metadata.eventOccurredAt) && metadata.eventOccurredAt >= 0
+        ? { eventOccurredAt: metadata.eventOccurredAt } : {}),
       mode: metadata.mode === "automatic" ? "automatic" : "manual",
       ...(typeof metadata.subjectKey === "string" && metadata.subjectKey.trim()
         ? { subjectKey: metadata.subjectKey.trim() } : {}),
@@ -1430,6 +1586,76 @@ function parseFeishuTaskMetadata(description) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Parse the dedicated Bridge registration envelope.  The envelope contains
+ * only opaque Feishu identity and inert controlled values; executable policy
+ * is always derived from the Taskboard's stored subject snapshot.
+ */
+function parseFeishuStageRegistrationBody(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["event", "binding", "controlledContext"]));
+  assertPlainObject(body.event);
+  assertAllowedKeys(body.event, new Set([
+    "eventId", "baseToken", "tableId", "recordId", "statusFieldId",
+    "beforeOptionId", "afterOptionId", "occurredAt",
+  ]));
+  const event = {
+    eventId: stringField(body.event.eventId, "event.eventId", { required: true, maxLength: 256 }),
+    baseToken: stringField(body.event.baseToken, "event.baseToken", { required: true, maxLength: 256 }),
+    tableId: stringField(body.event.tableId, "event.tableId", { required: true, maxLength: 256 }),
+    recordId: stringField(body.event.recordId, "event.recordId", { required: true, maxLength: 256 }),
+    statusFieldId: stringField(body.event.statusFieldId, "event.statusFieldId", { required: true, maxLength: 256 }),
+    beforeOptionId: stringField(body.event.beforeOptionId, "event.beforeOptionId", { required: true, maxLength: 256 }),
+    afterOptionId: stringField(body.event.afterOptionId, "event.afterOptionId", { required: true, maxLength: 256 }),
+  };
+  if (body.event.occurredAt !== undefined) {
+    if (!Number.isSafeInteger(body.event.occurredAt) || body.event.occurredAt < 0) {
+      throw new ApiError(400, "INVALID_FIELD", "event.occurredAt must be a non-negative timestamp");
+    }
+    event.occurredAt = body.event.occurredAt;
+  }
+
+  assertPlainObject(body.binding);
+  assertAllowedKeys(body.binding, new Set(["subjectKey", "configVersion", "stageId"]));
+  const binding = {
+    subjectKey: stringField(body.binding.subjectKey, "binding.subjectKey", { required: true, maxLength: 513 }),
+    configVersion: body.binding.configVersion,
+    stageId: stringField(body.binding.stageId, "binding.stageId", { required: true, maxLength: 64 }),
+  };
+  if (!Number.isSafeInteger(binding.configVersion) || binding.configVersion < 1) {
+    throw new ApiError(400, "INVALID_FIELD", "binding.configVersion must be a positive integer");
+  }
+  if (!STAGE_IDS.includes(binding.stageId)) {
+    throw new ApiError(400, "INVALID_FIELD", "binding.stageId is invalid");
+  }
+
+  assertPlainObject(body.controlledContext);
+  assertAllowedKeys(body.controlledContext, new Set([
+    "documentLinks", "namingDisplayValue", "namingValueUnique",
+  ]));
+  if (!Array.isArray(body.controlledContext.documentLinks)
+    || body.controlledContext.documentLinks.length > 32
+    || body.controlledContext.documentLinks.some((link) => (
+      typeof link !== "string" || link.length > 2048 || link.includes("\0")
+    ))) {
+    throw new ApiError(400, "INVALID_FIELD", "controlledContext.documentLinks is invalid");
+  }
+  const namingDisplayValue = stringField(
+    body.controlledContext.namingDisplayValue,
+    "controlledContext.namingDisplayValue",
+    { maxLength: 512 },
+  );
+  if (typeof body.controlledContext.namingValueUnique !== "boolean") {
+    throw new ApiError(400, "INVALID_FIELD", "controlledContext.namingValueUnique must be a boolean");
+  }
+  const controlledContext = {
+    documentLinks: body.controlledContext.documentLinks.map((link) => link.trim()),
+    namingDisplayValue: namingDisplayValue ?? "",
+    namingValueUnique: body.controlledContext.namingValueUnique,
+  };
+  return { event, binding, controlledContext };
 }
 
 function parseStartAiBody(body) {
@@ -2263,6 +2489,9 @@ export function createTaskboardServer(options = {}) {
   );
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
+  const pendingFeishuReconciliations = new Set();
+  const pendingLocalAutoCutRuns = new Set();
+  const autoCutRunner = options.autoCutRunner ?? runLocalAutoCut;
   const artifactService = options.artifactService ?? createArtifactService({
     rootDirectory: resolved.artifactsDirectory,
   });
@@ -2288,7 +2517,8 @@ export function createTaskboardServer(options = {}) {
     if (!marker || !origin) return null;
     for (const key of [
       "version", "source", "eventId", "baseToken", "tableId", "recordId",
-      "triggerField", "triggerFieldId", "triggerValue", "mode", "executionMode",
+      "triggerField", "triggerFieldId", "triggerValue", "statusFieldId", "beforeOptionId",
+      "afterOptionId", "stageId", "eventOccurredAt", "mode", "executionMode",
       "subjectKey", "configVersion", "uploadMode", "packageAlias", "packageSource",
       "concurrencyGroup", "maxConcurrent", "resourceGroups",
     ]) {
@@ -2340,6 +2570,206 @@ export function createTaskboardServer(options = {}) {
         "FEISHU_LABEL_REQUIRED",
         "Feishu tasks must include the feishu label",
       );
+    }
+  }
+
+  function packageSnapshotFromRecord(packageRecord, packageAlias) {
+    if (!packageRecord) return null;
+    return {
+      packageAlias: packageRecord.alias ?? packageAlias,
+      packageRevision: packageRecord.revision ?? 1,
+      name: packageRecord.name ?? packageRecord.projectName ?? packageRecord.alias ?? packageAlias,
+      projectId: packageRecord.projectId ?? null,
+      workspacePath: packageRecord.workspacePath,
+      model: packageRecord.model ?? null,
+      reasoningEffort: packageRecord.reasoningEffort ?? null,
+      prompt: packageRecord.prompt,
+      zipSourceDirectory: packageRecord.zipSourceDirectory ?? packageRecord.artifactSourcePath ?? null,
+      maxConcurrent: packageRecord.maxConcurrent,
+    };
+  }
+
+  function feishuTaskDescriptionMarker(metadata) {
+    const encoded = Buffer.from(JSON.stringify(metadata), "utf8").toString("base64url");
+    return `<!-- feishu-codex-task:v1:${encoded} -->`;
+  }
+
+  function sameControlledContext(left, right) {
+    return canonicalJson(left ?? null) === canonicalJson(right ?? null);
+  }
+
+  function sameStageRegistration(existing, expected) {
+    if (!existing) return false;
+    for (const key of [
+      "source", "eventId", "baseToken", "tableId", "recordId", "statusFieldId",
+      "beforeOptionId", "afterOptionId", "stageId", "eventOccurredAt", "subjectKey",
+      "configVersion", "packageAlias", "executionMode", "uploadMode",
+    ]) {
+      if (JSON.stringify(existing[key]) !== JSON.stringify(expected[key])) return false;
+    }
+    return sameControlledContext(existing.controlledContext, expected.controlledContext);
+  }
+
+  async function createCanonicalFeishuStageTask(registration, actor) {
+    const { event, binding, controlledContext } = registration;
+    const separator = binding.subjectKey.indexOf(":");
+    if (
+      separator <= 0
+      || separator === binding.subjectKey.length - 1
+      || binding.subjectKey.indexOf(":", separator + 1) !== -1
+      || binding.subjectKey.slice(0, separator) !== event.baseToken
+      || binding.subjectKey.slice(separator + 1) !== event.tableId
+    ) {
+      throw new ApiError(409, "FEISHU_SUBJECT_IDENTITY_REQUIRED", "Stage registration identity does not match its Base/table");
+    }
+
+    const subjectVersion = database.getFeishuSubjectVersion(binding.subjectKey, binding.configVersion);
+    if (!subjectVersion) {
+      throw new ApiError(409, "STALE_STAGE_EVENT", "The referenced Feishu workflow version does not exist");
+    }
+    const activeVersion = event.occurredAt === undefined
+      ? subjectVersion.lifecycle === "enabled" ? subjectVersion : null
+      : database.resolveFeishuSubjectVersionAt(binding.subjectKey, event.occurredAt);
+    if (!activeVersion || activeVersion.configVersion !== binding.configVersion) {
+      throw new ApiError(409, "STALE_STAGE_EVENT", "The Feishu event did not occur during the configured workflow version");
+    }
+    if (subjectVersion.baseToken !== event.baseToken || subjectVersion.tableId !== event.tableId) {
+      throw new ApiError(409, "FEISHU_SUBJECT_IDENTITY_REQUIRED", "Stage registration subject identity is invalid");
+    }
+    const stage = subjectVersion.stages?.[binding.stageId];
+    if (!stage || stage.enabled !== true) {
+      throw new ApiError(409, "STAGE_DISABLED", "The referenced Auto-Cut stage is disabled");
+    }
+    if (
+      subjectVersion.statusField?.fieldId !== event.statusFieldId
+      || stage.trigger?.fieldId !== event.statusFieldId
+      || stage.trigger?.optionId !== event.afterOptionId
+      || event.beforeOptionId === event.afterOptionId
+    ) {
+      throw new ApiError(409, "FEISHU_STAGE_BINDING_MISMATCH", "The Feishu status edge does not match the configured stage");
+    }
+
+    const packageAlias = subjectVersion.packageRoute?.packageAlias;
+    const packageRecord = typeof feishuPackages.get === "function"
+      ? await feishuPackages.get(packageAlias)
+      : (await feishuPackages.read())[packageAlias] ?? null;
+    if (!packageRecord) {
+      throw new ApiError(409, "UNKNOWN_PACKAGE_ALIAS", "The configured Auto-Cut package is not available");
+    }
+    if (packageRecord.state && packageRecord.state !== "enabled") {
+      throw new ApiError(409, "PACKAGE_DISABLED", "The configured Auto-Cut package is disabled");
+    }
+    const packageSnapshot = packageSnapshotFromRecord(packageRecord, packageAlias);
+    const executionMode = subjectVersion.execution?.mode === "automatic" ? "automatic" : "manual";
+    const uploadMode = subjectVersion.upload?.enqueueMode === "automatic" ? "automatic" : "manual";
+    const triggerField = subjectVersion.statusField?.fieldName ?? event.statusFieldId;
+    const origin = {
+      version: 1,
+      source: "feishu-base",
+      eventId: event.eventId,
+      baseToken: event.baseToken,
+      tableId: event.tableId,
+      recordId: event.recordId,
+      triggerField,
+      triggerFieldId: event.statusFieldId,
+      triggerValue: stage.trigger.value,
+      statusFieldId: event.statusFieldId,
+      beforeOptionId: event.beforeOptionId,
+      afterOptionId: event.afterOptionId,
+      stageId: binding.stageId,
+      ...(event.occurredAt === undefined ? {} : { eventOccurredAt: event.occurredAt }),
+      mode: executionMode,
+      executionMode,
+      subjectKey: binding.subjectKey,
+      configVersion: binding.configVersion,
+      uploadMode,
+      packageAlias,
+      packageSource: "subject-config",
+      concurrencyGroup: `autocut:${packageAlias}`,
+      maxConcurrent: packageRecord.maxConcurrent,
+      resourceGroups: Array.isArray(subjectVersion.execution?.resourceGroups)
+        ? subjectVersion.execution.resourceGroups
+        : [],
+      stageSnapshot: structuredClone(stage),
+      controlledContext: structuredClone(controlledContext),
+    };
+    const identity = {
+      baseToken: event.baseToken,
+      tableId: event.tableId,
+      recordId: event.recordId,
+      statusFieldId: event.statusFieldId,
+      stageId: binding.stageId,
+      eventId: event.eventId,
+    };
+    const existing = database.findFeishuTaskByRegistration(identity);
+    if (existing) {
+      const existingOrigin = database.getFeishuTaskOrigin(existing.id);
+      if (!sameStageRegistration(existingOrigin, origin)) {
+        throw new ApiError(409, "FEISHU_EVENT_BINDING_CONFLICT", "This Feishu event is already bound to a different task or stage");
+      }
+      return { task: existing, created: false };
+    }
+    const eventRows = database.findFeishuTaskByRegistrationEvent(identity);
+    if (eventRows.some((entry) => !sameStageRegistration(database.getFeishuTaskOrigin(entry.task.id), origin))) {
+      throw new ApiError(409, "FEISHU_EVENT_BINDING_CONFLICT", "This Feishu event is already bound to a different stage");
+    }
+    const marker = {
+      version: 1,
+      source: "feishu-base",
+      eventId: event.eventId,
+      baseToken: event.baseToken,
+      tableId: event.tableId,
+      recordId: event.recordId,
+      triggerField,
+      triggerFieldId: event.statusFieldId,
+      triggerValue: stage.trigger.value,
+      statusFieldId: event.statusFieldId,
+      beforeOptionId: event.beforeOptionId,
+      afterOptionId: event.afterOptionId,
+      stageId: binding.stageId,
+      ...(event.occurredAt === undefined ? {} : { eventOccurredAt: event.occurredAt }),
+      mode: executionMode,
+      executionMode,
+      subjectKey: binding.subjectKey,
+      configVersion: binding.configVersion,
+      uploadMode,
+      packageAlias,
+      packageSource: "subject-config",
+      concurrencyGroup: `autocut:${packageAlias}`,
+      maxConcurrent: packageRecord.maxConcurrent,
+      resourceGroups: origin.resourceGroups,
+    };
+    const taskInput = {
+      projectId: subjectProjectId(binding.subjectKey),
+      title: `${subjectVersion.tableName ?? "Auto-Cut"} · ${event.recordId} · ${stage.nameSuffix}`,
+      description: `${feishuTaskDescriptionMarker(marker)}\n\n${subjectVersion.tableName ?? "Auto-Cut"} ${stage.nameSuffix}`,
+      status: "todo",
+      priority: "high",
+      labels: ["feishu"],
+      sortOrder: undefined,
+      threadId: undefined,
+      threadBinding: undefined,
+      developmentContext: null,
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+      actor,
+      assignee: actor,
+      feishuOrigin: origin,
+      packageSnapshot,
+    };
+    try {
+      const task = database.createTask(taskInput);
+      return { task, created: true };
+    } catch (error) {
+      // A concurrent Bridge delivery may have won the unique event index.
+      const winner = database.findFeishuTaskByRegistration(identity);
+      if (winner) {
+        const winnerOrigin = database.getFeishuTaskOrigin(winner.id);
+        if (sameStageRegistration(winnerOrigin, origin)) return { task: winner, created: false };
+        throw new ApiError(409, "FEISHU_EVENT_BINDING_CONFLICT", "This Feishu event is already bound to a different task or stage");
+      }
+      throw error;
     }
   }
   const resourceScheduler = options.resourceScheduler ?? createResourceScheduler();
@@ -2397,6 +2827,15 @@ export function createTaskboardServer(options = {}) {
       displayEnabled: subject.displayEnabled,
       lifecycle,
       configVersion: subject.configVersion,
+      ...(subject.statusField ? { statusField: structuredClone(subject.statusField) } : {}),
+      ...(subject.documentField ? { documentField: structuredClone(subject.documentField) } : {}),
+      ...(subject.namingField ? { namingField: structuredClone(subject.namingField) } : {}),
+      ...(subject.stages ? {
+        stages: Object.fromEntries(Object.entries(subject.stages).map(([stageId, stage]) => [
+          stageId,
+          stage ? { ...structuredClone(stage), artifactTargetPath: null } : stage,
+        ])),
+      } : {}),
       trigger: subject.trigger,
       title: subject.title,
       execution: subject.execution,
@@ -2417,6 +2856,7 @@ export function createTaskboardServer(options = {}) {
         headers: {
           "content-type": "application/json",
           "x-feishu-bridge-client": "taskboard",
+          ...(resolved.feishuBridgeSecret ? { "x-feishu-bridge-secret": resolved.feishuBridgeSecret } : {}),
         },
         body: JSON.stringify({ lifecycle, expectedVersion, subject: safeSubject }),
       });
@@ -2495,7 +2935,11 @@ export function createTaskboardServer(options = {}) {
         response = await fetch(new URL("/api/feishu/base-preview", bridgeUrl), {
           method: "POST",
           redirect: "error",
-          headers: { "content-type": "application/json" },
+          headers: {
+            "content-type": "application/json",
+            "x-feishu-bridge-client": "taskboard",
+            "x-feishu-bridge-secret": resolved.feishuBridgeSecret,
+          },
           body: JSON.stringify({ url }),
         });
       } catch {
@@ -2815,11 +3259,51 @@ export function createTaskboardServer(options = {}) {
       : "manual";
   }
 
-  function terminalTaskStatusForRun(run, metadata) {
+  function artifactSourceForMetadata(metadata) {
+    if (
+      !metadata
+      || metadata.subjectKey !== `${metadata.baseToken}:${metadata.tableId}`
+      || !Number.isSafeInteger(metadata.configVersion)
+      || metadata.configVersion < 1
+    ) {
+      return null;
+    }
+    const source = database.getFeishuSubjectUploadTargetByVersion(
+      metadata.subjectKey,
+      metadata.configVersion,
+    );
+    return source;
+  }
+
+  function driverArtifactSourceForMetadata(metadata) {
+    const source = artifactSourceForMetadata(metadata);
+    return source?.artifactSourceMode === "driver_report"
+      && typeof source.artifactSourcePath === "string"
+      && path.isAbsolute(source.artifactSourcePath)
+      ? source
+      : null;
+  }
+
+  function localArtifactReportUrl(taskId, runId) {
+    const address = assertLoopbackListenAddress(server.address());
+    return `http://127.0.0.1:${address.port}${routePrefix}/api/local/tasks/${encodeURIComponent(taskId)}/runs/${encodeURIComponent(runId)}/artifact-report`;
+  }
+
+  function terminalTaskStatusForRun(run, metadata, artifact = null) {
     if (run?.status === "completed") {
-      return "in_progress";
+      return driverArtifactSourceForMetadata(metadata)
+        && artifact?.validationStatus === "verified"
+        ? completedTaskStatusForMetadata(metadata)
+        : "in_progress";
     }
     return run?.status === "failed" || run?.status === "interrupted" ? "blocked" : null;
+  }
+
+  function completionArtifactIdForRun(status, metadata, artifact) {
+    if (!driverArtifactSourceForMetadata(metadata)) return undefined;
+    return ["done", "in_review"].includes(status) && artifact?.validationStatus === "verified"
+      ? artifact.id
+      : null;
   }
 
   function completedTaskStatusForMetadata(metadata) {
@@ -2843,6 +3327,16 @@ export function createTaskboardServer(options = {}) {
 
   function assertTaskCanAcceptArtifact(task) {
     const metadata = assertTaskArtifactEligible(task);
+    if (
+      metadata.configVersion !== undefined
+      && artifactSourceForMetadata(metadata)?.artifactSourceMode !== "manual_select"
+    ) {
+      throw new ApiError(
+        409,
+        "MANUAL_ARTIFACT_SELECTION_REQUIRED",
+        "This task's creation-time ZIP source does not allow manual artifact selection",
+      );
+    }
     const completedStatus = completedTaskStatusForMetadata(metadata);
     if (task.status !== "in_progress" && task.status !== completedStatus) {
       throw new ApiError(
@@ -2862,6 +3356,389 @@ export function createTaskboardServer(options = {}) {
       );
     }
     return metadata;
+  }
+
+  function assertArtifactReportRequest(request, claimToken) {
+    assertLoopbackRequest(request);
+    const authorization = request.headers.authorization;
+    const suppliedToken = typeof authorization === "string" && authorization.startsWith("Bearer ")
+      ? authorization.slice("Bearer ".length)
+      : null;
+    if (
+      request.headers["x-taskboard-client"] !== "taskctl"
+      || !hasMatchingSecret(claimToken, suppliedToken)
+    ) {
+      throw new ApiError(403, "ARTIFACT_REPORT_AUTH_FAILED", "Auto-Cut artifact report authentication failed");
+    }
+  }
+
+  function autoCutResultError(code, message) {
+    return new ApiError(409, code, message);
+  }
+
+  function assertExactResultKeys(value, allowed, name) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw autoCutResultError("autocut_result_invalid", `Auto-Cut ${name} is invalid`);
+    }
+    const unknown = Object.keys(value).find((key) => !allowed.has(key));
+    if (unknown) {
+      throw autoCutResultError("autocut_result_invalid", `Auto-Cut ${name} contains an unsupported field`);
+    }
+  }
+
+  function expectedAutoCutBinding(run) {
+    return {
+      task_id: run.taskId,
+      run_id: run.runId,
+      subject_key: run.subjectKey,
+      config_version: run.configVersion,
+      stage_id: run.stageId,
+      event_id: run.eventId,
+    };
+  }
+
+  function publicAutoCutRun(run) {
+    return {
+      runId: run.runId,
+      taskId: run.taskId,
+      attempt: run.attempt,
+      subjectKey: run.subjectKey,
+      configVersion: run.configVersion,
+      stageId: run.stageId,
+      eventId: run.eventId,
+      manifestSha256: run.manifestSha256,
+      artifactName: run.artifactName,
+      state: run.state,
+      errorCode: run.errorCode,
+      errorMessage: run.errorMessage,
+      createdAt: run.createdAt,
+      updatedAt: run.updatedAt,
+    };
+  }
+
+  function assertAutoCutRunBinding(run, metadata) {
+    if (
+      !run
+      || run.taskId !== metadata?.taskId
+      || run.subjectKey !== metadata?.subjectKey
+      || run.configVersion !== metadata?.configVersion
+      || run.stageId !== metadata?.stageId
+      || run.eventId !== metadata?.eventId
+    ) {
+      throw autoCutResultError(
+        "AUTOCUT_RUN_BINDING_MISMATCH",
+        "The Auto-Cut report does not match this task and run",
+      );
+    }
+  }
+
+  function normalizeAutoCutResult(run, value) {
+    assertExactResultKeys(
+      value,
+      new Set([
+        "schema_version", "binding", "manifest_sha256", "status",
+        "package_zip", "archive_sha256", "draft_name", "error",
+      ]),
+      "result",
+    );
+    if (value.schema_version !== 1 || (value.status !== "pass" && value.status !== "blocked")) {
+      throw autoCutResultError("autocut_result_invalid", "Auto-Cut result schema is invalid");
+    }
+    assertExactResultKeys(
+      value.binding,
+      new Set(["task_id", "run_id", "subject_key", "config_version", "stage_id", "event_id"]),
+      "result binding",
+    );
+    if (canonicalJson(value.binding) !== canonicalJson(expectedAutoCutBinding(run))) {
+      throw autoCutResultError(
+        "AUTOCUT_RUN_BINDING_MISMATCH",
+        "The Auto-Cut result binding does not match this task and run",
+      );
+    }
+    if (value.manifest_sha256 !== run.manifestSha256) {
+      throw autoCutResultError(
+        "AUTOCUT_RUN_BINDING_MISMATCH",
+        "The Auto-Cut result manifest does not match this run",
+      );
+    }
+    if (value.status === "blocked") {
+      if (
+        Object.hasOwn(value, "package_zip")
+        || Object.hasOwn(value, "archive_sha256")
+        || Object.hasOwn(value, "draft_name")
+      ) {
+        throw autoCutResultError("autocut_result_invalid", "A blocked Auto-Cut result cannot contain a package");
+      }
+      assertExactResultKeys(value.error, new Set(["code", "message", "details"]), "result error");
+      if (
+        typeof value.error.code !== "string"
+        || value.error.code.trim() === ""
+        || typeof value.error.message !== "string"
+        || value.error.message.trim() === ""
+      ) {
+        throw autoCutResultError("autocut_result_invalid", "Auto-Cut result error is invalid");
+      }
+      return {
+        ...value,
+        error: {
+          code: value.error.code.trim().slice(0, 256),
+          message: value.error.message.trim().slice(0, 2_000),
+          ...(Object.hasOwn(value.error, "details") ? { details: value.error.details } : {}),
+        },
+      };
+    }
+    if (Object.hasOwn(value, "error")) {
+      throw autoCutResultError("autocut_result_invalid", "A successful Auto-Cut result cannot contain an error");
+    }
+    if (
+      typeof value.package_zip !== "string"
+      || !path.isAbsolute(value.package_zip)
+      || value.package_zip.includes("\0")
+      || value.package_zip.length > 4_096
+      || typeof value.archive_sha256 !== "string"
+      || !/^[a-f0-9]{64}$/u.test(value.archive_sha256)
+      || typeof value.draft_name !== "string"
+      || value.draft_name !== run.artifactName
+      || path.resolve(value.package_zip) !== path.resolve(run.packageZipPath)
+    ) {
+      throw autoCutResultError(
+        "AUTOCUT_RUN_BINDING_MISMATCH",
+        "The Auto-Cut result package does not match this run",
+      );
+    }
+    return value;
+  }
+
+  function normalizeAutoCutPackageReceipt(run, result, value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw autoCutResultError("autocut_package_receipt_invalid", "Auto-Cut package receipt is invalid");
+    }
+    if (
+      value.schema_version !== 2
+      || value.status !== "pass"
+      || value.workflow_mode !== "lite"
+      || value.delivery_mode !== "lite_zip"
+      || value.zip_crc_pass !== true
+      || value.zip_tree_identity_pass !== true
+      || !Array.isArray(value.source_pairs)
+    ) {
+      throw autoCutResultError(
+        "autocut_package_receipt_invalid",
+        "Auto-Cut package receipt does not prove a validated Lite ZIP",
+      );
+    }
+    if (
+      !value.binding
+      || canonicalJson(value.binding) !== canonicalJson(expectedAutoCutBinding(run))
+      || value.source_manifest_sha256 !== run.manifestSha256
+      || value.archive_sha256 !== result.archive_sha256
+      || value.draft_name !== run.artifactName
+      || value.package_root_name !== run.artifactName
+      || typeof value.package_zip !== "string"
+      || typeof value.archive_path !== "string"
+      || !path.isAbsolute(value.package_zip)
+      || !path.isAbsolute(value.archive_path)
+      || path.resolve(value.package_zip) !== path.resolve(run.packageZipPath)
+      || path.resolve(value.archive_path) !== path.resolve(run.packageZipPath)
+    ) {
+      throw autoCutResultError(
+        "AUTOCUT_RUN_BINDING_MISMATCH",
+        "The Auto-Cut package receipt does not match this task and run",
+      );
+    }
+    return value;
+  }
+
+  async function readAutoCutResult(run) {
+    let details;
+    let value;
+    try {
+      details = await stat(run.resultPath);
+      if (!details.isFile() || details.size <= 0 || details.size > AUTOCUT_RESULT_MAX_BYTES) {
+        throw autoCutResultError("autocut_result_invalid", "Auto-Cut result file is invalid");
+      }
+      value = JSON.parse(await readFile(run.resultPath, "utf8"));
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      if (error?.code === "ENOENT") {
+        throw autoCutResultError("autocut_result_missing", "Auto-Cut did not produce its bound result receipt");
+      }
+      throw autoCutResultError("autocut_result_invalid", "Auto-Cut result receipt could not be read");
+    }
+    const result = normalizeAutoCutResult(run, value);
+    if (result.status === "blocked") return result;
+
+    const receiptPath = `${run.packageZipPath}.receipt.json`;
+    let receiptDetails;
+    let receiptValue;
+    try {
+      receiptDetails = await stat(receiptPath);
+      if (!receiptDetails.isFile() || receiptDetails.size <= 0 || receiptDetails.size > AUTOCUT_RESULT_MAX_BYTES) {
+        throw autoCutResultError("autocut_package_receipt_invalid", "Auto-Cut package receipt file is invalid");
+      }
+      receiptValue = JSON.parse(await readFile(receiptPath, "utf8"));
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      if (error?.code === "ENOENT") {
+        throw autoCutResultError(
+          "autocut_package_receipt_missing",
+          "Auto-Cut did not produce the exact adjacent package receipt",
+        );
+      }
+      throw autoCutResultError("autocut_package_receipt_invalid", "Auto-Cut package receipt could not be read");
+    }
+    return {
+      ...result,
+      packageReceipt: normalizeAutoCutPackageReceipt(run, result, receiptValue),
+    };
+  }
+
+  async function phasedArtifactSource(run, metadata, report, result) {
+    assertAutoCutRunBinding(run, metadata);
+    if (!report.manifestSha256 || report.manifestSha256 !== run.manifestSha256) {
+      throw autoCutResultError(
+        "AUTOCUT_RUN_BINDING_MISMATCH",
+        "The reported manifest does not match this Auto-Cut run",
+      );
+    }
+    if (result.status !== "pass" || result.archive_sha256 !== report.sha256) {
+      throw autoCutResultError(
+        "AUTOCUT_RUN_BINDING_MISMATCH",
+        "The reported ZIP does not match the Auto-Cut result receipt",
+      );
+    }
+    const packageSnapshot = database.getFeishuTaskPackageSnapshot(run.taskId);
+    const configuredSource = driverArtifactSourceForMetadata(metadata);
+    if (!packageSnapshot?.zipSourceDirectory || !configuredSource?.artifactSourcePath) {
+      throw autoCutResultError(
+        "AUTOCUT_PACKAGE_SOURCE_UNAVAILABLE",
+        "The frozen Auto-Cut ZIP source is unavailable",
+      );
+    }
+    let packageRoot;
+    let configuredRoot;
+    let expectedPath;
+    let reportedPath;
+    try {
+      [packageRoot, configuredRoot, expectedPath, reportedPath] = await Promise.all([
+        realpath(packageSnapshot.zipSourceDirectory),
+        realpath(configuredSource.artifactSourcePath),
+        realpath(run.packageZipPath),
+        realpath(report.path),
+      ]);
+    } catch {
+      throw autoCutResultError(
+        "ARTIFACT_SOURCE_UNAVAILABLE",
+        "The reported ZIP or its frozen source root is unavailable",
+      );
+    }
+    const relativePath = path.relative(packageRoot, expectedPath);
+    if (
+      packageRoot !== configuredRoot
+      || expectedPath !== reportedPath
+      || relativePath === ""
+      || relativePath === ".."
+      || relativePath.startsWith(`..${path.sep}`)
+      || path.isAbsolute(relativePath)
+      || path.basename(expectedPath) !== `${run.artifactName}.zip`
+    ) {
+      throw autoCutResultError(
+        "AUTOCUT_RUN_BINDING_MISMATCH",
+        "The reported ZIP path does not match this Auto-Cut run",
+      );
+    }
+    return { artifactSourcePath: packageRoot };
+  }
+
+  async function acceptReportedArtifact(source, report) {
+    let sourceRoot;
+    let reportedPath;
+    try {
+      [sourceRoot, reportedPath] = await Promise.all([
+        realpath(source.artifactSourcePath),
+        realpath(report.path),
+      ]);
+    } catch (error) {
+      if (["EACCES", "ENOENT", "ENOTDIR", "EPERM"].includes(error?.code)) {
+        throw new ApiError(
+          409,
+          "ARTIFACT_SOURCE_UNAVAILABLE",
+          "The reported ZIP or its configured source root is unavailable",
+        );
+      }
+      throw error;
+    }
+    const relativePath = path.relative(sourceRoot, reportedPath);
+    if (
+      relativePath === ""
+      || relativePath === ".."
+      || relativePath.startsWith(`..${path.sep}`)
+      || path.isAbsolute(relativePath)
+    ) {
+      throw new ApiError(
+        403,
+        "ARTIFACT_OUTSIDE_SOURCE_ROOT",
+        "The reported ZIP is outside this task's configured source root",
+      );
+    }
+    if (!reportedPath.toLowerCase().endsWith(".zip")) {
+      throw new ApiError(400, "INVALID_ARTIFACT_TYPE", "Artifact must be a .zip file");
+    }
+
+    let handle;
+    try {
+      handle = await open(reportedPath, "r");
+      const details = await handle.stat();
+      if (!details.isFile()) {
+        throw new ApiError(400, "INVALID_ARTIFACT_FILE", "The reported artifact must be a regular file");
+      }
+      return await artifactService.acceptUpload({
+        filename: path.basename(reportedPath),
+        contentType: "application/zip",
+        stream: handle.createReadStream({ autoClose: false }),
+      });
+    } catch (error) {
+      if (["EACCES", "ENOENT", "ENOTDIR", "EPERM"].includes(error?.code)) {
+        throw new ApiError(409, "ARTIFACT_SOURCE_UNAVAILABLE", "The reported ZIP is unavailable");
+      }
+      throw error;
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+  }
+
+  async function sha256File(filename) {
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(filename)) hash.update(chunk);
+    return hash.digest("hex");
+  }
+
+  async function reportLocalAutoCutArtifact(run, claimToken) {
+    const result = await readAutoCutResult(run);
+    if (result.status === "blocked") return result;
+    const response = await fetch(localArtifactReportUrl(run.taskId, run.runId), {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${claimToken}`,
+        "content-type": "application/json",
+        "x-taskboard-client": "taskctl",
+      },
+      body: JSON.stringify({
+        path: run.packageZipPath,
+        sha256: await sha256File(run.packageZipPath),
+        manifestSha256: run.manifestSha256,
+      }),
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch {}
+    if (!response.ok) {
+      throw new ApiError(
+        response.status,
+        payload?.error?.code ?? "AUTOCUT_ARTIFACT_REPORT_FAILED",
+        payload?.error?.message ?? "Taskboard could not accept the Auto-Cut ZIP",
+      );
+    }
+    return result;
   }
 
   function assertTaskCanEnqueueArtifact(task) {
@@ -2884,10 +3761,17 @@ export function createTaskboardServer(options = {}) {
     // A task created before upload was configured has an intentionally empty
     // target in its snapshot. Let that task use the subject's current target;
     // once a target was captured, keep the creation-time binding stable.
-    const target = snapshotTarget?.targetPath
-      ? snapshotTarget
-      : database.getFeishuSubjectUploadTargetByOrigin(metadata.baseToken, metadata.tableId);
-    if (automaticOnly && target?.enqueueMode !== "automatic") return null;
+    const stageTargetPath = isPhasedAutoCutOrigin(metadata)
+      && typeof metadata.stageSnapshot.artifactTargetPath === "string"
+      && metadata.stageSnapshot.artifactTargetPath.trim()
+      ? metadata.stageSnapshot.artifactTargetPath.trim()
+      : null;
+    const target = isPhasedAutoCutOrigin(metadata)
+      ? snapshotTarget && { ...snapshotTarget, targetPath: stageTargetPath }
+      : snapshotTarget?.targetPath
+        ? snapshotTarget
+        : database.getFeishuSubjectUploadTargetByOrigin(metadata.baseToken, metadata.tableId);
+    if (automaticOnly && (snapshotTarget?.enqueueMode ?? target?.enqueueMode) !== "automatic") return null;
     if (!target) {
       throw new ApiError(409, "TASK_UPLOAD_NOT_CONFIGURED", "This task is not linked to a configured subject");
     }
@@ -2917,12 +3801,23 @@ export function createTaskboardServer(options = {}) {
     return upload;
   }
 
-  function maybeAutomaticallyEnqueueCompletedTask(task) {
+  function artifactForAutomaticEnqueue(task, metadata) {
+    if (artifactSourceForMetadata(metadata)?.artifactSourceMode === "driver_report") {
+      const artifact = database.getTaskCompletionArtifact(task.id);
+      return artifact?.validationStatus === "verified" ? artifact : null;
+    }
+    const [artifact] = database.listTaskArtifacts(task.id);
+    return artifact?.validationStatus === "verified" ? artifact : null;
+  }
+
+  function maybeAutomaticallyEnqueueCompletedTask(task, exactArtifact = null) {
     try {
-      if (task?.status !== "done") return { upload: null, error: null };
+      if (task?.status !== "done" || task.archivedAt !== null) {
+        return { upload: null, error: null };
+      }
       const metadata = trustedFeishuTaskOrigin(task);
       if (!metadata) return { upload: null, error: null };
-      const [artifact] = database.listTaskArtifacts(task.id);
+      const artifact = exactArtifact ?? artifactForAutomaticEnqueue(task, metadata);
       if (!artifact || artifact.validationStatus !== "verified") return { upload: null, error: null };
       return {
         upload: enqueueArtifactUpload(task, metadata, artifact, { automaticOnly: true }),
@@ -2960,9 +3855,7 @@ export function createTaskboardServer(options = {}) {
     }
   }
 
-  function reconcileFeishuTaskAfterRun(taskId, threadId, run, actor, metadata, lease = null) {
-    const status = terminalTaskStatusForRun(run, metadata);
-    if (!status) return;
+  async function reconcileFeishuTaskAfterRun(taskId, threadId, run, actor, metadata, lease = null) {
     const current = database.getTask(taskId);
     if (!current || current.threadId !== threadId) {
       clearFeishuExecutionAfterRun(taskId, lease);
@@ -2979,17 +3872,120 @@ export function createTaskboardServer(options = {}) {
       if (lease) resourceScheduler.release(lease);
       return;
     }
+    const currentMetadata = trustedFeishuTaskOrigin(current, { requirePackage: true });
+    if (!currentMetadata) {
+      const task = database.releaseTaskFromAiStart(taskId, claim.claimToken, actor);
+      clearFeishuExecutionAfterRun(taskId, lease);
+      events.emit("task.updated", { task });
+      if (lease) resourceScheduler.release(lease);
+      return;
+    }
+    const artifact = run?.id ? database.getTaskArtifactForRun(taskId, run.id) : null;
+    const autoCutRun = run?.id ? database.getFeishuAutoCutRun(run.id) : null;
+    let status;
+    let completionArtifactId;
+    if (autoCutRun) {
+      if (run?.status === "completed") {
+        try {
+          const result = await readAutoCutResult(autoCutRun);
+          if (result.status === "blocked") {
+            database.markFeishuAutoCutRunBlocked(autoCutRun.runId, result.error);
+            status = "blocked";
+          } else if (
+            autoCutRun.state !== "reported"
+            || artifact?.validationStatus !== "verified"
+            || artifact.sha256 !== result.archive_sha256
+            || artifact.filename !== path.basename(autoCutRun.packageZipPath)
+          ) {
+            throw autoCutResultError(
+              "autocut_artifact_missing",
+              "Auto-Cut completed without its bound verified ZIP",
+            );
+          } else {
+            status = completedTaskStatusForMetadata(currentMetadata);
+            completionArtifactId = artifact.id;
+          }
+        } catch (error) {
+          database.markFeishuAutoCutRunBlocked(autoCutRun.runId, error);
+          status = "blocked";
+        }
+      } else if (run?.status === "failed" || run?.status === "interrupted") {
+        let failure = autoCutResultError(
+          autoCutRun.state === "blocked" && autoCutRun.errorCode
+            ? autoCutRun.errorCode
+            : "autocut_process_failed",
+          autoCutRun.state === "blocked" && autoCutRun.errorMessage
+            ? autoCutRun.errorMessage
+            : typeof run?.error === "string" && run.error.trim()
+              ? run.error.trim()
+              : "The Auto-Cut process did not complete successfully",
+        );
+        try {
+          const result = await readAutoCutResult(autoCutRun);
+          if (result.status === "blocked") failure = result.error;
+        } catch (error) {
+          if (error?.code !== "autocut_result_missing") failure = error;
+        }
+        database.markFeishuAutoCutRunBlocked(autoCutRun.runId, failure);
+        status = "blocked";
+      } else {
+        return;
+      }
+    } else {
+      status = terminalTaskStatusForRun(run, currentMetadata, artifact);
+      completionArtifactId = completionArtifactIdForRun(status, currentMetadata, artifact);
+    }
+    if (!status) return;
     const task = database.settleTaskAiStart(
       taskId,
       claim.claimToken,
       run.id,
       status,
       actor,
+      completionArtifactId,
     );
+    if (autoCutRun && ["done", "in_review"].includes(status)) {
+      database.updateFeishuAutoCutRun(autoCutRun.runId, {
+        state: "completed",
+        errorCode: null,
+        errorMessage: null,
+      });
+    }
     clearFeishuExecutionAfterRun(taskId, lease);
     events.emit("task.updated", { task });
+    if (
+      ["done", "in_review"].includes(status)
+      && task.status === "done"
+      && artifact?.validationStatus === "verified"
+    ) {
+      maybeAutomaticallyEnqueueCompletedTask(task, artifact);
+    }
     if (lease) resourceScheduler.release(lease);
   }
+
+  function scheduleFeishuTaskReconciliation(taskId, threadId, run, actor, metadata, lease = null) {
+    const pending = reconcileFeishuTaskAfterRun(
+      taskId,
+      threadId,
+      run,
+      actor,
+      metadata,
+      lease,
+    ).catch((error) => {
+      if (lease) resourceScheduler.release(lease);
+      console.error("Failed to reconcile Feishu task after Codex run", error);
+    });
+    pendingFeishuReconciliations.add(pending);
+    void pending.finally(() => pendingFeishuReconciliations.delete(pending)).catch(() => {});
+    return pending;
+  }
+
+  async function settleFeishuTaskReconciliations() {
+    while (pendingFeishuReconciliations.size > 0) {
+      await Promise.allSettled([...pendingFeishuReconciliations]);
+    }
+  }
+
   function reconcileClaimedFeishuTasks() {
     for (const claim of database.listTaskAiStarts()) {
       const task = database.getTask(claim.taskId);
@@ -3016,10 +4012,6 @@ export function createTaskboardServer(options = {}) {
         } else {
           try { database.deleteTaskAiStartClaim(claim.taskId, claim.claimToken); } catch {}
         }
-        continue;
-      }
-      if (task.status !== "in_progress") {
-        try { database.releaseTaskFromAiStart(task.id, claim.claimToken, CODEX_AGENT_ACTOR); } catch {}
         continue;
       }
       if (!claim.threadId) {
@@ -3069,8 +4061,27 @@ export function createTaskboardServer(options = {}) {
         }
         continue;
       }
-      const status = terminalTaskStatusForRun(latest, metadata);
-      if (!status) continue;
+      if (
+        database.getFeishuAutoCutRun(latest.id)
+        && ["completed", "failed", "interrupted"].includes(latest.status)
+      ) {
+        scheduleFeishuTaskReconciliation(
+          task.id,
+          claim.threadId,
+          latest,
+          CODEX_AGENT_ACTOR,
+          metadata,
+        );
+        continue;
+      }
+      const artifact = database.getTaskArtifactForRun(task.id, latest.id);
+      const status = terminalTaskStatusForRun(latest, metadata, artifact);
+      if (!status) {
+        if (task.status !== "in_progress") {
+          try { database.releaseTaskFromAiStart(task.id, claim.claimToken, CODEX_AGENT_ACTOR); } catch {}
+        }
+        continue;
+      }
       try {
         const updated = database.settleTaskAiStart(
           task.id,
@@ -3078,6 +4089,7 @@ export function createTaskboardServer(options = {}) {
           latest.id,
           status,
           CODEX_AGENT_ACTOR,
+          completionArtifactIdForRun(status, metadata, artifact),
         );
         clearFeishuExecutionAfterRun(task.id);
         events.emit("task.updated", { task: updated });
@@ -3100,6 +4112,34 @@ export function createTaskboardServer(options = {}) {
     };
   }
 
+  function isPhasedAutoCutOrigin(origin) {
+    return Boolean(
+      origin
+      && STAGE_IDS.includes(origin.stageId)
+      && origin.packageSource === "subject-config"
+      && origin.stageSnapshot
+      && typeof origin.stageSnapshot === "object"
+      && origin.controlledContext
+      && typeof origin.controlledContext === "object"
+    );
+  }
+
+  function blockedPreparationError(error) {
+    const normalized = error instanceof ApiError
+      ? error
+      : new ApiError(
+          Number.isInteger(error?.status) ? error.status : 409,
+          typeof error?.code === "string" && error.code.trim()
+            ? error.code.trim()
+            : "AUTOCUT_RUN_PREPARATION_FAILED",
+          typeof error?.message === "string" && error.message.trim()
+            ? error.message.trim()
+            : "Auto-Cut run preparation failed",
+        );
+    normalized.feishuAutoCutPreparationBlocked = true;
+    return normalized;
+  }
+
   function normalizePackageModelError(error, packageConfig) {
     if (error?.code !== "INVALID_MODEL" && error?.code !== "INVALID_REASONING_EFFORT") {
       return error;
@@ -3111,7 +4151,15 @@ export function createTaskboardServer(options = {}) {
     );
   }
 
-  async function startClaimedTaskWithAi(claimedTask, actor, metadata, packageConfig, lease, trigger) {
+  async function startClaimedTaskWithAi(
+    claimedTask,
+    actor,
+    metadata,
+    packageConfig,
+    lease,
+    trigger,
+    autoCutRunConsent = null,
+  ) {
     const threadId = randomUUID();
     let thread;
     let unsubscribeRun = null;
@@ -3144,12 +4192,14 @@ export function createTaskboardServer(options = {}) {
         if (event?.type !== "ai.run" || !event.run || event.run.status === "running") return;
         unsubscribeRun?.();
         unsubscribeRun = null;
-        try {
-          reconcileFeishuTaskAfterRun(claimedTask.id, thread.id, event.run, actor, metadata, lease);
-        } catch (error) {
-          resourceScheduler.release(lease);
-          console.error("Failed to reconcile Feishu task after Codex run", error);
-        }
+        scheduleFeishuTaskReconciliation(
+          claimedTask.id,
+          thread.id,
+          event.run,
+          actor,
+          metadata,
+          lease,
+        );
       });
     } catch (error) {
       unsubscribeRun?.();
@@ -3173,29 +4223,138 @@ export function createTaskboardServer(options = {}) {
         message: packageConfig.prompt,
       }, {
         taskClaimedByServer: true,
-        onRunCreated: (createdRun) => database.bindTaskAiStartRun(
-          claimedTask.id,
-          claimedTask.claimToken,
-          thread.id,
-          createdRun.id,
-        ),
+        onRunCreated: async (createdRun) => {
+          database.bindTaskAiStartRun(
+            claimedTask.id,
+            claimedTask.claimToken,
+            thread.id,
+            createdRun.id,
+          );
+          const task = database.getTask(claimedTask.id);
+          const origin = trustedFeishuTaskOrigin(task, { requirePackage: true });
+          if (!isPhasedAutoCutOrigin(origin)) {
+            if (!driverArtifactSourceForMetadata(metadata)) return null;
+            return {
+              artifactReport: {
+                url: localArtifactReportUrl(claimedTask.id, createdRun.id),
+                token: claimedTask.claimToken,
+              },
+            };
+          }
+          const attempt = database.createFeishuAutoCutRun({
+            runId: createdRun.id,
+            taskId: task.id,
+            subjectKey: origin.subjectKey,
+            configVersion: origin.configVersion,
+            stageId: origin.stageId,
+            eventId: origin.eventId,
+            resultPath: path.join(
+              resolved.dataDirectory,
+              "autocut-runs",
+              task.id,
+              createdRun.id,
+              "result.json",
+            ),
+          });
+          try {
+            if (!driverArtifactSourceForMetadata(origin)) {
+              throw new ApiError(
+                409,
+                "AUTOCUT_DRIVER_REPORT_REQUIRED",
+                "Phased Auto-Cut runs require the driver report artifact source",
+              );
+            }
+            const subjectVersion = database.getFeishuSubjectVersion(
+              origin.subjectKey,
+              origin.configVersion,
+            );
+            if (!subjectVersion) {
+              throw new ApiError(409, "AUTOCUT_SUBJECT_SNAPSHOT_MISSING", "The task's subject snapshot is unavailable");
+            }
+            const packageSnapshot = database.getFeishuTaskPackageSnapshot(task.id);
+            if (!packageSnapshot) {
+              throw new ApiError(409, "AUTOCUT_PACKAGE_SNAPSHOT_MISSING", "The task's package snapshot is unavailable");
+            }
+            const controlledContext = await readCurrentControlledContext({
+              bridgeUrl: resolved.feishuBridgeUrl,
+              bridgeSecret: resolved.feishuBridgeSecret,
+              origin,
+            });
+            const prepared = await prepareFeishuRunInputs({
+              dataDirectory: resolved.dataDirectory,
+              task,
+              run: attempt,
+              origin,
+              subjectVersion,
+              packageSnapshot,
+              controlledContext,
+            });
+            database.markFeishuAutoCutRunPrepared(createdRun.id, prepared);
+            return {
+              artifactReport: {
+                url: localArtifactReportUrl(task.id, createdRun.id),
+                token: claimedTask.claimToken,
+              },
+              sourceManifest: {
+                path: prepared.manifestPath,
+                sha256: prepared.manifestSha256,
+              },
+              executionInput: { path: prepared.executionInputPath },
+              autoCutBinding: {
+                taskId: task.id,
+                runId: createdRun.id,
+                subjectKey: origin.subjectKey,
+                configVersion: origin.configVersion,
+                stageId: origin.stageId,
+                eventId: origin.eventId,
+              },
+              autoCutRuntime: {
+                jobRoot: prepared.jobRoot,
+                draftsRoot: prepared.draftsRoot,
+                resultPath: prepared.resultPath,
+                packageZipPath: prepared.packageZipPath,
+              },
+              ...(trigger === "retry" && autoCutRunConsent
+                ? { autoCutRunConsent }
+                : {}),
+            };
+          } catch (error) {
+            const failure = blockedPreparationError(error);
+            database.markFeishuAutoCutRunBlocked(createdRun.id, failure);
+            const blockedTask = database.settleTaskAiStart(
+              task.id,
+              claimedTask.claimToken,
+              createdRun.id,
+              "blocked",
+              actor,
+            );
+            events.emit("task.updated", { task: blockedTask });
+            throw failure;
+          }
+        },
       });
+      const preparedAttempt = database.getFeishuAutoCutRun(run.id);
+      if (preparedAttempt?.state === "prepared") {
+        database.updateFeishuAutoCutRun(run.id, { state: "running" });
+      }
     } catch (error) {
       unsubscribeRun?.();
       unsubscribeRun = null;
       resourceScheduler.release(lease);
-      try {
-        const rollback = database.getTask(claimedTask.id)
-          ? database.releaseTaskFromAiStart(
-            claimedTask.id,
-            claimedTask.claimToken,
-            actor,
-          )
-          : null;
-        if (!rollback) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${claimedTask.id}' does not exist`);
-        events.emit("task.updated", { task: rollback });
-      } catch {}
-      try { aiChat.deleteThread(thread.id); } catch {}
+      if (error?.feishuAutoCutPreparationBlocked !== true) {
+        try {
+          const rollback = database.getTask(claimedTask.id)
+            ? database.releaseTaskFromAiStart(
+              claimedTask.id,
+              claimedTask.claimToken,
+              actor,
+            )
+            : null;
+          if (!rollback) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${claimedTask.id}' does not exist`);
+          events.emit("task.updated", { task: rollback });
+        } catch {}
+        try { aiChat.deleteThread(thread.id); } catch {}
+      }
       throw normalizePackageModelError(error, packageConfig);
     }
     return {
@@ -3214,11 +4373,210 @@ export function createTaskboardServer(options = {}) {
     };
   }
 
+  async function prepareClaimedPhasedAutoCutRun(claimedTask, actor, metadata, packageConfig) {
+    const threadId = randomUUID();
+    const project = database.getProject(claimedTask.projectId);
+    if (!project) {
+      throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${claimedTask.projectId}' does not exist`);
+    }
+    const thread = database.createAiChatThread({
+      id: threadId,
+      title: `${claimedTask.identifier} · ${metadata.packageAlias}`,
+      origin: {
+        projectId: project.id,
+        projectName: project.name,
+        workspacePath: packageConfig.workspacePath,
+        issueId: claimedTask.id,
+        issueIdentifier: claimedTask.identifier,
+      },
+      model: "local-autocut",
+      reasoningEffort: "none",
+      sandbox: "workspace-write",
+    });
+    const boundTask = database.bindTaskAiStart(
+      claimedTask.id,
+      claimedTask.claimToken,
+      claimedTask.version,
+      thread.id,
+      actor,
+    );
+    events.emit("task.updated", { task: boundTask });
+    const run = database.createAiChatRun({ threadId: thread.id });
+    database.bindTaskAiStartRun(
+      boundTask.id,
+      claimedTask.claimToken,
+      thread.id,
+      run.id,
+    );
+    const origin = trustedFeishuTaskOrigin(database.getTask(boundTask.id), { requirePackage: true });
+    const attempt = database.createFeishuAutoCutRun({
+      runId: run.id,
+      taskId: boundTask.id,
+      subjectKey: origin.subjectKey,
+      configVersion: origin.configVersion,
+      stageId: origin.stageId,
+      eventId: origin.eventId,
+      resultPath: path.join(
+        resolved.dataDirectory,
+        "autocut-runs",
+        boundTask.id,
+        run.id,
+        "result.json",
+      ),
+    });
+    try {
+      if (!driverArtifactSourceForMetadata(origin)) {
+        throw new ApiError(
+          409,
+          "AUTOCUT_DRIVER_REPORT_REQUIRED",
+          "Phased Auto-Cut runs require the driver report artifact source",
+        );
+      }
+      const subjectVersion = database.getFeishuSubjectVersion(origin.subjectKey, origin.configVersion);
+      if (!subjectVersion) {
+        throw new ApiError(409, "AUTOCUT_SUBJECT_SNAPSHOT_MISSING", "The task's subject snapshot is unavailable");
+      }
+      const packageSnapshot = database.getFeishuTaskPackageSnapshot(boundTask.id);
+      if (!packageSnapshot) {
+        throw new ApiError(409, "AUTOCUT_PACKAGE_SNAPSHOT_MISSING", "The task's package snapshot is unavailable");
+      }
+      const controlledContext = await readCurrentControlledContext({
+        bridgeUrl: resolved.feishuBridgeUrl,
+        bridgeSecret: resolved.feishuBridgeSecret,
+        origin,
+      });
+      const prepared = await prepareFeishuRunInputs({
+        dataDirectory: resolved.dataDirectory,
+        task: boundTask,
+        run: attempt,
+        origin,
+        subjectVersion,
+        packageSnapshot,
+        controlledContext,
+      });
+      return {
+        task: database.getTask(boundTask.id),
+        thread,
+        run,
+        autoCutRun: database.markFeishuAutoCutRunPrepared(run.id, prepared),
+      };
+    } catch (error) {
+      const failure = blockedPreparationError(error);
+      database.markFeishuAutoCutRunBlocked(run.id, failure);
+      database.updateAiChatRun(run.id, {
+        status: "failed",
+        exitCode: 1,
+        error: failure.message.slice(0, 65_536),
+        finishedAt: new Date().toISOString(),
+      });
+      const blockedTask = database.settleTaskAiStart(
+        boundTask.id,
+        claimedTask.claimToken,
+        run.id,
+        "blocked",
+        actor,
+      );
+      clearFeishuExecutionAfterRun(boundTask.id);
+      events.emit("task.updated", { task: blockedTask });
+      throw failure;
+    }
+  }
+
+  async function startClaimedTaskWithLocalAutoCut(
+    claimedTask,
+    actor,
+    metadata,
+    packageConfig,
+    lease,
+    trigger,
+    autoCutRunConsent = null,
+  ) {
+    let prepared;
+    try {
+      prepared = await prepareClaimedPhasedAutoCutRun(claimedTask, actor, metadata, packageConfig);
+      database.updateFeishuAutoCutRun(prepared.run.id, { state: "running" });
+    } catch (error) {
+      resourceScheduler.release(lease);
+      if (error?.feishuAutoCutPreparationBlocked !== true) {
+        try {
+          const rollback = database.releaseTaskFromAiStart(
+            claimedTask.id,
+            claimedTask.claimToken,
+            actor,
+          );
+          events.emit("task.updated", { task: rollback });
+        } catch {}
+      }
+      throw error;
+    }
+
+    let operation;
+    operation = (async () => {
+      let terminalRun;
+      try {
+        await autoCutRunner({
+          run: prepared.autoCutRun,
+          packageConfig,
+          environment: codexProcessEnvironment,
+          signal: taskStartAbortController.signal,
+          ...(trigger === "retry" && autoCutRunConsent ? { autoCutRunConsent } : {}),
+        });
+        await reportLocalAutoCutArtifact(prepared.autoCutRun, claimedTask.claimToken);
+        terminalRun = database.updateAiChatRun(prepared.run.id, {
+          status: "completed",
+          exitCode: 0,
+          error: null,
+          finishedAt: new Date().toISOString(),
+        });
+      } catch (error) {
+        database.markFeishuAutoCutRunBlocked(prepared.run.id, error);
+        terminalRun = database.updateAiChatRun(prepared.run.id, {
+          status: error?.name === "AbortError" || error?.code === "AUTOCUT_RUN_INTERRUPTED"
+            ? "interrupted"
+            : "failed",
+          exitCode: 1,
+          error: String(error?.message ?? error).slice(0, 65_536),
+          finishedAt: new Date().toISOString(),
+        });
+      }
+      await scheduleFeishuTaskReconciliation(
+        prepared.task.id,
+        prepared.thread.id,
+        terminalRun,
+        actor,
+        metadata,
+        lease,
+      );
+    })();
+    pendingLocalAutoCutRuns.add(operation);
+    void operation.finally(() => pendingLocalAutoCutRuns.delete(operation)).catch(() => {});
+
+    return {
+      task: database.getTask(claimedTask.id),
+      thread: prepared.thread,
+      run: prepared.run,
+      execution: {
+        executionId: lease.requestId,
+        leaseId: lease.leaseId,
+        state: "running",
+        trigger,
+        mode: executionRequestForTask(claimedTask, metadata, packageConfig).mode,
+        concurrencyGroup: lease.concurrencyGroup,
+        resourceGroups: lease.resourceGroups,
+      },
+    };
+  }
+
   async function startTaskWithAi(
     task,
     actor,
     metadata,
-    { trigger = "manual", signal = taskStartAbortController.signal, lease: providedLease = null } = {},
+    {
+      trigger = "manual",
+      signal = taskStartAbortController.signal,
+      lease: providedLease = null,
+      autoCutRunConsent = null,
+    } = {},
   ) {
     if (trigger === "automatic" && !allowAutomaticExecution) {
       throw new ApiError(
@@ -3278,24 +4636,33 @@ export function createTaskboardServer(options = {}) {
     try {
       if (!lease) lease = await resourceScheduler.request(execution);
       assertTaskStartAllowed(signal);
-      return await startClaimedTaskWithAi(
+      const startClaimedTask = trigger === "retry"
+        && autoCutRunConsent?.allowVideoAudioAsr === true
+        && autoCutRunConsent?.allowConfiguredLocalOutput === true
+        && isPhasedAutoCutOrigin(metadata)
+        ? startClaimedTaskWithLocalAutoCut
+        : startClaimedTaskWithAi;
+      return await startClaimedTask(
         claimedTask,
         actor,
         metadata,
         packageConfig,
         lease,
         trigger,
+        autoCutRunConsent,
       );
     } catch (error) {
       if (lease) resourceScheduler.release(lease);
-      try {
-        const rollback = database.releaseTaskFromAiStart(
-          claimedTask.id,
-          claimedTask.claimToken,
-          actor,
-        );
-        events.emit("task.updated", { task: rollback });
-      } catch {}
+      if (error?.feishuAutoCutPreparationBlocked !== true) {
+        try {
+          const rollback = database.releaseTaskFromAiStart(
+            claimedTask.id,
+            claimedTask.claimToken,
+            actor,
+          );
+          events.emit("task.updated", { task: rollback });
+        } catch {}
+      }
       throw error;
     }
   }
@@ -3305,11 +4672,18 @@ export function createTaskboardServer(options = {}) {
     scheduler: resourceScheduler,
     allowAutomaticExecution,
     onTaskUpdated: (task) => events.emit("task.updated", { task }),
-    startClaimedTask: (task, metadata, lease, trigger, actor) => startTaskWithAi(
+    startClaimedTask: (
+      task,
+      metadata,
+      lease,
+      trigger,
+      actor,
+      autoCutRunConsent,
+    ) => startTaskWithAi(
       task,
       actor ?? CODEX_AGENT_ACTOR,
       metadata,
-      { trigger, lease },
+      { trigger, lease, autoCutRunConsent },
     ),
   });
   reconcileClaimedFeishuTasks();
@@ -4280,7 +5654,33 @@ export function createTaskboardServer(options = {}) {
       if (pathname === "/api/local/feishu/tasks" && request.method === "POST") {
         assertFeishuBridgeRequest(request, resolved.feishuBridgeSecret);
         const actor = actorFromRequest(request);
-        const { assigneeTarget, ...input } = parseTaskCreate(await readJson(request));
+        const rawBody = await readJson(request);
+        if (
+          rawBody
+          && typeof rawBody === "object"
+          && !Array.isArray(rawBody)
+          && Object.hasOwn(rawBody, "event")
+          && Object.hasOwn(rawBody, "binding")
+          && Object.hasOwn(rawBody, "controlledContext")
+        ) {
+          const registration = parseFeishuStageRegistrationBody(rawBody);
+          const result = await createCanonicalFeishuStageTask(registration, actor);
+          const task = result.task;
+          events.emit(result.created ? "task.created" : "task.updated", { task });
+          if (result.created && allowAutomaticExecution && !closing) {
+            const metadata = trustedFeishuTaskOrigin(task, { requirePackage: true });
+            if (metadata && executionModeForMetadata(metadata) === "automatic") {
+              void startTrackedTask(task.id, () => executionCoordinator.schedule(
+                task, metadata, "automatic", { actor: CODEX_AGENT_ACTOR },
+              )).catch((error) => {
+                if (["SERVER_SHUTTING_DOWN", "REQUEST_CANCELLED"].includes(error?.code)) return;
+                console.error(`Automatic execution failed for task '${task.id}': ${error.code ?? "EXECUTION_FAILED"}`);
+              });
+            }
+          }
+          return sendJson(response, result.created ? 201 : 200, { task });
+        }
+        const { assigneeTarget, ...input } = parseTaskCreate(rawBody);
         const metadata = parseFeishuTaskMetadata(input.description);
         if (!metadata || !metadata.baseToken || !metadata.tableId || !metadata.recordId || !metadata.eventId) {
           throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task description does not contain valid workflow metadata");
@@ -4691,6 +6091,169 @@ export function createTaskboardServer(options = {}) {
         return methodNotAllowed(response, ["GET", "POST"]);
       }
 
+      const autoCutRetryRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/autocut-retry$/);
+      if (autoCutRetryRoute) {
+        assertAiLoopbackRequest(request);
+        assertNoQuery(url.searchParams, "POST /api/local/tasks/:id/autocut-retry");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const taskId = decodeRouteSegment(autoCutRetryRoute[1], "Task id");
+        const { version, autoCutRunConsent } = parseAutoCutRetry(await readJson(request));
+        const task = database.getTask(taskId);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        const metadata = requireTrustedFeishuTask(task, { requirePackage: true });
+        if (!isPhasedAutoCutOrigin(metadata)) {
+          throw new ApiError(409, "AUTOCUT_RETRY_NOT_ALLOWED", "Only a blocked phased Auto-Cut task can be retried");
+        }
+        const ready = database.prepareFeishuAutoCutRetry(
+          task.id,
+          version,
+          actorFromRequest(request),
+        );
+        events.emit("task.updated", { task: ready });
+        return sendJson(response, 202, await startTrackedTask(ready.id, () => (
+          executionCoordinator.schedule(ready, metadata, "retry", {
+            actor: actorFromRequest(request),
+            autoCutRunConsent,
+          })
+        )));
+      }
+
+      const autoCutRunsRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/autocut-runs$/);
+      if (autoCutRunsRoute) {
+        assertNoQuery(url.searchParams, "/api/local/tasks/:id/autocut-runs");
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        const taskId = decodeRouteSegment(autoCutRunsRoute[1], "Task id");
+        const task = database.getTask(taskId);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        const metadata = assertTaskArtifactEligible(task);
+        if (!isPhasedAutoCutOrigin(metadata)) {
+          throw new ApiError(409, "TASK_NOT_PHASED_AUTOCUT", "This task has no phased Auto-Cut attempts");
+        }
+        return sendJson(response, 200, {
+          runs: database.listFeishuAutoCutRuns(task.id).map(publicAutoCutRun),
+        });
+      }
+
+      const artifactReportRoute = pathname.match(
+        /^\/api\/local\/tasks\/([^/]+)\/runs\/([^/]+)\/artifact-report$/,
+      );
+      if (artifactReportRoute) {
+        assertNoQuery(url.searchParams, "/api/local/tasks/:taskId/runs/:runId/artifact-report");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const taskId = decodeRouteSegment(artifactReportRoute[1], "Task id");
+        const runId = decodeRouteSegment(artifactReportRoute[2], "Run id");
+        const task = database.getTask(taskId);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        if (task.archivedAt !== null) {
+          throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot accept Auto-Cut artifact reports");
+        }
+        const metadata = assertTaskArtifactEligible(task);
+        const configuredSource = driverArtifactSourceForMetadata(metadata);
+        if (!configuredSource) {
+          throw new ApiError(
+            409,
+            "TASK_NOT_DRIVER_REPORT_ELIGIBLE",
+            "This task was not created with an Auto-Cut driver report source",
+          );
+        }
+        const claim = database.getTaskAiStartForArtifactReport(task.id, runId);
+        if (!claim) {
+          throw new ApiError(
+            409,
+            "ARTIFACT_REPORT_RUN_NOT_ACTIVE",
+            "The specified Auto-Cut run no longer owns an active task claim",
+          );
+        }
+        assertArtifactReportRequest(request, claim.claimToken);
+        const report = parseArtifactReport(await readJson(request));
+        const autoCutRun = database.getFeishuAutoCutRun(runId);
+        let acceptedResult = null;
+        let source = configuredSource;
+        if (autoCutRun) {
+          acceptedResult = await readAutoCutResult(autoCutRun);
+          source = await phasedArtifactSource(autoCutRun, metadata, report, acceptedResult);
+        } else if (report.manifestSha256 !== undefined) {
+          throw autoCutResultError(
+            "AUTOCUT_RUN_BINDING_MISMATCH",
+            "A legacy Auto-Cut run cannot report a phased manifest",
+          );
+        }
+        const stored = await acceptReportedArtifact(source, report);
+        let artifact;
+        try {
+          if (stored.sha256 !== report.sha256) {
+            throw new ApiError(
+              409,
+              "ARTIFACT_HASH_MISMATCH",
+              "The reported ZIP changed before Taskboard could verify it",
+            );
+          }
+          if (autoCutRun && stored.draftRoot !== autoCutRun.artifactName) {
+            throw autoCutResultError(
+              "AUTOCUT_RUN_BINDING_MISMATCH",
+              "The reported ZIP draft root does not match this Auto-Cut run",
+            );
+          }
+          const existing = database.getTaskArtifactForRun(task.id, runId);
+          if (existing && existing.filename === stored.filename && existing.sha256 === stored.sha256) {
+            const existingWork = database.getTaskArtifactForWork(existing.id);
+            const existingContent = existingWork
+              ? await artifactService.getStoredArtifactStats(existingWork.storageKey)
+              : null;
+            if (!existingContent?.isFile()) {
+              throw new ApiError(
+                409,
+                "ARTIFACT_CONTENT_MISSING",
+                "This run's ZIP is already registered but its local content is missing",
+              );
+            }
+          }
+          const currentTask = database.getTask(task.id);
+          if (!currentTask || currentTask.archivedAt !== null) {
+            throw new ApiError(409, "TASK_START_STATE_CHANGED", "Task state changed before storing the run artifact");
+          }
+          const currentMetadata = assertTaskArtifactEligible(currentTask);
+          if (!driverArtifactSourceForMetadata(currentMetadata)) {
+            throw new ApiError(
+              409,
+              "TASK_NOT_DRIVER_REPORT_ELIGIBLE",
+              "This task no longer accepts Auto-Cut artifact reports",
+            );
+          }
+          let currentAutoCutRun = null;
+          if (autoCutRun) {
+            currentAutoCutRun = database.getFeishuAutoCutRun(runId);
+            assertAutoCutRunBinding(currentAutoCutRun, currentMetadata);
+            const currentResult = await readAutoCutResult(currentAutoCutRun);
+            await phasedArtifactSource(currentAutoCutRun, currentMetadata, report, currentResult);
+            if (canonicalJson(currentResult) !== canonicalJson(acceptedResult)) {
+              throw autoCutResultError(
+                "AUTOCUT_RUN_BINDING_MISMATCH",
+                "The Auto-Cut result changed while storing its ZIP",
+              );
+            }
+          }
+          artifact = database.createTaskArtifact(task.id, {
+            ...stored,
+            sourceMode: "driver_report",
+            runId,
+            requiredRunClaim: { runId, claimToken: claim.claimToken },
+            ...(currentAutoCutRun ? { requiredAutoCutRun: currentAutoCutRun } : {}),
+            requiredTaskStatus: "in_progress",
+            completedTaskStatus: null,
+            actor: CODEX_AGENT_ACTOR,
+          });
+        } catch (error) {
+          await artifactService.removeStoredArtifact(stored.storageKey);
+          throw error;
+        }
+        const created = artifact.id === stored.id;
+        if (!created) await artifactService.removeStoredArtifact(stored.storageKey);
+        const currentTask = database.getTask(task.id);
+        if (created) events.emit("artifact.created", { artifact, task: currentTask });
+        return sendJson(response, created ? 201 : 200, { artifact, task: currentTask });
+      }
+
       const taskArtifactsRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/artifacts$/);
       if (taskArtifactsRoute) {
         assertNoQuery(url.searchParams, "/api/local/tasks/:id/artifacts");
@@ -4715,6 +6278,11 @@ export function createTaskboardServer(options = {}) {
           });
           let artifact;
           try {
+            const currentTask = database.getTask(task.id);
+            if (!currentTask) {
+              throw new ApiError(409, "TASK_START_STATE_CHANGED", "Task changed before storing the ZIP artifact");
+            }
+            assertTaskCanAcceptArtifact(currentTask);
             const existing = database.listTaskArtifacts(task.id).find((candidate) => (
               candidate.filename === stored.filename && candidate.sha256 === stored.sha256
             ));
@@ -5439,18 +7007,22 @@ export function createTaskboardServer(options = {}) {
       }
       cloudRealtimeSockets.clear();
       cloudRealtimeServer.close();
-      const serverClosed = listening
-        ? new Promise((resolve, reject) => {
-            server.close((error) => error ? reject(error) : resolve());
-          })
-        : Promise.resolve();
       events.close();
       for (const response of aiEventResponses) response.end();
       aiEventResponses.clear();
       await executionCoordinator.close();
       await settleTaskStarts();
+      if (pendingLocalAutoCutRuns.size > 0) {
+        await Promise.allSettled([...pendingLocalAutoCutRuns]);
+      }
+      const serverClosed = listening
+        ? new Promise((resolve, reject) => {
+            server.close((error) => error ? reject(error) : resolve());
+          })
+        : Promise.resolve();
       await uploadWorker.close();
       await aiChat.close();
+      await settleFeishuTaskReconciliations();
       await projectSummary.close();
       await serverClosed;
       listening = false;

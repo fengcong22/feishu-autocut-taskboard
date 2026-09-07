@@ -420,6 +420,16 @@ function normalizeFeishuTaskOrigin(value) {
       ? { triggerFieldId: value.triggerFieldId.trim() } : {}),
     ...(typeof value.triggerValue === "string" && value.triggerValue.trim()
       ? { triggerValue: value.triggerValue.trim() } : {}),
+    ...(typeof value.statusFieldId === "string" && value.statusFieldId.trim()
+      ? { statusFieldId: value.statusFieldId.trim() } : {}),
+    ...(typeof value.beforeOptionId === "string" && value.beforeOptionId.trim()
+      ? { beforeOptionId: value.beforeOptionId.trim() } : {}),
+    ...(typeof value.afterOptionId === "string" && value.afterOptionId.trim()
+      ? { afterOptionId: value.afterOptionId.trim() } : {}),
+    ...(typeof value.stageId === "string" && value.stageId.trim()
+      ? { stageId: value.stageId.trim() } : {}),
+    ...(Number.isSafeInteger(value.eventOccurredAt) && value.eventOccurredAt >= 0
+      ? { eventOccurredAt: value.eventOccurredAt } : {}),
     ...(value.mode ? { mode: value.mode } : {}),
     ...(typeof value.subjectKey === "string" && value.subjectKey.trim()
       ? { subjectKey: value.subjectKey.trim() } : {}),
@@ -439,6 +449,10 @@ function normalizeFeishuTaskOrigin(value) {
       ? { maxConcurrent: value.maxConcurrent } : {}),
     ...(Array.isArray(value.resourceGroups)
       ? { resourceGroups: value.resourceGroups.filter((group) => typeof group === "string" && group.trim()) } : {}),
+    ...(value.stageSnapshot && typeof value.stageSnapshot === "object" && !Array.isArray(value.stageSnapshot)
+      ? { stageSnapshot: structuredClone(value.stageSnapshot) } : {}),
+    ...(value.controlledContext && typeof value.controlledContext === "object" && !Array.isArray(value.controlledContext)
+      ? { controlledContext: structuredClone(value.controlledContext) } : {}),
   };
   if (!Number.isSafeInteger(origin.version) || origin.version < 1) {
     throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task origin version is invalid");
@@ -451,6 +465,18 @@ function normalizeFeishuTaskOrigin(value) {
   }
   if (origin.uploadMode !== undefined && !["manual", "automatic"].includes(origin.uploadMode)) {
     throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task origin uploadMode is invalid");
+  }
+  if (origin.stageId !== undefined && !["initial", "first_review", "final_review"].includes(origin.stageId)) {
+    throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task origin stageId is invalid");
+  }
+  if (origin.controlledContext !== undefined) {
+    const context = origin.controlledContext;
+    if (!Array.isArray(context.documentLinks)
+      || context.documentLinks.some((link) => typeof link !== "string" || link.length > 2048)
+      || typeof context.namingDisplayValue !== "string"
+      || typeof context.namingValueUnique !== "boolean") {
+      throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu controlled context is invalid");
+    }
   }
   return origin;
 }
@@ -643,6 +669,7 @@ function taskArtifactFromRow(row) {
   return {
     id: row.id,
     taskId: row.task_id,
+    runId: row.run_id ?? null,
     filename: row.filename,
     contentType: row.content_type,
     size: row.size,
@@ -669,6 +696,31 @@ function taskArtifactSummaryFromRow(row) {
     taskId: row.task_id,
     filename: row.filename,
     validationStatus: row.validation_status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function feishuAutoCutRunFromRow(row) {
+  if (!row) return null;
+  return {
+    runId: row.run_id,
+    taskId: row.task_id,
+    attempt: row.attempt,
+    subjectKey: row.subject_key,
+    configVersion: row.config_version,
+    stageId: row.stage_id,
+    eventId: row.event_id,
+    manifestPath: row.manifest_path ?? null,
+    manifestSha256: row.manifest_sha256 ?? null,
+    executionInputPath: row.execution_input_path ?? null,
+    draftsRoot: row.drafts_root ?? null,
+    resultPath: row.result_path,
+    packageZipPath: row.package_zip_path ?? null,
+    artifactName: row.artifact_name ?? null,
+    state: row.state,
+    errorCode: row.error_code ?? null,
+    errorMessage: row.error_message ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -728,6 +780,15 @@ function projectSummaryFromRow(row) {
     generatedAt: row.generated_at,
     attemptedAt: row.attempted_at,
     error: row.error,
+  };
+}
+
+function workflowWorkspaceFromRow(row) {
+  return {
+    projectId: row.project_id,
+    workspace: JSON.parse(row.workspace),
+    version: row.version,
+    updatedAt: row.updated_at,
   };
 }
 
@@ -945,28 +1006,58 @@ export class TaskboardDatabase {
       CREATE TABLE IF NOT EXISTS task_artifacts (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        run_id TEXT,
         storage_key TEXT NOT NULL UNIQUE,
         filename TEXT NOT NULL,
         content_type TEXT NOT NULL,
         size INTEGER NOT NULL CHECK (size >= 0),
         sha256 TEXT NOT NULL,
-        source_mode TEXT NOT NULL CHECK (source_mode = 'manual_select'),
+        source_mode TEXT NOT NULL CHECK (source_mode IN ('manual_select', 'driver_report')),
         validation_status TEXT NOT NULL CHECK (validation_status = 'verified'),
         entry_count INTEGER NOT NULL CHECK (entry_count > 0),
         draft_root TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        CHECK (
+          (source_mode = 'manual_select' AND run_id IS NULL)
+          OR (source_mode = 'driver_report' AND run_id IS NOT NULL)
+        )
       );
 
       CREATE INDEX IF NOT EXISTS task_artifacts_task_created
         ON task_artifacts(task_id, created_at, id);
 
+      CREATE TABLE IF NOT EXISTS task_completion_artifacts (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        artifact_id TEXT NOT NULL UNIQUE REFERENCES task_artifacts(id) ON DELETE CASCADE
+      );
+
       CREATE TABLE IF NOT EXISTS feishu_task_origins (
         task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
         metadata_json TEXT NOT NULL,
+        subject_key TEXT,
+        config_version INTEGER,
+        stage_id TEXT,
+        event_id TEXT,
+        base_token TEXT,
+        table_id TEXT,
+        record_id TEXT,
+        status_field_id TEXT,
+        before_option_id TEXT,
+        after_option_id TEXT,
+        event_occurred_at INTEGER,
+        stage_snapshot_json TEXT,
+        controlled_context_json TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+
+      CREATE INDEX IF NOT EXISTS feishu_task_origins_binding
+        ON feishu_task_origins(base_token, table_id, record_id, status_field_id, stage_id, event_id);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS feishu_task_origins_event
+        ON feishu_task_origins(base_token, table_id, record_id, status_field_id, stage_id, event_id)
+        WHERE event_id IS NOT NULL AND stage_id IS NOT NULL;
 
       CREATE TABLE IF NOT EXISTS feishu_task_package_snapshots (
         task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
@@ -986,7 +1077,7 @@ export class TaskboardDatabase {
         ready_at INTEGER NOT NULL,
         package_alias TEXT NOT NULL,
         package_revision INTEGER NOT NULL CHECK (package_revision > 0),
-        trigger TEXT NOT NULL CHECK (trigger IN ('manual', 'move', 'automatic')),
+        trigger TEXT NOT NULL CHECK (trigger IN ('manual', 'move', 'automatic', 'retry')),
         lease_id TEXT,
         version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
         created_at TEXT NOT NULL,
@@ -1153,9 +1244,44 @@ export class TaskboardDatabase {
         subject_key TEXT NOT NULL REFERENCES feishu_subjects(subject_key) ON DELETE CASCADE,
         version INTEGER NOT NULL CHECK (version > 0),
         snapshot_json TEXT NOT NULL,
+        lifecycle TEXT NOT NULL DEFAULT 'draft' CHECK (lifecycle IN ('draft', 'enabled', 'disabled')),
+        enabled_at INTEGER,
+        closed_at INTEGER,
         created_at TEXT NOT NULL,
         PRIMARY KEY(subject_key, version)
       );
+
+      CREATE INDEX IF NOT EXISTS feishu_subject_versions_interval
+        ON feishu_subject_versions(subject_key, enabled_at, closed_at, version);
+
+      CREATE TABLE IF NOT EXISTS feishu_autocut_runs (
+        run_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        attempt INTEGER NOT NULL CHECK (attempt > 0),
+        subject_key TEXT NOT NULL,
+        config_version INTEGER NOT NULL CHECK (config_version > 0),
+        stage_id TEXT NOT NULL CHECK (stage_id IN ('initial', 'first_review', 'final_review')),
+        event_id TEXT NOT NULL,
+        manifest_path TEXT,
+        manifest_sha256 TEXT,
+        execution_input_path TEXT,
+        drafts_root TEXT,
+        result_path TEXT NOT NULL,
+        package_zip_path TEXT,
+        artifact_name TEXT,
+        state TEXT NOT NULL CHECK (state IN ('preparing', 'prepared', 'running', 'blocked', 'reported', 'completed')),
+        error_code TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(task_id, attempt)
+      );
+
+      CREATE INDEX IF NOT EXISTS feishu_autocut_runs_task_created
+        ON feishu_autocut_runs(task_id, attempt, created_at, run_id);
+
+      CREATE INDEX IF NOT EXISTS feishu_autocut_runs_binding
+        ON feishu_autocut_runs(subject_key, config_version, stage_id, event_id);
 
       CREATE TABLE IF NOT EXISTS feishu_unified_view_sets (
         subject_key TEXT PRIMARY KEY REFERENCES feishu_subjects(subject_key) ON DELETE CASCADE,
@@ -1211,6 +1337,63 @@ export class TaskboardDatabase {
       );
 
     `);
+
+    const subjectVersionColumns = this.database.prepare("PRAGMA table_info(feishu_subject_versions)").all();
+    if (!subjectVersionColumns.some((column) => column.name === "lifecycle")) {
+      this.database.exec("ALTER TABLE feishu_subject_versions ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'draft' CHECK (lifecycle IN ('draft', 'enabled', 'disabled'))");
+    }
+    if (!subjectVersionColumns.some((column) => column.name === "enabled_at")) {
+      this.database.exec("ALTER TABLE feishu_subject_versions ADD COLUMN enabled_at INTEGER");
+    }
+    if (!subjectVersionColumns.some((column) => column.name === "closed_at")) {
+      this.database.exec("ALTER TABLE feishu_subject_versions ADD COLUMN closed_at INTEGER");
+    }
+    this.database.exec(`
+      UPDATE feishu_subject_versions
+      SET lifecycle = CASE
+        WHEN json_extract(snapshot_json, '$.lifecycle') IN ('enabled', 'disabled', 'draft')
+          THEN json_extract(snapshot_json, '$.lifecycle')
+        ELSE lifecycle
+      END
+      WHERE lifecycle = 'draft'
+    `);
+    this.database.exec(`
+      CREATE INDEX IF NOT EXISTS feishu_subject_versions_interval
+        ON feishu_subject_versions(subject_key, enabled_at, closed_at, version)
+    `);
+
+    const feishuOriginColumns = this.database.prepare("PRAGMA table_info(feishu_task_origins)").all();
+    for (const column of [
+      "subject_key", "config_version", "stage_id", "event_id", "base_token", "table_id", "record_id",
+      "status_field_id", "before_option_id", "after_option_id", "event_occurred_at",
+      "stage_snapshot_json", "controlled_context_json",
+    ]) {
+      if (!feishuOriginColumns.some((candidate) => candidate.name === column)) {
+        this.database.exec(`ALTER TABLE feishu_task_origins ADD COLUMN ${column} ${column === "config_version" || column === "event_occurred_at" ? "INTEGER" : "TEXT"}`);
+      }
+    }
+    this.database.exec(`
+      CREATE INDEX IF NOT EXISTS feishu_task_origins_binding
+        ON feishu_task_origins(base_token, table_id, record_id, status_field_id, stage_id, event_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS feishu_task_origins_event
+        ON feishu_task_origins(base_token, table_id, record_id, status_field_id, stage_id, event_id)
+        WHERE event_id IS NOT NULL AND stage_id IS NOT NULL;
+      UPDATE feishu_task_origins
+      SET subject_key = COALESCE(subject_key, json_extract(metadata_json, '$.subjectKey')),
+          config_version = COALESCE(config_version, json_extract(metadata_json, '$.configVersion')),
+          stage_id = COALESCE(stage_id, json_extract(metadata_json, '$.stageId')),
+          event_id = COALESCE(event_id, json_extract(metadata_json, '$.eventId')),
+          base_token = COALESCE(base_token, json_extract(metadata_json, '$.baseToken')),
+          table_id = COALESCE(table_id, json_extract(metadata_json, '$.tableId')),
+          record_id = COALESCE(record_id, json_extract(metadata_json, '$.recordId')),
+          status_field_id = COALESCE(status_field_id, json_extract(metadata_json, '$.statusFieldId')),
+          before_option_id = COALESCE(before_option_id, json_extract(metadata_json, '$.beforeOptionId')),
+          after_option_id = COALESCE(after_option_id, json_extract(metadata_json, '$.afterOptionId')),
+          event_occurred_at = COALESCE(event_occurred_at, json_extract(metadata_json, '$.eventOccurredAt'))
+    `);
+
+    this.#migrateTaskArtifacts();
+    this.#migrateFeishuExecutionTriggers();
 
     const feishuBaseColumns = this.database.prepare("PRAGMA table_info(feishu_bases)").all();
     if (!feishuBaseColumns.some((column) => column.name === "removed_at")) {
@@ -1702,6 +1885,75 @@ export class TaskboardDatabase {
 
   close() {
     this.database.close();
+  }
+
+  #migrateTaskArtifacts() {
+    const artifactsSql = this.database.prepare(`
+      SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'task_artifacts'
+    `).get()?.sql ?? "";
+    const artifactColumns = new Set(
+      this.database.prepare("PRAGMA table_info(task_artifacts)").all().map((column) => column.name),
+    );
+    const isCurrent = artifactColumns.has("run_id") && artifactsSql.includes("'driver_report'");
+
+    if (!isCurrent) {
+      const runId = artifactColumns.has("run_id") ? "run_id" : "NULL";
+      this.database.exec("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE");
+      try {
+        this.database.exec(`
+          CREATE TABLE task_artifacts_run_migration (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            run_id TEXT,
+            storage_key TEXT NOT NULL UNIQUE,
+            filename TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            size INTEGER NOT NULL CHECK (size >= 0),
+            sha256 TEXT NOT NULL,
+            source_mode TEXT NOT NULL CHECK (source_mode IN ('manual_select', 'driver_report')),
+            validation_status TEXT NOT NULL CHECK (validation_status = 'verified'),
+            entry_count INTEGER NOT NULL CHECK (entry_count > 0),
+            draft_root TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK (
+              (source_mode = 'manual_select' AND run_id IS NULL)
+              OR (source_mode = 'driver_report' AND run_id IS NOT NULL)
+            )
+          );
+
+          INSERT INTO task_artifacts_run_migration (
+            id, task_id, run_id, storage_key, filename, content_type, size, sha256,
+            source_mode, validation_status, entry_count, draft_root, created_at, updated_at
+          )
+          SELECT
+            id, task_id, ${runId}, storage_key, filename, content_type, size, sha256,
+            source_mode, validation_status, entry_count, draft_root, created_at, updated_at
+          FROM task_artifacts;
+
+          DROP TABLE task_artifacts;
+          ALTER TABLE task_artifacts_run_migration RENAME TO task_artifacts;
+        `);
+        this.database.exec("COMMIT");
+      } catch (error) {
+        this.database.exec("ROLLBACK");
+        throw error;
+      } finally {
+        this.database.exec("PRAGMA foreign_keys = ON");
+      }
+
+      const violation = this.database.prepare("PRAGMA foreign_key_check").get();
+      if (violation) {
+        throw new Error(`Task artifact migration produced a foreign key violation in '${violation.table}'`);
+      }
+    }
+
+    this.database.exec(`
+      CREATE INDEX IF NOT EXISTS task_artifacts_task_created
+        ON task_artifacts(task_id, created_at, id);
+      CREATE UNIQUE INDEX IF NOT EXISTS task_artifacts_run
+        ON task_artifacts(run_id) WHERE run_id IS NOT NULL;
+    `);
   }
 
   #migrateTaskStatuses() {
@@ -3764,9 +4016,30 @@ export class TaskboardDatabase {
       if (input.feishuOrigin !== undefined) {
         const origin = normalizeFeishuTaskOrigin(input.feishuOrigin);
         this.database.prepare(`
-          INSERT INTO feishu_task_origins (task_id, metadata_json, created_at, updated_at)
-          VALUES (?, ?, ?, ?)
-        `).run(id, JSON.stringify(origin), timestamp, timestamp);
+          INSERT INTO feishu_task_origins (
+            task_id, metadata_json, subject_key, config_version, stage_id, event_id,
+            base_token, table_id, record_id, status_field_id, before_option_id, after_option_id,
+            event_occurred_at, stage_snapshot_json, controlled_context_json, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          id,
+          JSON.stringify(origin),
+          origin.subjectKey ?? null,
+          origin.configVersion ?? null,
+          origin.stageId ?? null,
+          origin.eventId ?? null,
+          origin.baseToken ?? null,
+          origin.tableId ?? null,
+          origin.recordId ?? null,
+          origin.statusFieldId ?? origin.triggerFieldId ?? null,
+          origin.beforeOptionId ?? null,
+          origin.afterOptionId ?? null,
+          origin.eventOccurredAt ?? null,
+          origin.stageSnapshot ? JSON.stringify(origin.stageSnapshot) : null,
+          origin.controlledContext ? JSON.stringify(origin.controlledContext) : null,
+          timestamp,
+          timestamp,
+        );
       }
       if (input.packageSnapshot !== undefined) {
         const snapshot = normalizeFeishuPackageSnapshot(input.packageSnapshot);
@@ -3959,14 +4232,36 @@ export class TaskboardDatabase {
 
   getFeishuTaskOrigin(taskId) {
     const row = this.database.prepare(`
-      SELECT task_id, metadata_json, created_at, updated_at
+      SELECT *
       FROM feishu_task_origins WHERE task_id = ?
     `).get(taskId);
     if (!row) return null;
     try {
+      const metadata = normalizeFeishuTaskOrigin(JSON.parse(row.metadata_json));
+      let controlledContext = null;
+      let stageSnapshot = null;
+      try {
+        controlledContext = row.controlled_context_json ? JSON.parse(row.controlled_context_json) : null;
+      } catch {}
+      try {
+        stageSnapshot = row.stage_snapshot_json ? JSON.parse(row.stage_snapshot_json) : null;
+      } catch {}
       return {
         taskId: row.task_id,
-        ...normalizeFeishuTaskOrigin(JSON.parse(row.metadata_json)),
+        ...metadata,
+        ...(row.subject_key ? { subjectKey: row.subject_key } : {}),
+        ...(Number.isSafeInteger(row.config_version) ? { configVersion: row.config_version } : {}),
+        ...(row.stage_id ? { stageId: row.stage_id } : {}),
+        ...(row.event_id ? { eventId: row.event_id } : {}),
+        ...(row.base_token ? { baseToken: row.base_token } : {}),
+        ...(row.table_id ? { tableId: row.table_id } : {}),
+        ...(row.record_id ? { recordId: row.record_id } : {}),
+        ...(row.status_field_id ? { statusFieldId: row.status_field_id } : {}),
+        ...(row.before_option_id ? { beforeOptionId: row.before_option_id } : {}),
+        ...(row.after_option_id ? { afterOptionId: row.after_option_id } : {}),
+        ...(Number.isSafeInteger(row.event_occurred_at) ? { eventOccurredAt: row.event_occurred_at } : {}),
+        ...(stageSnapshot && typeof stageSnapshot === "object" ? { stageSnapshot } : {}),
+        ...(controlledContext && typeof controlledContext === "object" ? { controlledContext } : {}),
         createdAt: row.created_at,
         updatedAt: row.updated_at,
       };
@@ -3987,6 +4282,315 @@ export class TaskboardDatabase {
     }
   }
 
+  #migrateFeishuExecutionTriggers() {
+    const executionsSql = this.database.prepare(`
+      SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'feishu_task_executions'
+    `).get()?.sql ?? "";
+    if (executionsSql.includes("'retry'")) return;
+
+    this.database.exec("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE");
+    try {
+      this.database.exec(`
+        CREATE TABLE feishu_task_executions_retry_migration (
+          task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+          state TEXT NOT NULL CHECK (state IN ('delayed', 'queued', 'running')),
+          mode TEXT NOT NULL CHECK (mode IN ('manual', 'automatic')),
+          ready_at INTEGER NOT NULL,
+          package_alias TEXT NOT NULL,
+          package_revision INTEGER NOT NULL CHECK (package_revision > 0),
+          trigger TEXT NOT NULL CHECK (trigger IN ('manual', 'move', 'automatic', 'retry')),
+          lease_id TEXT,
+          version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          last_error TEXT
+        );
+
+        INSERT INTO feishu_task_executions_retry_migration (
+          task_id, state, mode, ready_at, package_alias, package_revision, trigger,
+          lease_id, version, created_at, updated_at, last_error
+        )
+        SELECT
+          task_id, state, mode, ready_at, package_alias, package_revision, trigger,
+          lease_id, version, created_at, updated_at, last_error
+        FROM feishu_task_executions;
+
+        DROP TABLE feishu_task_executions;
+        ALTER TABLE feishu_task_executions_retry_migration RENAME TO feishu_task_executions;
+        CREATE INDEX feishu_task_executions_pending
+          ON feishu_task_executions(state, ready_at, created_at, task_id);
+      `);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    } finally {
+      this.database.exec("PRAGMA foreign_keys = ON");
+    }
+
+    const violation = this.database.prepare("PRAGMA foreign_key_check").get();
+    if (violation) {
+      throw new Error(`Feishu execution migration produced a foreign key violation in '${violation.table}'`);
+    }
+  }
+
+  getFeishuSubjectVersion(subjectKey, configVersion) {
+    if (typeof subjectKey !== "string" || subjectKey.trim() === "") return null;
+    if (!Number.isSafeInteger(configVersion) || configVersion < 1) return null;
+    const row = this.database.prepare(`
+      SELECT subject_key, version, snapshot_json, lifecycle, enabled_at, closed_at, created_at
+      FROM feishu_subject_versions
+      WHERE subject_key = ? AND version = ?
+      LIMIT 1
+    `).get(subjectKey.trim(), configVersion);
+    if (!row) return null;
+    let snapshot;
+    try { snapshot = JSON.parse(row.snapshot_json); } catch { return null; }
+    return {
+      ...structuredClone(snapshot),
+      subjectKey: row.subject_key,
+      configVersion: row.version,
+      lifecycle: row.lifecycle,
+      enabledAt: row.enabled_at ?? null,
+      closedAt: row.closed_at ?? null,
+      createdAt: row.created_at,
+    };
+  }
+
+  resolveFeishuSubjectVersionAt(subjectKey, occurredAt) {
+    if (typeof subjectKey !== "string" || subjectKey.trim() === "") return null;
+    if (!Number.isSafeInteger(occurredAt) || occurredAt < 0) return null;
+    const row = this.database.prepare(`
+      SELECT subject_key, version, snapshot_json, lifecycle, enabled_at, closed_at, created_at
+      FROM feishu_subject_versions
+      WHERE subject_key = ?
+        AND lifecycle = 'enabled'
+        AND (enabled_at IS NULL OR enabled_at <= ?)
+        AND (closed_at IS NULL OR closed_at > ?)
+      ORDER BY version DESC
+      LIMIT 1
+    `).get(subjectKey.trim(), occurredAt, occurredAt);
+    if (!row) return null;
+    let snapshot;
+    try { snapshot = JSON.parse(row.snapshot_json); } catch { return null; }
+    return {
+      ...structuredClone(snapshot),
+      subjectKey: row.subject_key,
+      configVersion: row.version,
+      lifecycle: row.lifecycle,
+      enabledAt: row.enabled_at ?? null,
+      closedAt: row.closed_at ?? null,
+      createdAt: row.created_at,
+    };
+  }
+
+  listFeishuSubjectVersions(subjectKey) {
+    const rows = this.database.prepare(`
+      SELECT subject_key, version, snapshot_json, lifecycle, enabled_at, closed_at, created_at
+      FROM feishu_subject_versions
+      WHERE subject_key = ?
+      ORDER BY version
+    `).all(subjectKey);
+    return rows.flatMap((row) => {
+      try {
+        return [{
+          ...structuredClone(JSON.parse(row.snapshot_json)),
+          subjectKey: row.subject_key,
+          configVersion: row.version,
+          lifecycle: row.lifecycle,
+          enabledAt: row.enabled_at ?? null,
+          closedAt: row.closed_at ?? null,
+          createdAt: row.created_at,
+        }];
+      } catch { return []; }
+    });
+  }
+
+  createFeishuAutoCutRun(input) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new ApiError(400, "INVALID_FIELD", "Auto-Cut run input is required");
+    }
+    const requiredText = (value, name) => {
+      if (typeof value !== "string" || value.trim() === "" || value.includes("\0")) {
+        throw new ApiError(400, "INVALID_FIELD", `${name} is invalid`);
+      }
+      return value.trim();
+    };
+    const runId = requiredText(input.runId, "runId");
+    const taskId = requiredText(input.taskId, "taskId");
+    const subjectKey = requiredText(input.subjectKey, "subjectKey");
+    const eventId = requiredText(input.eventId, "eventId");
+    const stageId = requiredText(input.stageId, "stageId");
+    if (!["initial", "first_review", "final_review"].includes(stageId)) {
+      throw new ApiError(400, "INVALID_FIELD", "stageId is invalid");
+    }
+    if (!Number.isSafeInteger(input.configVersion) || input.configVersion < 1) {
+      throw new ApiError(400, "INVALID_FIELD", "configVersion must be a positive integer");
+    }
+    if (input.attempt !== undefined
+      && (!Number.isSafeInteger(input.attempt) || input.attempt < 1)) {
+      throw new ApiError(400, "INVALID_FIELD", "attempt must be a positive integer");
+    }
+    const resultPath = requiredText(input.resultPath, "resultPath");
+    const manifestPath = input.manifestPath == null ? null : requiredText(input.manifestPath, "manifestPath");
+    const executionInputPath = input.executionInputPath == null
+      ? null : requiredText(input.executionInputPath, "executionInputPath");
+    const draftsRoot = input.draftsRoot == null ? null : requiredText(input.draftsRoot, "draftsRoot");
+    const packageZipPath = input.packageZipPath == null ? null : requiredText(input.packageZipPath, "packageZipPath");
+    const artifactName = input.artifactName == null ? null : requiredText(input.artifactName, "artifactName");
+    const manifestSha256 = input.manifestSha256 == null ? null : requiredText(input.manifestSha256, "manifestSha256");
+    const timestamp = now();
+
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      if (!this.database.prepare("SELECT 1 FROM tasks WHERE id = ?").get(taskId)) {
+        throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+      }
+      const existing = this.database.prepare("SELECT * FROM feishu_autocut_runs WHERE run_id = ?").get(runId);
+      const sameBinding = existing && existing.task_id === taskId
+        && existing.subject_key === subjectKey
+        && existing.config_version === input.configVersion
+        && existing.stage_id === stageId
+        && existing.event_id === eventId;
+      if (existing) {
+        if (!sameBinding) {
+          throw new ApiError(409, "FEISHU_AUTOCUT_RUN_BINDING_CONFLICT", "Auto-Cut run binding is immutable");
+        }
+        this.database.exec("COMMIT");
+        return feishuAutoCutRunFromRow(existing);
+      }
+      const maxAttempt = this.database.prepare(`
+        SELECT MAX(attempt) AS value FROM feishu_autocut_runs WHERE task_id = ?
+      `).get(taskId)?.value ?? 0;
+      const attempt = input.attempt ?? (maxAttempt + 1);
+      if (attempt <= maxAttempt) {
+        throw new ApiError(409, "FEISHU_AUTOCUT_ATTEMPT_CONFLICT", "Auto-Cut attempt number is not increasing");
+      }
+      this.database.prepare(`
+        INSERT INTO feishu_autocut_runs (
+          run_id, task_id, attempt, subject_key, config_version, stage_id, event_id,
+          manifest_path, manifest_sha256, execution_input_path, drafts_root, result_path,
+          package_zip_path, artifact_name, state, error_code, error_message, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'preparing', NULL, NULL, ?, ?)
+      `).run(
+        runId, taskId, attempt, subjectKey, input.configVersion, stageId, eventId,
+        manifestPath, manifestSha256, executionInputPath, draftsRoot, resultPath,
+        packageZipPath, artifactName, timestamp, timestamp,
+      );
+      this.database.exec("COMMIT");
+      return this.getFeishuAutoCutRun(runId);
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch {}
+      if (String(error?.message ?? "").includes("UNIQUE constraint failed: feishu_autocut_runs.task_id, feishu_autocut_runs.attempt")) {
+        throw new ApiError(409, "FEISHU_AUTOCUT_ATTEMPT_CONFLICT", "Auto-Cut attempt number is already used");
+      }
+      throw error;
+    }
+  }
+
+  getFeishuAutoCutRun(runId) {
+    const row = this.database.prepare("SELECT * FROM feishu_autocut_runs WHERE run_id = ?").get(runId);
+    return feishuAutoCutRunFromRow(row);
+  }
+
+  listFeishuAutoCutRuns(taskId) {
+    this.#requireTask(taskId);
+    return this.database.prepare(`
+      SELECT * FROM feishu_autocut_runs WHERE task_id = ? ORDER BY attempt, created_at, run_id
+    `).all(taskId).map(feishuAutoCutRunFromRow);
+  }
+
+  markFeishuAutoCutRunPrepared(runId, input) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new ApiError(400, "INVALID_FIELD", "Prepared run input is required");
+    }
+    const fields = ["manifestPath", "manifestSha256", "executionInputPath", "draftsRoot", "packageZipPath", "artifactName"];
+    const values = fields.map((field) => input[field]);
+    if (values.some((value) => typeof value !== "string" || value.trim() === "" || value.includes("\0"))) {
+      throw new ApiError(400, "INVALID_FIELD", "Prepared Auto-Cut run paths and name are required");
+    }
+    const manifestSha256 = input.manifestSha256.trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/u.test(manifestSha256)) {
+      throw new ApiError(400, "INVALID_FIELD", "manifestSha256 is invalid");
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.database.prepare("SELECT * FROM feishu_autocut_runs WHERE run_id = ?").get(runId);
+      if (!row) throw new ApiError(404, "FEISHU_AUTOCUT_RUN_NOT_FOUND", `Auto-Cut run '${runId}' does not exist`);
+      if (row.state !== "preparing") {
+        const same = row.manifest_path === input.manifestPath
+          && row.manifest_sha256 === manifestSha256
+          && row.execution_input_path === input.executionInputPath
+          && row.drafts_root === input.draftsRoot
+          && row.package_zip_path === input.packageZipPath
+          && row.artifact_name === input.artifactName;
+        if (same) {
+          this.database.exec("COMMIT");
+          return feishuAutoCutRunFromRow(row);
+        }
+        throw new ApiError(409, "FEISHU_AUTOCUT_RUN_IMMUTABLE", "Auto-Cut run preparation is immutable");
+      }
+      const timestamp = now();
+      this.database.prepare(`
+        UPDATE feishu_autocut_runs
+        SET manifest_path = ?, manifest_sha256 = ?, execution_input_path = ?, drafts_root = ?,
+            package_zip_path = ?, artifact_name = ?, state = 'prepared', updated_at = ?,
+            error_code = NULL, error_message = NULL
+        WHERE run_id = ? AND state = 'preparing'
+      `).run(
+        input.manifestPath, manifestSha256, input.executionInputPath, input.draftsRoot,
+        input.packageZipPath, input.artifactName, timestamp, runId,
+      );
+      this.database.exec("COMMIT");
+      return this.getFeishuAutoCutRun(runId);
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
+  updateFeishuAutoCutRun(runId, patch) {
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new ApiError(400, "INVALID_FIELD", "Run update must be an object");
+    }
+    const immutable = ["taskId", "attempt", "subjectKey", "configVersion", "stageId", "eventId", "resultPath"];
+    if (immutable.some((key) => Object.hasOwn(patch, key))) {
+      throw new ApiError(409, "FEISHU_AUTOCUT_RUN_IMMUTABLE", "Auto-Cut run binding is immutable");
+    }
+    const allowed = new Set(["state", "errorCode", "errorMessage"]);
+    const unknown = Object.keys(patch).find((key) => !allowed.has(key));
+    if (unknown) throw new ApiError(400, "INVALID_FIELD", `Unsupported Auto-Cut run field '${unknown}'`);
+    if (patch.state !== undefined
+      && !["preparing", "prepared", "running", "blocked", "reported", "completed"].includes(patch.state)) {
+      throw new ApiError(400, "INVALID_FIELD", "Invalid Auto-Cut run state");
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.database.prepare("SELECT * FROM feishu_autocut_runs WHERE run_id = ?").get(runId);
+      if (!row) throw new ApiError(404, "FEISHU_AUTOCUT_RUN_NOT_FOUND", `Auto-Cut run '${runId}' does not exist`);
+      const state = patch.state ?? row.state;
+      const errorCode = patch.errorCode === undefined ? row.error_code : patch.errorCode;
+      const errorMessage = patch.errorMessage === undefined ? row.error_message : patch.errorMessage;
+      const timestamp = now();
+      this.database.prepare(`
+        UPDATE feishu_autocut_runs SET state = ?, error_code = ?, error_message = ?, updated_at = ?
+        WHERE run_id = ?
+      `).run(state, errorCode ?? null, errorMessage ?? null, timestamp, runId);
+      this.database.exec("COMMIT");
+      return this.getFeishuAutoCutRun(runId);
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
+  markFeishuAutoCutRunBlocked(runId, error) {
+    const errorCode = typeof error?.code === "string" && error.code.trim() ? error.code.trim() : "AUTOCUT_RUN_BLOCKED";
+    const errorMessage = typeof error?.message === "string" && error.message.trim()
+      ? error.message.trim() : "Auto-Cut run is blocked";
+    return this.updateFeishuAutoCutRun(runId, { state: "blocked", errorCode, errorMessage });
+  }
+
   createFeishuExecution(input) {
     if (!input || typeof input !== "object") throw new ApiError(400, "INVALID_FIELD", "Execution input is required");
     const taskId = String(input.taskId ?? "").trim();
@@ -3998,7 +4602,7 @@ export class TaskboardDatabase {
     if (!Number.isSafeInteger(input.packageRevision) || input.packageRevision < 1) {
       throw new ApiError(400, "INVALID_FIELD", "packageRevision must be a positive integer");
     }
-    if (!['manual', 'automatic'].includes(input.mode) || !['manual', 'move', 'automatic'].includes(input.trigger)) {
+    if (!['manual', 'automatic'].includes(input.mode) || !['manual', 'move', 'automatic', 'retry'].includes(input.trigger)) {
       throw new ApiError(400, "INVALID_FIELD", "Invalid execution mode or trigger");
     }
     const timestamp = now();
@@ -4092,6 +4696,56 @@ export class TaskboardDatabase {
     this.database.prepare("DELETE FROM feishu_task_executions WHERE task_id = ?").run(taskId);
   }
 
+  prepareFeishuAutoCutRetry(taskId, expectedVersion, actor) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.getTask(taskId);
+      if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+      this.#requireVersion(current, expectedVersion);
+      if (current.archivedAt !== null || current.status !== "blocked") {
+        throw new ApiError(409, "AUTOCUT_RETRY_NOT_ALLOWED", "Only a blocked Auto-Cut task can be retried");
+      }
+      const latestRun = this.database.prepare(`
+        SELECT state FROM feishu_autocut_runs
+        WHERE task_id = ?
+        ORDER BY attempt DESC, created_at DESC, run_id DESC
+        LIMIT 1
+      `).get(taskId);
+      const active = this.database.prepare(`
+        SELECT 1
+        FROM feishu_task_executions
+        WHERE task_id = ?
+        UNION ALL
+        SELECT 1
+        FROM task_ai_starts
+        WHERE task_id = ?
+        LIMIT 1
+      `).get(taskId, taskId);
+      if (!latestRun || latestRun.state !== "blocked" || active) {
+        throw new ApiError(409, "AUTOCUT_RETRY_NOT_ALLOWED", "This Auto-Cut task is not ready for retry");
+      }
+      const timestamp = now();
+      const updated = this.database.prepare(`
+        UPDATE tasks
+        SET status = 'todo', thread_id = NULL, version = version + 1, updated_at = ?
+        WHERE id = ? AND version = ? AND status = 'blocked' AND archived_at IS NULL
+      `).run(timestamp, taskId, expectedVersion);
+      if (updated.changes !== 1) this.#throwMissingOrConflict(taskId, expectedVersion);
+      this.#recordTaskActivity(
+        taskId,
+        actor,
+        taskFieldChanges(current, { status: "todo", threadId: null }),
+        timestamp,
+      );
+      this.database.prepare("DELETE FROM task_completion_artifacts WHERE task_id = ?").run(taskId);
+      this.database.exec("COMMIT");
+      return this.getTask(taskId);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   transitionFeishuTaskExecution(taskId, expectedVersion, status, actor = {
     type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null,
   }) {
@@ -4162,6 +4816,16 @@ export class TaskboardDatabase {
   }
 
   findFeishuTaskByEventId(eventId, projectId = null) {
+    const indexed = this.database.prepare(`
+      SELECT feishu_task_origins.task_id
+      FROM feishu_task_origins
+      JOIN tasks ON tasks.id = feishu_task_origins.task_id
+      WHERE feishu_task_origins.event_id = ?
+        AND (? IS NULL OR tasks.project_id = ?)
+      ORDER BY tasks.created_at, tasks.id
+      LIMIT 1
+    `).get(eventId, projectId, projectId);
+    if (indexed) return this.getTask(indexed.task_id);
     const rows = this.database.prepare(`
       SELECT feishu_task_origins.task_id, feishu_task_origins.metadata_json
       FROM feishu_task_origins JOIN tasks ON tasks.id = feishu_task_origins.task_id
@@ -4176,6 +4840,49 @@ export class TaskboardDatabase {
       } catch {}
     }
     return null;
+  }
+
+  findFeishuTaskByRegistration(identity) {
+    if (!identity || typeof identity !== "object" || Array.isArray(identity)) return null;
+    const values = [
+      identity.baseToken,
+      identity.tableId,
+      identity.recordId,
+      identity.statusFieldId,
+      identity.stageId,
+      identity.eventId,
+    ];
+    if (values.some((value) => typeof value !== "string" || value.trim() === "")) return null;
+    const row = this.database.prepare(`
+      SELECT task_id, metadata_json, subject_key, config_version, stage_id, event_id,
+             base_token, table_id, record_id, status_field_id, before_option_id,
+             after_option_id, event_occurred_at, stage_snapshot_json, controlled_context_json
+      FROM feishu_task_origins
+      WHERE base_token = ? AND table_id = ? AND record_id = ?
+        AND status_field_id = ? AND stage_id = ? AND event_id = ?
+      LIMIT 1
+    `).get(...values.map((value) => value.trim()));
+    return row ? this.getTask(row.task_id) : null;
+  }
+
+  findFeishuTaskByRegistrationEvent(identity) {
+    if (!identity || typeof identity !== "object" || Array.isArray(identity)) return null;
+    const values = [identity.baseToken, identity.tableId, identity.recordId, identity.statusFieldId, identity.eventId];
+    if (values.some((value) => typeof value !== "string" || value.trim() === "")) return null;
+    const rows = this.database.prepare(`
+      SELECT task_id, stage_id, subject_key, config_version, event_id, metadata_json
+      FROM feishu_task_origins
+      WHERE base_token = ? AND table_id = ? AND record_id = ?
+        AND status_field_id = ? AND event_id = ?
+      ORDER BY task_id
+    `).all(...values.map((value) => value.trim()));
+    return rows.map((row) => ({
+      task: this.getTask(row.task_id),
+      stageId: row.stage_id,
+      subjectKey: row.subject_key,
+      configVersion: row.config_version,
+      eventId: row.event_id,
+    }));
   }
 
   listFeishuTasks(scope = {}) {
@@ -4412,6 +5119,7 @@ export class TaskboardDatabase {
       `).run(current.id, claimToken, timestamp, timestamp);
       this.database.prepare("UPDATE task_ai_starts SET claimed_activity_rowid = ? WHERE task_id = ? AND claim_token = ?")
         .run(Number(activity.lastInsertRowid), current.id, claimToken);
+      this.database.prepare("DELETE FROM task_completion_artifacts WHERE task_id = ?").run(current.id);
       this.database.exec("COMMIT");
       return attachAiStartClaim(this.getTask(current.id), claimToken);
     } catch (error) {
@@ -4481,6 +5189,36 @@ export class TaskboardDatabase {
       updatedAt: row.updated_at,
       claimedActivityRowid: row.claimed_activity_rowid,
     }));
+  }
+
+  getTaskAiStartForArtifactReport(taskId, runId) {
+    const row = this.database.prepare(`
+      SELECT
+        task_ai_starts.task_id,
+        task_ai_starts.thread_id,
+        task_ai_starts.run_id,
+        task_ai_starts.claim_token
+      FROM task_ai_starts
+      JOIN tasks ON tasks.id = task_ai_starts.task_id
+      JOIN ai_chat_runs ON ai_chat_runs.id = task_ai_starts.run_id
+      JOIN ai_chat_threads ON ai_chat_threads.id = task_ai_starts.thread_id
+      WHERE task_ai_starts.task_id = ?
+        AND task_ai_starts.run_id = ?
+        AND tasks.status = 'in_progress'
+        AND tasks.archived_at IS NULL
+        AND tasks.thread_id = task_ai_starts.thread_id
+        AND ai_chat_runs.status = 'running'
+        AND ai_chat_runs.thread_id = task_ai_starts.thread_id
+        AND ai_chat_threads.origin_issue_id = tasks.id
+        AND ai_chat_threads.origin_project_id = tasks.project_id
+      LIMIT 1
+    `).get(taskId, runId);
+    return row ? {
+      taskId: row.task_id,
+      threadId: row.thread_id,
+      runId: row.run_id,
+      claimToken: row.claim_token,
+    } : null;
   }
 
   deleteTaskAiStartClaim(id, claimToken) {
@@ -4570,7 +5308,7 @@ export class TaskboardDatabase {
     return current;
   }
 
-  settleTaskAiStart(id, claimToken, runId, status, actor) {
+  settleTaskAiStart(id, claimToken, runId, status, actor, completionArtifactId = undefined) {
     if (!["in_progress", "in_review", "done", "blocked"].includes(status)) {
       throw new ApiError(400, "INVALID_FIELD", "Invalid AI start terminal status");
     }
@@ -4590,7 +5328,48 @@ export class TaskboardDatabase {
       if (!claim.run_id || claim.run_id !== runId) {
         throw new ApiError(409, "TASK_START_STATE_CHANGED", "Codex run does not own this task start claim");
       }
-      if (current.status !== "in_progress" || current.threadId !== claim.thread_id) {
+      if (
+        current.archivedAt !== null
+        || current.threadId !== claim.thread_id
+      ) {
+        this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
+          .run(id, claimToken);
+        this.database.exec("COMMIT");
+        return current;
+      }
+      let completionArtifact = null;
+      if (completionArtifactId !== undefined && completionArtifactId !== null) {
+        completionArtifact = this.database.prepare(`
+          SELECT id, run_id FROM task_artifacts
+          WHERE id = ?
+            AND task_id = ?
+            AND run_id = ?
+            AND source_mode = 'driver_report'
+            AND validation_status = 'verified'
+          LIMIT 1
+        `).get(completionArtifactId, id, runId);
+        if (!completionArtifact) {
+          throw new ApiError(
+            409,
+            "TASK_COMPLETION_ARTIFACT_INVALID",
+            "The completion artifact does not belong to this task and run",
+          );
+        }
+      }
+      const persistCompletionArtifact = () => {
+        if (completionArtifactId === undefined) return;
+        if (completionArtifactId === null) {
+          this.database.prepare("DELETE FROM task_completion_artifacts WHERE task_id = ?").run(id);
+          return;
+        }
+        this.database.prepare(`
+          INSERT INTO task_completion_artifacts (task_id, artifact_id)
+          VALUES (?, ?)
+          ON CONFLICT(task_id) DO UPDATE SET artifact_id = excluded.artifact_id
+        `).run(id, completionArtifact.id);
+      };
+      if (current.status !== "in_progress") {
+        persistCompletionArtifact();
         this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
           .run(id, claimToken);
         this.database.exec("COMMIT");
@@ -4598,12 +5377,14 @@ export class TaskboardDatabase {
       }
       const latestStatusChange = this.latestTaskStatusChange(id, claim.claimed_activity_rowid);
       if (latestStatusChange) {
+        persistCompletionArtifact();
         this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
           .run(id, claimToken);
         this.database.exec("COMMIT");
         return current;
       }
       if (status === "in_progress") {
+        persistCompletionArtifact();
         this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
           .run(id, claimToken);
         this.database.exec("COMMIT");
@@ -4617,6 +5398,7 @@ export class TaskboardDatabase {
       if (result.changes !== 1) {
         throw new ApiError(409, "TASK_START_STATE_CHANGED", "Task start state changed before Codex finished");
       }
+      persistCompletionArtifact();
       this.#recordTaskActivity(current.id, actor, taskFieldChanges(current, { status }), timestamp);
       this.database.prepare("DELETE FROM task_ai_starts WHERE task_id = ? AND claim_token = ?")
         .run(id, claimToken);
@@ -5236,6 +6018,27 @@ export class TaskboardDatabase {
     return row ? taskArtifactWorkFromRow(row) : null;
   }
 
+  getTaskArtifactForRun(taskId, runId) {
+    const row = this.database.prepare(`
+      SELECT * FROM task_artifacts
+      WHERE task_id = ? AND run_id = ?
+      LIMIT 1
+    `).get(taskId, runId);
+    return row ? taskArtifactFromRow(row) : null;
+  }
+
+  getTaskCompletionArtifact(taskId) {
+    const row = this.database.prepare(`
+      SELECT task_artifacts.*
+      FROM task_completion_artifacts
+      JOIN task_artifacts ON task_artifacts.id = task_completion_artifacts.artifact_id
+      WHERE task_completion_artifacts.task_id = ?
+        AND task_artifacts.task_id = task_completion_artifacts.task_id
+      LIMIT 1
+    `).get(taskId);
+    return row ? taskArtifactFromRow(row) : null;
+  }
+
   createTaskArtifact(taskId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -5248,21 +6051,82 @@ export class TaskboardDatabase {
           `This task accepts artifacts only while it is ${acceptedStatuses.join(" or ")}`,
         );
       }
-      const existing = this.database.prepare(`
-        SELECT * FROM task_artifacts
-        WHERE task_id = ? AND filename = ? AND sha256 = ?
-        ORDER BY created_at, id
-        LIMIT 1
-      `).get(task.id, input.filename, input.sha256);
+      const runId = input.runId ?? null;
+      const requiredAutoCutRun = input.requiredAutoCutRun ?? null;
+      if (input.sourceMode === "driver_report") {
+        const requiredRunClaim = input.requiredRunClaim;
+        const activeClaim = requiredRunClaim?.runId === runId
+          ? this.getTaskAiStartForArtifactReport(task.id, runId)
+          : null;
+        if (!activeClaim || activeClaim.claimToken !== requiredRunClaim?.claimToken) {
+          throw new ApiError(
+            409,
+            "TASK_START_STATE_CHANGED",
+            "Task start state changed before storing the run artifact",
+          );
+        }
+      }
+      let autoCutRun = null;
+      if (requiredAutoCutRun) {
+        autoCutRun = this.database.prepare("SELECT * FROM feishu_autocut_runs WHERE run_id = ?").get(runId);
+        const origin = task.feishuOrigin;
+        if (
+          !autoCutRun
+          || autoCutRun.task_id !== task.id
+          || autoCutRun.task_id !== requiredAutoCutRun.taskId
+          || autoCutRun.subject_key !== requiredAutoCutRun.subjectKey
+          || autoCutRun.config_version !== requiredAutoCutRun.configVersion
+          || autoCutRun.stage_id !== requiredAutoCutRun.stageId
+          || autoCutRun.event_id !== requiredAutoCutRun.eventId
+          || autoCutRun.manifest_sha256 !== requiredAutoCutRun.manifestSha256
+          || autoCutRun.package_zip_path !== requiredAutoCutRun.packageZipPath
+          || autoCutRun.artifact_name !== requiredAutoCutRun.artifactName
+          || origin?.subjectKey !== autoCutRun.subject_key
+          || origin?.configVersion !== autoCutRun.config_version
+          || origin?.stageId !== autoCutRun.stage_id
+          || origin?.eventId !== autoCutRun.event_id
+          || !["prepared", "running", "reported"].includes(autoCutRun.state)
+        ) {
+          throw new ApiError(
+            409,
+            "AUTOCUT_RUN_BINDING_MISMATCH",
+            "The Auto-Cut artifact no longer matches this task and run",
+          );
+        }
+      }
+      const existing = input.sourceMode === "driver_report"
+        ? this.database.prepare(`
+          SELECT * FROM task_artifacts
+          WHERE task_id = ? AND run_id = ?
+          LIMIT 1
+        `).get(task.id, runId)
+        : this.database.prepare(`
+          SELECT * FROM task_artifacts
+          WHERE task_id = ? AND run_id IS NULL AND filename = ? AND sha256 = ?
+          ORDER BY created_at, id
+          LIMIT 1
+        `).get(task.id, input.filename, input.sha256);
+      if (
+        existing
+        && input.sourceMode === "driver_report"
+        && (existing.filename !== input.filename || existing.sha256 !== input.sha256)
+      ) {
+        throw new ApiError(
+          409,
+          "ARTIFACT_RUN_CONFLICT",
+          "This Codex run already reported a different ZIP artifact",
+        );
+      }
       if (!existing) {
         this.database.prepare(`
           INSERT INTO task_artifacts (
-            id, task_id, storage_key, filename, content_type, size, sha256, source_mode,
-            validation_status, entry_count, draft_root, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            id, task_id, run_id, storage_key, filename, content_type, size, sha256,
+            source_mode, validation_status, entry_count, draft_root, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           input.id,
           task.id,
+          runId,
           input.storageKey,
           input.filename,
           input.contentType,
@@ -5296,6 +6160,20 @@ export class TaskboardDatabase {
           taskFieldChanges(task, { status: input.completedTaskStatus }),
           timestamp,
         );
+      }
+      if (autoCutRun && autoCutRun.state !== "reported") {
+        const updated = this.database.prepare(`
+          UPDATE feishu_autocut_runs
+          SET state = 'reported', error_code = NULL, error_message = NULL, updated_at = ?
+          WHERE run_id = ? AND state IN ('prepared', 'running')
+        `).run(now(), autoCutRun.run_id);
+        if (updated.changes !== 1) {
+          throw new ApiError(
+            409,
+            "AUTOCUT_RUN_BINDING_MISMATCH",
+            "The Auto-Cut run changed while storing its artifact",
+          );
+        }
       }
       this.database.exec("COMMIT");
       return this.getTaskArtifact(existing?.id ?? input.id);
@@ -5373,6 +6251,10 @@ export class TaskboardDatabase {
     return {
       subjectKey: row.subject_key,
       enqueueMode: upload?.enqueueMode === "automatic" ? "automatic" : "manual",
+      artifactSourceMode: upload?.artifactSourceMode ?? "manual_select",
+      artifactSourcePath: typeof upload?.artifactSourcePath === "string" && upload.artifactSourcePath.trim()
+        ? upload.artifactSourcePath.trim()
+        : null,
       targetId: typeof upload?.targetId === "string" && upload.targetId.trim()
         ? upload.targetId.trim()
         : null,

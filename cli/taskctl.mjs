@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
+import { createHash } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import { realpathSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { createReadStream, realpathSync } from "node:fs";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -116,6 +117,7 @@ const COMMAND_OPTIONS = new Map([
   ["attachment list", new Set(["task", "comment", "after", "json"])],
   ["attachment download", new Set(["output", "json"])],
   ["attachment upload", new Set(["file", "task", "comment", "content-type", "kind", "json"])],
+  ["artifact report", new Set(["file"])],
   ["context current", new Set(["cwd", "json"])],
 ]);
 
@@ -139,6 +141,7 @@ Commands:
   attachment list (--task ISSUE_ID | --comment COMMENT_ID) [--after CURSOR]
   attachment download ATTACHMENT_ID --output PATH
   attachment upload --file PATH (--task ISSUE_ID | --comment COMMENT_ID)
+  artifact report --file PATH
 
 Global options:
   --runtime-file FILE  Use an explicit launcher runtime descriptor
@@ -310,12 +313,16 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/create/update/move/archive/restore/tree/relation, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/create/update/move/archive/restore/tree/relation, comment list/add/update/delete, attachment list/download/upload, artifact report, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
 
   const processEnv = overrides.env ?? process.env;
+  if (command === "artifact report") {
+    expectOperandCount(parsed, 0);
+    return reportArtifact(parsed.options, processEnv, overrides);
+  }
   const env = parsed.options["runtime-file"] === undefined
     ? processEnv
     : { ...processEnv, CODEX_TASKBOARD_RUNTIME_FILE: parsed.options["runtime-file"] };
@@ -474,6 +481,124 @@ async function execute(parsed, overrides) {
     default:
       throw usageError(`Unsupported command: ${command}`);
   }
+}
+
+async function reportArtifact(options, env, overrides) {
+  const { url, token } = artifactReportContext(env);
+  const filename = resolveInputPath(requiredOption(options, "file"), overrides);
+  if (path.extname(filename).toLowerCase() !== ".zip") {
+    throw usageError("Artifact report --file must be a .zip file");
+  }
+
+  let fileStat;
+  try {
+    fileStat = await stat(filename);
+  } catch (error) {
+    throw fileReadError(filename, error);
+  }
+  if (!fileStat.isFile()) {
+    throw usageError("Artifact report --file must be a regular file");
+  }
+
+  let sha256;
+  try {
+    sha256 = await sha256File(filename);
+  } catch (error) {
+    throw fileReadError(filename, error);
+  }
+  const body = { path: filename, sha256 };
+  if (env.CODEX_AUTOCUT_SOURCE_MANIFEST_SHA256 !== undefined) {
+    const manifestSha256 = env.CODEX_AUTOCUT_SOURCE_MANIFEST_SHA256;
+    if (typeof manifestSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifestSha256)) {
+      throw usageError("CODEX_AUTOCUT_SOURCE_MANIFEST_SHA256 must be a lowercase SHA-256 digest");
+    }
+    body.manifestSha256 = manifestSha256;
+  }
+
+  const fetchImplementation = overrides.fetch ?? globalThis.fetch;
+  if (typeof fetchImplementation !== "function") {
+    throw new TaskctlError("fetch is not available", {
+      code: "CLIENT_UNAVAILABLE",
+      exitCode: 3,
+    });
+  }
+
+  let response;
+  try {
+    response = await fetchImplementation(url, {
+      method: "POST",
+      redirect: "error",
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        "x-taskboard-client": "taskctl",
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    throw new TaskctlError(`Cannot reach taskboard service at ${url.origin}`, {
+      code: "SERVICE_UNAVAILABLE",
+      exitCode: 3,
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  const payload = await readResponse(response);
+  if (!response.ok) {
+    const apiError = extractApiError(payload, response.status);
+    throw new TaskctlError(apiError.message, {
+      code: apiError.code,
+      exitCode: response.status === 409 ? 5 : 4,
+      details: apiError.details,
+    });
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new TaskctlError("Taskboard service returned an invalid JSON response", {
+      code: "INVALID_RESPONSE",
+      exitCode: 4,
+    });
+  }
+  return payload;
+}
+
+function artifactReportContext(env) {
+  const rawUrl = env.CODEX_AUTOCUT_ARTIFACT_REPORT_URL;
+  if (typeof rawUrl !== "string" || rawUrl.trim() === "") {
+    throw usageError("Missing CODEX_AUTOCUT_ARTIFACT_REPORT_URL");
+  }
+  const token = env.CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN;
+  if (typeof token !== "string" || token.trim() === "") {
+    throw usageError("Missing CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN");
+  }
+
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw usageError("CODEX_AUTOCUT_ARTIFACT_REPORT_URL must be a valid URL");
+  }
+  const isLoopback = url.hostname === "localhost"
+    || url.hostname === "127.0.0.1"
+    || url.hostname === "[::1]";
+  if (url.protocol !== "http:" || !isLoopback || url.username || url.password) {
+    throw usageError("CODEX_AUTOCUT_ARTIFACT_REPORT_URL must be a loopback HTTP endpoint");
+  }
+  return { url, token };
+}
+
+async function sha256File(filename) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(filename)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+function fileReadError(filename, error) {
+  return new TaskctlError(`Cannot read artifact file: ${filename}`, {
+    code: "FILE_READ_FAILED",
+    exitCode: 2,
+    details: error instanceof Error ? error.message : String(error),
+  });
 }
 
 function createApiClient(overrides, {

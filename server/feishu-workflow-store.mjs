@@ -1,6 +1,15 @@
 import { createHash } from "node:crypto";
 
 import { ApiError } from "./database.mjs";
+import {
+  STAGE_IDS,
+  isPhasedSubject,
+  normalizeStage,
+  portablePhasedSubject,
+  validatePhasedSubjectConfig,
+} from "./feishu-workflow-stages.mjs";
+
+export { STAGE_IDS, normalizeStage, validatePhasedSubjectConfig } from "./feishu-workflow-stages.mjs";
 
 const now = () => new Date().toISOString();
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
@@ -171,6 +180,20 @@ function shareableSubject(subject, { forceDraft = false } = {}) {
     displayEnabled: subject.displayEnabled,
     lifecycle: subject.lifecycle,
     configVersion: subject.configVersion,
+    ...(subject.statusField ? { statusField: clone(subject.statusField) } : {}),
+    ...(subject.documentField ? { documentField: clone(subject.documentField) } : {}),
+    ...(subject.namingField ? { namingField: clone(subject.namingField) } : {}),
+    ...(subject.stages ? {
+      stages: Object.fromEntries(STAGE_IDS.map((stageId) => {
+        const stage = subject.stages[stageId];
+        return [stageId, stage ? {
+          ...clone(stage),
+          // Stage destinations are local to the Taskboard machine and never
+          // cross the Bridge/share boundary.
+          artifactTargetPath: null,
+        } : null];
+      })),
+    } : {}),
     trigger: clone(subject.trigger),
     title: clone(subject.title),
     execution: clone(subject.execution),
@@ -245,7 +268,7 @@ function validateShareDocument(value) {
       const subjectAllowed = new Set([
         "subjectKey", "baseToken", "baseName", "tableId", "tableName", "projectId", "displayEnabled",
         "lifecycle", "configVersion", "createdAt", "updatedAt", "trigger", "title", "execution",
-        "packageRoute", "upload", "metadata",
+        "packageRoute", "upload", "metadata", "statusField", "documentField", "namingField", "stages",
       ]);
       const subjectUnknown = Object.keys(inputSubject).find((key) => !subjectAllowed.has(key));
       if (subjectUnknown) {
@@ -280,6 +303,10 @@ function validateShareDocument(value) {
         execution: clone(inputSubject.execution),
         packageRoute: clone(inputSubject.packageRoute),
         upload: clone(inputSubject.upload),
+        statusField: clone(inputSubject.statusField),
+        documentField: clone(inputSubject.documentField),
+        namingField: clone(inputSubject.namingField),
+        stages: clone(inputSubject.stages),
       };
       if (typeof normalized.displayEnabled !== "boolean") {
         throw new ApiError(400, "INVALID_SHARE_CONFIGURATION", `${key}.displayEnabled must be boolean`);
@@ -320,17 +347,19 @@ function validateShareDocument(value) {
 }
 
 const SUBJECT_PATCH_KEYS = new Set([
-  "displayEnabled", "trigger", "title", "execution", "packageRoute", "upload", "expectedVersion",
+  "displayEnabled", "trigger", "title", "execution", "packageRoute", "upload",
+  "statusField", "documentField", "namingField", "stages", "expectedVersion",
 ]);
 
-function validateSubjectConfig(value) {
+export function validateSubjectConfig(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new ApiError(400, "INVALID_BODY", "Subject configuration must be an object");
   }
   const allowedTopLevel = new Set([
     "subjectKey", "baseToken", "baseName", "tableId", "tableName", "projectId",
     "displayEnabled", "lifecycle", "configVersion", "trigger", "title", "execution",
-    "packageRoute", "upload", "metadata", "createdAt", "updatedAt",
+    "packageRoute", "upload", "metadata", "statusField", "documentField", "namingField", "stages",
+    "createdAt", "updatedAt",
   ]);
   const unknownTopLevel = Object.keys(value).find((key) => !allowedTopLevel.has(key));
   if (unknownTopLevel) throw new ApiError(400, "UNKNOWN_FIELD", `Unknown subject field '${unknownTopLevel}'`);
@@ -390,6 +419,28 @@ function validateSubjectConfig(value) {
     const candidate = value.upload[field];
     if (candidate !== null && candidate !== undefined && candidate !== "" && !/^(?:[A-Za-z]:[\\/]|\\\\|\/)/u.test(candidate)) {
       throw new ApiError(400, "INVALID_FIELD", `upload.${field} must be absolute`);
+    }
+  }
+  if (isPhasedSubject(value)) {
+    try {
+      const normalized = validatePhasedSubjectConfig(value);
+      if (value.lifecycle === "enabled" && value.upload.enqueueMode === "automatic") {
+        const missingDestination = STAGE_IDS.find((stageId) => (
+          normalized.stages[stageId].enabled
+          && normalized.stages[stageId].artifactTargetPath === null
+        ));
+        if (missingDestination) {
+          throw new ApiError(
+            400,
+            "INVALID_FIELD",
+            `Enabled automatic stage '${missingDestination}' requires artifactTargetPath`,
+          );
+        }
+      }
+      for (const key of ["statusField", "documentField", "namingField", "stages"]) value[key] = normalized[key];
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw new ApiError(400, error.code ?? "INVALID_FIELD", error.message);
     }
   }
   return value;
@@ -547,8 +598,26 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     return row;
   }
   function saveVersion(row, snapshot, version, timestamp) {
-    db.prepare(`INSERT INTO feishu_subject_versions (subject_key, version, snapshot_json, created_at) VALUES (?, ?, ?, ?)`)
-      .run(row.subject_key, version, JSON.stringify(snapshot), timestamp);
+    const lifecycle = LIFECYCLES.has(snapshot?.lifecycle) ? snapshot.lifecycle : "draft";
+    const timestampMs = Date.parse(timestamp);
+    const enabledAt = Number.isSafeInteger(snapshot?.enabledAt)
+      ? snapshot.enabledAt
+      : lifecycle === "enabled" && Number.isFinite(timestampMs) ? timestampMs : null;
+    const closedAt = Number.isSafeInteger(snapshot?.closedAt)
+      ? snapshot.closedAt
+      : lifecycle === "disabled" && Number.isFinite(timestampMs) ? timestampMs : null;
+    if (lifecycle !== "enabled") {
+      db.prepare(`
+        UPDATE feishu_subject_versions
+        SET closed_at = COALESCE(closed_at, ?)
+        WHERE subject_key = ? AND lifecycle = 'enabled' AND closed_at IS NULL
+      `).run(Number.isFinite(timestampMs) ? timestampMs : null, row.subject_key);
+    }
+    db.prepare(`
+      INSERT INTO feishu_subject_versions (
+        subject_key, version, snapshot_json, lifecycle, enabled_at, closed_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(row.subject_key, version, JSON.stringify(snapshot), lifecycle, enabledAt, closedAt, timestamp);
   }
 
   function requiresBridgeDisableBeforeRemoval(subject) {

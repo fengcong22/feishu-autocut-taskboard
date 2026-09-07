@@ -706,7 +706,7 @@ test("unsupported composer nodes fail with the stable code before a run starts",
   }
 });
 
-async function createFixture() {
+async function createFixture({ trustedAutoCutSource = null } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-ai-runner-"));
   const workspacePath = path.join(directory, "workspace");
   const otherWorkspacePath = path.join(directory, "other-workspace");
@@ -844,6 +844,15 @@ if (args[0] === "app-server") {
       CODEX_FEISHU_BRIDGE_SECRET: "must-not-reach-codex",
     },
     killGraceMs: 50,
+    ...(trustedAutoCutSource ? {
+      resolveContext: async (projectId, issueId) => ({
+        project: database.getProject(projectId),
+        issue: issueId ? database.getTask(issueId) : null,
+        workspacePath: workspace,
+        addDirectories: [otherWorkspace],
+        trustedAutoCutSource,
+      }),
+    } : {}),
   });
   return {
     capturePath,
@@ -949,6 +958,78 @@ test("Codex turns use stdin, explicit resume ids, server-owned cwd and sanitized
     );
     assert.equal(persisted.includes("<taskboard_context>"), false);
     assert.equal(persisted.includes("SECRET REASONING"), false);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("trusted Auto-Cut turns add only their exact run output directories to the writable sandbox", async () => {
+  const fixture = await createFixture({
+    trustedAutoCutSource: {
+      source: "feishu-base",
+      baseToken: "base",
+      tableId: "table",
+      recordId: "record",
+    },
+  });
+  try {
+    const actor = { type: "user", id: "local-user", name: "Local user", avatarUrl: null };
+    const task = fixture.database.createTask({
+      projectId: "project",
+      title: "Trusted Auto-Cut",
+      description: "Trusted Auto-Cut",
+      status: "todo",
+      priority: "high",
+      labels: ["feishu"],
+      actor,
+      assignee: actor,
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+    });
+    const thread = await fixture.service.createThread({
+      projectId: "project",
+      issueId: task.id,
+      sandbox: "workspace-write",
+    });
+    const jobRoot = path.join(fixture.directory, "taskboard-data", "autocut-runs", task.id, "run");
+    const packageOutputRoot = path.join(fixture.directory, "zip-source", ".taskboard-autocut", task.id, "run");
+    await Promise.all([mkdir(jobRoot, { recursive: true }), mkdir(packageOutputRoot, { recursive: true })]);
+
+    const run = await fixture.service.startTurn(
+      thread.id,
+      { message: "run package" },
+      {
+        taskClaimedByServer: true,
+        onRunCreated: async (createdRun) => ({
+          artifactReport: { url: "http://127.0.0.1/report", token: "claim-token" },
+          sourceManifest: { path: path.join(jobRoot, "source-manifest.json"), sha256: "a".repeat(64) },
+          executionInput: { path: path.join(jobRoot, "execution_input.json") },
+          autoCutBinding: {
+            taskId: task.id,
+            runId: createdRun.id,
+            subjectKey: "base:table",
+            configVersion: 1,
+            stageId: "initial",
+            eventId: "event-1",
+          },
+          autoCutRuntime: {
+            jobRoot,
+            draftsRoot: path.join(jobRoot, "drafts"),
+            resultPath: path.join(jobRoot, "result.json"),
+            packageZipPath: path.join(packageOutputRoot, "draft.zip"),
+          },
+        }),
+      },
+    );
+    await waitFor(() => fixture.service.getRun(run.id)?.status !== "running");
+
+    const captures = (await readFile(fixture.capturePath, "utf8")).trim().split("\n").map(JSON.parse);
+    const execArgs = captures.at(-1).args;
+    assert.deepEqual(
+      execArgs.flatMap((value, index) => value === "--add-dir" ? [execArgs[index + 1]] : []),
+      [fixture.otherWorkspace, jobRoot, packageOutputRoot],
+    );
   } finally {
     await fixture.close();
   }
