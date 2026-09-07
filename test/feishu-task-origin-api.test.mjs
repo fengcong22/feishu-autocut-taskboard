@@ -140,6 +140,7 @@ test("Bridge provenance routes isolate trusted tasks from forged markers", async
     assert.equal(trusted.response.status, 201);
     assert.equal(trusted.body.task.feishuOrigin.eventId, "event-trusted");
     assert.equal(trusted.body.task.feishuOrigin.packageSource, "table-default");
+    assert.equal(trusted.body.task.feishuOrigin.statusFieldId, "fld_progress");
 
     const byEvent = await request(
       fixture.baseUrl,
