@@ -1557,7 +1557,9 @@ function parseFeishuTaskMetadata(description) {
       ...(typeof metadata.triggerValue === "string" && metadata.triggerValue.trim()
         ? { triggerValue: metadata.triggerValue.trim() } : {}),
       ...(typeof metadata.statusFieldId === "string" && metadata.statusFieldId.trim()
-        ? { statusFieldId: metadata.statusFieldId.trim() } : {}),
+        ? { statusFieldId: metadata.statusFieldId.trim() }
+        : (typeof metadata.triggerFieldId === "string" && metadata.triggerFieldId.trim()
+          ? { statusFieldId: metadata.triggerFieldId.trim() } : {})),
       ...(typeof metadata.beforeOptionId === "string" && metadata.beforeOptionId.trim()
         ? { beforeOptionId: metadata.beforeOptionId.trim() } : {}),
       ...(typeof metadata.afterOptionId === "string" && metadata.afterOptionId.trim()
