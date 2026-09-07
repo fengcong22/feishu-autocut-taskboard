@@ -153,3 +153,21 @@ setInterval(() => {}, 1_000);
     await rm(current.root, { recursive: true, force: true });
   }
 });
+
+test("reports an unavailable local runner when its installed script is missing", async () => {
+  const current = await fixture("process.exit(0);");
+  try {
+    await rm(path.join(current.runtimeRoot, "scripts", "jy_wrapper.py"));
+    await assert.rejects(
+      runLocalAutoCut({
+        run: current.run,
+        packageConfig: current.packageConfig,
+        environment: { ...process.env, LOCALAPPDATA: current.localAppData },
+      }),
+      (error) => error?.code === "AUTOCUT_RUNTIME_UNAVAILABLE"
+        && error?.message === "Auto-Cut local runner is unavailable",
+    );
+  } finally {
+    await rm(current.root, { recursive: true, force: true });
+  }
+});

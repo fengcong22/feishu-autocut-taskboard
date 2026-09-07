@@ -4531,7 +4531,9 @@ export function createTaskboardServer(options = {}) {
       } catch (error) {
         database.markFeishuAutoCutRunBlocked(prepared.run.id, error);
         terminalRun = database.updateAiChatRun(prepared.run.id, {
-          status: error?.name === "AbortError" ? "interrupted" : "failed",
+          status: error?.name === "AbortError" || error?.code === "AUTOCUT_RUN_INTERRUPTED"
+            ? "interrupted"
+            : "failed",
           exitCode: 1,
           error: String(error?.message ?? error).slice(0, 65_536),
           finishedAt: new Date().toISOString(),
@@ -7005,11 +7007,6 @@ export function createTaskboardServer(options = {}) {
       }
       cloudRealtimeSockets.clear();
       cloudRealtimeServer.close();
-      const serverClosed = listening
-        ? new Promise((resolve, reject) => {
-            server.close((error) => error ? reject(error) : resolve());
-          })
-        : Promise.resolve();
       events.close();
       for (const response of aiEventResponses) response.end();
       aiEventResponses.clear();
@@ -7018,6 +7015,11 @@ export function createTaskboardServer(options = {}) {
       if (pendingLocalAutoCutRuns.size > 0) {
         await Promise.allSettled([...pendingLocalAutoCutRuns]);
       }
+      const serverClosed = listening
+        ? new Promise((resolve, reject) => {
+            server.close((error) => error ? reject(error) : resolve());
+          })
+        : Promise.resolve();
       await uploadWorker.close();
       await aiChat.close();
       await settleFeishuTaskReconciliations();

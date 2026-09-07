@@ -66,10 +66,21 @@ async function resolveInstalledRuntime(workspacePath, environment) {
   ) {
     throw runnerError("AUTOCUT_RUNTIME_UNAVAILABLE", "Auto-Cut deployment does not match the registered package");
   }
-  const runtimeRoot = await realpath(report.runtime_root);
-  const python = await realpath(report.components.python.runtime_path);
-  const script = await realpath(path.join(runtimeRoot, "scripts", "jy_wrapper.py"));
-  const [pythonInfo, scriptInfo] = await Promise.all([stat(python), stat(script)]);
+  let runtimeRoot;
+  let python;
+  let script;
+  let pythonInfo;
+  let scriptInfo;
+  try {
+    runtimeRoot = await realpath(report.runtime_root);
+    [python, script] = await Promise.all([
+      realpath(report.components.python.runtime_path),
+      realpath(path.join(runtimeRoot, "scripts", "jy_wrapper.py")),
+    ]);
+    [pythonInfo, scriptInfo] = await Promise.all([stat(python), stat(script)]);
+  } catch {
+    throw runnerError("AUTOCUT_RUNTIME_UNAVAILABLE", "Auto-Cut local runner is unavailable");
+  }
   if (!pythonInfo.isFile() || !scriptInfo.isFile()) {
     throw runnerError("AUTOCUT_RUNTIME_UNAVAILABLE", "Auto-Cut local runner is unavailable");
   }

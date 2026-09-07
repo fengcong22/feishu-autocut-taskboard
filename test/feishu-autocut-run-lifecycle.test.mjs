@@ -428,6 +428,118 @@ test("an authorized phased retry runs locally without starting another Codex tur
   }
 });
 
+test("records a local Auto-Cut interruption as an interrupted AI run", async () => {
+  const controlledContext = {
+    documentLinks: ["https://guanghe.feishu.cn/docx/interrupted-run"],
+    namingDisplayValue: "课程中断",
+    namingValueUnique: true,
+  };
+  const fixture = await createFixture({
+    controlledContext,
+    autoCutRunner: async () => {
+      const error = new Error("Auto-Cut was interrupted because Taskboard is shutting down");
+      error.code = "AUTOCUT_RUN_INTERRUPTED";
+      throw error;
+    },
+  });
+  try {
+    const subject = await registerSubject(fixture);
+    const created = await jsonRequest(
+      fixture.baseUrl,
+      "/api/local/feishu/tasks",
+      registration(subject, controlledContext),
+    );
+    assert.equal(created.response.status, 201, JSON.stringify(created.body));
+    const initial = await jsonRequest(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {});
+    assert.equal(initial.response.status, 202, JSON.stringify(initial.body));
+    const blocked = await waitForTaskStatus(fixture.app, created.body.task.id, "blocked");
+
+    const retried = await jsonRequest(
+      fixture.baseUrl,
+      `/api/local/tasks/${encodeURIComponent(blocked.id)}/autocut-retry`,
+      {
+        version: blocked.version,
+        runConsent: {
+          allowVideoAudioAsr: true,
+          allowConfiguredLocalOutput: true,
+        },
+      },
+    );
+    assert.equal(retried.response.status, 202, JSON.stringify(retried.body));
+    await waitForTaskStatus(fixture.app, created.body.task.id, "blocked");
+    const [run] = fixture.app.database.listAiChatRuns(retried.body.thread.id);
+    assert.equal(run.status, "interrupted");
+  } finally {
+    await fixture.app.close();
+    await fixture.bridge.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("keeps the local listener available until a prepared Auto-Cut report finishes during shutdown", async () => {
+  const controlledContext = {
+    documentLinks: ["https://guanghe.feishu.cn/docx/shutdown-report"],
+    namingDisplayValue: "课程关闭",
+    namingValueUnique: true,
+  };
+  let signalReady;
+  const waitForAbort = new Promise((resolve) => { signalReady = resolve; });
+  let fixtureClosed = false;
+  const fixture = await createFixture({
+    controlledContext,
+    autoCutRunner: async ({ run, signal }) => {
+      await writePassingRunResult(run);
+      signalReady(run);
+      await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+      return { exitCode: 0 };
+    },
+  });
+  try {
+    const subject = await registerSubject(fixture, {
+      executionMode: "automatic",
+      enqueueMode: "automatic",
+    });
+    const created = await jsonRequest(
+      fixture.baseUrl,
+      "/api/local/feishu/tasks",
+      registration(subject, controlledContext),
+    );
+    assert.equal(created.response.status, 201, JSON.stringify(created.body));
+    const initial = await jsonRequest(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {});
+    assert.equal(initial.response.status, 202, JSON.stringify(initial.body));
+    const blocked = await waitForTaskStatus(fixture.app, created.body.task.id, "blocked");
+
+    const retried = await jsonRequest(
+      fixture.baseUrl,
+      `/api/local/tasks/${encodeURIComponent(blocked.id)}/autocut-retry`,
+      {
+        version: blocked.version,
+        runConsent: {
+          allowVideoAudioAsr: true,
+          allowConfiguredLocalOutput: true,
+        },
+      },
+    );
+    assert.equal(retried.response.status, 202, JSON.stringify(retried.body));
+    const run = await waitForAbort;
+    await fixture.app.close();
+    fixtureClosed = true;
+
+    const database = new TaskboardDatabase(path.join(fixture.directory, "taskboard.sqlite"));
+    try {
+      assert.equal(database.getTask(created.body.task.id).status, "done");
+      assert.equal(database.getFeishuAutoCutRun(run.runId).state, "completed");
+      assert.equal(database.getTaskArtifactForRun(created.body.task.id, run.runId)?.validationStatus, "verified");
+    } finally {
+      database.close();
+    }
+  } finally {
+    if (!fixtureClosed) await fixture.app.close();
+    await fixture.bridge.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
 test("a trusted phased Auto-Cut start persists an immutable run and injects private inputs", async () => {
   const controlledContext = {
     documentLinks: ["https://guanghe.feishu.cn/docx/lifecycle"],
